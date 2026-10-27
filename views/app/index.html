@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>拾光手账</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">▧</span>
+        <div>
+          <h1>拾光手账</h1>
+          <p>收好每一个想留下的片刻</p>
+        </div>
+      </div>
+      <nav aria-label="功能导航">
+        <button data-tab="album" aria-current="page">相册</button>
+        <button data-tab="characters">角色参考</button>
+        <button data-tab="plans">朝夕拾记</button>
+        <button data-tab="jobs">任务记录</button>
+        <button data-tab="settings">设置</button>
+      </nav>
+    </header>
+    <main id="main" aria-busy="true">
+      <div class="empty">
+        <span class="spinner"></span>
+        <p>正在打开相册…</p>
+      </div>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <dialog id="dialog" aria-labelledby="dialog-title">
+      <div id="dialog-content"></div>
+      <input
+        id="file-input"
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        hidden
+      />
+    </dialog>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
