@@ -62,7 +62,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.0")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.1")
 class CompanionAlbum(Star):
     @staticmethod
     def clean_tool_echo(text: str) -> str:

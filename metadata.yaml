@@ -2,7 +2,8 @@ name: astrbot_plugin_companion_album
 display_name: 拾光手账
 author: local-workshop
 desc: 角色参考图、生活相册、自然生图及 QQ 空间配图，支持照片复用和任务恢复。
-version: 0.1.0
+version: 0.1.1
+repo: https://github.com/qcq14119/lumen-journal
 astrbot_version: '>=4.29.1'
 support_platforms:
   - aiocqhttp
