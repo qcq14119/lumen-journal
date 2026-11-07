@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from apscheduler.triggers.cron import CronTrigger
 
 from .store import AlbumError, now, text_value, uid
+from .daily import DailySchedule
 
 FORMAT = "companion-life-plans-v1"
 WEEKDAYS = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
@@ -1350,12 +1351,35 @@ def next_times(
 
 
 class LifePlans:
-    def __init__(self, store, execute):
+    def __init__(self, store, execute, current_cid=None):
         self.store, self.execute = store, execute
+        self.current_cid = current_cid
         self.task = None
         self.workers = set()
         self.running_scopes = set()
         self.last_error = ""
+        self.daily = DailySchedule(self)
+
+    def today(self, scope: str, cid: str, *, at=None, limit=60):
+        return self.daily.today(scope, cid, at=at, limit=limit)
+
+    def adjust_occurrence(self, scope, cid, occurrence_id, decision, **kwargs):
+        return self.daily.adjust(scope, cid, occurrence_id, decision, **kwargs)
+
+    @staticmethod
+    def _belongs(plan: dict, cid: str) -> bool:
+        """Chat-derived one-shot plans are meaningful only in their source chat."""
+        return not (
+            plan.get("run_once") and plan.get("source") in ("chat", "chain")
+        ) or bool(cid and plan.get("origin_cid") == cid)
+
+    async def current_conversations(self):
+        scopes = {p.get("scope", "") for p in self.store.all("life_plan")}
+        return {
+            scope: (await self.current_cid(scope) or "") if self.current_cid else ""
+            for scope in scopes
+            if scope
+        }
 
     def get_calendar(self, scope: str = "") -> dict:
         """Read the persisted seasonal calendar & trips config, falling back to defaults."""
@@ -1608,7 +1632,7 @@ class LifePlans:
                 self.store.save("calendar", "default", cal, int(row["revision"]))
             return self.get_calendar()
 
-    def override_wake_dates_for(self, scope: str = "") -> set[str]:
+    def override_wake_dates_for(self, scope: str = "", cid: str = "") -> set[str]:
         """Return YYYY-MM-DD dates where a one-shot override_day_wake plan is pending or already ran."""
         dates = set()
         for p in self.store.all("life_plan"):
@@ -1618,6 +1642,7 @@ class LifePlans:
                 and p.get("run_once")
                 and p.get("override_day_wake")
                 and (not scope or p.get("scope") == scope)
+                and self._belongs(p, cid)
             ):
                 if p.get("override_date"):
                     dates.add(p["override_date"])
@@ -1633,6 +1658,7 @@ class LifePlans:
                 r.get("override_day_wake")
                 and r.get("state") in ("running", "sent", "unknown")
                 and (not scope or r.get("scope") == scope)
+                and bool(cid and r.get("conversation_id") == cid)
             ):
                 if r.get("override_date"):
                     dates.add(r["override_date"])
@@ -1681,6 +1707,9 @@ class LifePlans:
         photo_mode = text_value(plan.get("photo_mode", "auto"), 20) or "auto"
         if photo_mode not in PHOTO_MODES:
             raise AlbumError("拍照模式须为 auto、always 或 never")
+        contact_mode = plan.get("contact_mode", "adaptive")
+        if contact_mode not in ("adaptive", "reminder"):
+            raise AlbumError("联系方式须为随聊天调整或按约提醒")
         day_mode = text_value(plan.get("day_mode", "cron"), 30) or "cron"
         if day_mode not in DAY_MODES:
             raise AlbumError("作息套组模式不正确")
@@ -1696,6 +1725,9 @@ class LifePlans:
         if type(chain_depth) is not int or not (0 <= chain_depth <= 2):
             raise AlbumError("计划链深度格式不正确")
         source = text_value(plan.get("source", "user"), 40) or "user"
+        origin_cid = text_value(plan.get("origin_cid", ""), 100)
+        if run_once and source in ("chat", "chain") and not origin_cid:
+            raise AlbumError("聊天约定缺少来源聊天，不能安排执行")
         enabled = plan.get("enabled", False)
         if type(enabled) is not bool:
             raise AlbumError("启用状态格式不正确")
@@ -1710,6 +1742,7 @@ class LifePlans:
             "window_before": window_before,
             "window_after": window_after,
             "photo_mode": photo_mode,
+            "contact_mode": contact_mode,
             "day_mode": day_mode,
             "override_day_wake": override_day_wake,
             "override_date": override_date,
@@ -1717,6 +1750,7 @@ class LifePlans:
             "trigger_at": trigger_at,
             "chain_depth": chain_depth,
             "source": source,
+            "origin_cid": origin_cid,
             "import_key": old.get("import_key", data.get("import_key", "")),
             "activated_at": now()
             if enabled and not old.get("enabled")
@@ -1729,6 +1763,10 @@ class LifePlans:
                 other["id"] != old.get("id")
                 and other["name"] == name
                 and other["scope"] == scope
+                and (
+                    self._belongs(other, origin_cid)
+                    or not (run_once and source in ("chat", "chain"))
+                )
             ):
                 raise AlbumError("此会话已存在同名计划，请编辑原计划")
         return self.store.save(
@@ -1747,10 +1785,14 @@ class LifePlans:
         chain_depth: int = 0,
         source: str = "chat",
         override_day_wake: bool = False,
+        origin_cid: str = "",
+        contact_mode: str = "adaptive",
     ) -> dict:
         """Create and enable a one-shot plan that destroys itself after firing."""
         if chain_depth > 1:
             raise AlbumError("一次性后续约定最多延续一层，不再继续追加")
+        if source in ("chat", "chain") and not origin_cid:
+            raise AlbumError("聊天约定缺少来源聊天，不能安排执行")
         current_ts = now()
         trigger_at = (int(trigger_at) // 60) * 60
         if trigger_at < current_ts + 180:
@@ -1764,9 +1806,13 @@ class LifePlans:
             existing = [
                 p
                 for p in self.store.all("life_plan")
-                if p["scope"] == scope and not p.get("deleted")
+                if p["scope"] == scope
+                and not p.get("deleted")
+                and self._belongs(p, origin_cid)
             ]
-            pending_once = [p for p in existing if p.get("run_once")]
+            pending_once = [
+                p for p in existing if p.get("run_once") and p.get("enabled")
+            ]
             if len(pending_once) >= MAX_PENDING_ONCE:
                 raise AlbumError(
                     f"当前已有 {MAX_PENDING_ONCE} 条待执行的心念约定，请等完成后再定新约定"
@@ -1778,7 +1824,7 @@ class LifePlans:
                 if override_day_wake
                 else ""
             )
-            overrides = self.override_wake_dates_for(scope)
+            overrides = self.override_wake_dates_for(scope, origin_cid)
             if override_date:
                 overrides.add(override_date)
             earliest = trigger_at - window_before * 60
@@ -1817,27 +1863,51 @@ class LifePlans:
                     "window_before": window_before,
                     "window_after": window_minutes,
                     "photo_mode": photo_mode if photo_mode in PHOTO_MODES else "auto",
+                    "contact_mode": contact_mode,
                     "chain_depth": chain_depth,
                     "source": source,
+                    "origin_cid": origin_cid,
                     "override_day_wake": bool(override_day_wake),
                     "override_date": override_date,
                 },
                 character=char,
             )
 
-    def cancel_once(self, scope: str, plan_id: str) -> dict:
+    def cancel_once(self, scope: str, plan_id: str, origin_cid: str = "") -> dict:
         """Cancel and remove a pending one-shot plan in the given scope."""
         key = text_value(plan_id, 100)
         with self.store.lock:
             plan = self.store.get("life_plan", key)
-            if plan["scope"] != scope or not plan.get("run_once"):
+            if (
+                plan["scope"] != scope
+                or not plan.get("run_once")
+                or not self._belongs(plan, origin_cid)
+            ):
                 raise AlbumError("只能取消当前会话中尚未触发的一次性心念约定")
-            self.destroy_plan(key)
+            self.destroy_plan(key, waiting_state="skipped", reason="用户已取消，未送达")
             return plan
 
-    def destroy_plan(self, key: str):
-        """Permanently delete a one-shot plan record from life_plan."""
+    def destroy_plan(self, key: str, *, waiting_state=None, reason="", at=None):
+        """End unsent durable waits and remove their source in one transaction."""
         with self.store.lock, self.store.db:
+            if waiting_state:
+                rows = self.store.db.execute(
+                    "SELECT id,data,revision FROM records WHERE kind='life_run' "
+                    "AND json_extract(data,'$.plan_id')=? "
+                    "AND json_extract(data,'$.state')='deferred'", (key,),
+                ).fetchall()
+                for row in rows:
+                    run = json.loads(row["data"])
+                    delivery = self.store.db.execute("SELECT state FROM deliveries WHERE id=?", ("life:" + row["id"],)).fetchone()
+                    if delivery and delivery["state"] in ("sending", "unknown", "sent"):
+                        state = delivery["state"] if delivery["state"] != "sending" else "unknown"
+                        error = "已有投递记录，未再次发送"
+                    else:
+                        state, error = waiting_state, reason
+                    payload = {**run, "state": state, "capacity_wait": False,
+                               "error": error, "finished_at": now() if at is None else at}
+                    self.store.db.execute("UPDATE records SET data=?,revision=revision+1 WHERE kind='life_run' AND id=? AND revision=?",
+                                          (json.dumps(payload, ensure_ascii=False), row["id"], row["revision"]))
             self.store.db.execute(
                 "DELETE FROM records WHERE kind='life_plan' AND id=?", (key,)
             )
@@ -2052,13 +2122,18 @@ class LifePlans:
                         if p.get("day_mode") and p.get("day_mode") != "cron"
                         else {}
                     ),
+                    **(
+                        {"contact_mode": "reminder"}
+                        if p.get("contact_mode") == "reminder"
+                        else {}
+                    ),
                 }
                 for p in self.store.all("life_plan")
                 if not p.get("deleted") and not p.get("run_once")
             ],
         }
 
-    def state(self) -> dict:
+    def state(self, current_cids=None) -> dict:
         point = datetime.now(ZoneInfo("UTC"))
         sh_now = point.astimezone(ZoneInfo("Asia/Shanghai")).date()
         cal = self.get_calendar()
@@ -2072,10 +2147,13 @@ class LifePlans:
             run.setdefault("timezone", zones.get(run.get("plan_id"), "Asia/Shanghai"))
             last.setdefault(run.get("plan_id"), run)
         override_cache = {}
+        current_cids = current_cids or {}
 
         def _overrides(sc):
             if sc not in override_cache:
-                override_cache[sc] = self.override_wake_dates_for(sc)
+                override_cache[sc] = self.override_wake_dates_for(
+                    sc, current_cids.get(sc, "")
+                )
             return override_cache[sc]
 
         return {
@@ -2105,6 +2183,11 @@ class LifePlans:
             "runs": runs[:100],
             "calendar": cal,
             "today_profile": day_profile(sh_now, cal),
+            "today": [
+                item
+                for scope, cid in current_cids.items()
+                for item in self.today(scope, cid)
+            ],
             "scheduler_error": self.last_error,
             "scheduler_running": self.task is not None and not self.task.done(),
         }
@@ -2227,11 +2310,14 @@ class LifePlans:
             timestamp,
             point,
             calendar=self.get_calendar(),
-            override_wake_dates=self.override_wake_dates_for(plan.get("scope", "")),
+            override_wake_dates=self.override_wake_dates_for(
+                plan.get("scope", ""), plan.get("_conversation_id", "")
+            ),
         )
         return detail["anchor_ts"] if detail else None
 
     async def tick(self, timestamp: int):
+        self.daily.prune(timestamp)
         point = datetime.fromtimestamp(timestamp, ZoneInfo("UTC"))
         cal = (
             self.prune_expired_calendar(
@@ -2241,6 +2327,7 @@ class LifePlans:
             else self.get_calendar()
         )
         override_cache = {}
+        current_cids = await self.current_conversations()
         for plan in self.store.all("life_plan"):
             if (
                 plan.get("deleted")
@@ -2254,12 +2341,21 @@ class LifePlans:
                     int(plan.get("trigger_at") or 0)
                     + int(plan.get("window_after") or 0) * 60
                 )
+                adjusted_times = [
+                        a["effective_ts"]
+                        for a in self.daily._adjustments(plan["id"])
+                        if a["plan_revision"] == plan["revision"]
+                        and a["character_id"] == plan["character_id"]
+                        and (not plan.get("origin_cid") or a["cid"] == plan["origin_cid"])
+                    ]
+                max_fire = max(adjusted_times) if adjusted_times else max_fire
                 if max_fire > 0 and timestamp > max_fire + 3600:
-                    self.destroy_plan(plan["id"])
+                    self.destroy_plan(plan["id"], waiting_state="expired", reason="已过期，未送达", at=timestamp)
                     continue
             sc = plan.get("scope", "")
+            cid = current_cids.get(sc, "")
             if sc not in override_cache:
-                override_cache[sc] = self.override_wake_dates_for(sc)
+                override_cache[sc] = self.override_wake_dates_for(sc, cid)
             detail = self._matching_anchor_detail(
                 plan,
                 timestamp,
@@ -2267,13 +2363,16 @@ class LifePlans:
                 calendar=cal,
                 override_wake_dates=override_cache[sc],
             )
+            detail = self.daily.match(plan, timestamp, cid, cal, detail)
             if detail is None:
                 continue
             anchor_ts = detail["anchor_ts"]
             key = f"{plan['id']}:{anchor_ts}"
-            if self.store.db.execute(
-                "SELECT 1 FROM records WHERE kind='life_run' AND id=?", (key,)
-            ).fetchone():
+            try:
+                previous_run = self.store.get("life_run", key)
+            except AlbumError:
+                previous_run = {}
+            if previous_run and previous_run["state"] != "deferred":
                 if plan.get("run_once"):
                     self.destroy_plan(plan["id"])
                 continue
@@ -2282,12 +2381,52 @@ class LifePlans:
             anchor_local = datetime.fromtimestamp(anchor_ts, zone)
             delta_minutes = (timestamp - anchor_ts) // 60
             busy = plan["scope"] in self.running_scopes or len(self.workers) >= 4
+            adjustment = detail.get("adjustment") or {}
+            wrong_chat = (
+                not self._belongs(plan, cid)
+                or bool(adjustment and adjustment["cid"] != cid)
+                or bool(detail.get("capacity_cid") and detail["capacity_cid"] != cid)
+            )
+            suppressed = adjustment.get("decision") == "skip"
+            # An explicit reminder waits for capacity; a routine may stay quiet.
+            if (
+                busy
+                and plan.get("contact_mode") == "reminder"
+                and not wrong_chat
+                and not suppressed
+            ):
+                self.store.save(
+                    "life_run",
+                    key,
+                    {
+                        **previous_run,
+                        "plan_id": plan["id"],
+                        "scope": sc,
+                        "conversation_id": previous_run.get("conversation_id") or cid,
+                        "name": plan["name"],
+                        "anchor_at": anchor_ts,
+                        "at": timestamp,
+                        "state": "deferred",
+                        "capacity_wait": True,
+                        "defer_until": timestamp + 60,
+                        "error": "前一条消息仍在处理，按约提醒等待发送",
+                    },
+                    previous_run.get("revision"),
+                )
+                continue
             run = self.store.save(
                 "life_run",
                 key,
                 {
                     "plan_id": plan["id"],
                     "scope": plan["scope"],
+                    "conversation_id": adjustment.get("cid")
+                    or detail.get("capacity_cid")
+                    or plan.get("origin_cid", "")
+                    if wrong_chat
+                    else cid,
+                    "origin_cid": plan.get("origin_cid", ""),
+                    "source": plan.get("source", "user"),
                     "name": plan["name"],
                     "at": timestamp,
                     "anchor_at": anchor_ts,
@@ -2298,11 +2437,25 @@ class LifePlans:
                     "trip_wake": bool(detail.get("trip_wake")),
                     "day_label": detail["profile"]["label"],
                     "timezone": plan["timezone"],
-                    "state": "skipped" if busy else "running",
-                    "error": "上一生活片刻仍在处理中，本次跳过" if busy else "",
+                    "state": "held"
+                    if wrong_chat
+                    else "skipped"
+                    if busy or suppressed
+                    else "running",
+                    "error": "原聊天已切换或来源不明，本次约定未执行"
+                    if wrong_chat
+                    else "上一生活片刻仍在处理中，本次跳过"
+                    if busy
+                    else adjustment.get("reason") or "本次不打扰"
+                    if suppressed
+                    else "",
+                    "decision": adjustment.get("decision", "keep"),
+                    "progress": adjustment.get("progress", "unknown"),
+                    "adjustment_revision": adjustment.get("revision", 0),
                 },
+                previous_run.get("revision"),
             )
-            if run["state"] == "skipped":
+            if run["state"] in ("skipped", "held"):
                 if plan.get("run_once"):
                     self.destroy_plan(plan["id"])
                 continue
@@ -2310,6 +2463,10 @@ class LifePlans:
                 override_cache[sc].add(plan["override_date"])
             self.running_scopes.add(plan["scope"])
             effective_instruction = plan["instruction"]
+            if adjustment.get("decision") == "replace" and adjustment.get(
+                "replacement"
+            ):
+                effective_instruction = adjustment["replacement"]
             if detail.get("trip_wake") and detail["profile"].get("active_trip"):
                 trip = detail["profile"]["active_trip"]
                 effective_instruction = (
@@ -2326,6 +2483,10 @@ class LifePlans:
                 "_delta_minutes": delta_minutes,
                 "_day_profile": detail["profile"],
                 "_trip_wake": bool(detail.get("trip_wake")),
+                "_conversation_id": cid,
+                "_occurrence": self.daily.occurrence(sc, cid, key, at=timestamp)
+                if cid
+                else None,
             }
             task = asyncio.create_task(
                 self.run(
@@ -2340,6 +2501,7 @@ class LifePlans:
 
     async def run(self, plan: dict, run: dict, instruction: str, local_time: str):
         destroy = False
+        status, receipt = None, {}
         try:
             latest = self.store.get("life_plan", plan["id"])
             if (
@@ -2358,6 +2520,8 @@ class LifePlans:
             status, receipt = await self.execute(
                 plan, run["id"], instruction, local_time
             )
+            if status == "deferred":
+                destroy = False
             self.store.save(
                 "life_run",
                 run["id"],
@@ -2367,14 +2531,17 @@ class LifePlans:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            from .continuity import safe_stage
+
             self.store.save(
                 "life_run",
                 run["id"],
                 {
                     **run,
-                    "state": "unknown",
-                    "error": "执行异常，需核对；不会自动重发",
-                    "code": type(exc).__name__,
+                    **receipt,
+                    "state": "sent" if status == "sent" else "unknown",
+                    "error": "发送已确认，执行记录曾保存失败" if status == "sent" else "执行异常，需核对；不会自动重发",
+                    "stages": receipt.get("stages", []) + [safe_stage("sending", "failed" if status == "sent" else "unknown", exc)],
                 },
                 run["revision"],
             )

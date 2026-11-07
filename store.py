@@ -767,6 +767,60 @@ class Store:
             "total": len(rows),
         }
 
+    def save_provider(self, data: dict) -> dict:
+        """Save only one image site, merging against the current locked settings."""
+        from .provider import validate_url
+
+        if not isinstance(data, dict) or set(data) != {"site", "settings_revision"}:
+            raise AlbumError("站点保存参数不正确")
+        if type(data["settings_revision"]) is not int:
+            raise AlbumError("缺少有效设置版本，请刷新后重试")
+        site = data["site"]
+        allowed = {"id", "name", "base_url", "api_keys", "active_key_id", "model",
+                   "size", "reference_field", "enabled", "api_key", "clear_api_key"}
+        if not isinstance(site, dict) or set(site) - allowed:
+            raise AlbumError("站点配置字段不正确")
+        key = text_value(site.get("id", ""), 80)
+        if not key:
+            raise AlbumError("缺少站点编号")
+        site = {**site, "id": key}
+        address = text_value(site.get("base_url", ""))
+        site["base_url"] = validate_url(address if key == "primary" else address.rstrip("/"))
+        if urlsplit(site["base_url"]).query:
+            raise AlbumError("API基础地址不能带查询参数")
+        with self.lock:
+            if data["settings_revision"] != self.settings["settings_revision"]:
+                error = AlbumError("设置已在其他页面或切站后改变，请刷新再保存")
+                error.status_code = 409
+                raise error
+            patch = {"settings_revision": data["settings_revision"]}
+            if key == "primary":
+                patch.update({k: v for k, v in site.items() if k not in {"id", "name", "enabled"}})
+                patch["primary_name"] = text_value(site.get("name", ""), 120) or urlsplit(site["base_url"]).hostname
+                patch["primary_enabled"] = site.get("enabled", False)
+                if not isinstance(patch["primary_enabled"], bool):
+                    raise AlbumError("站点开关必须为布尔值")
+                credentials = merge_credentials(self.settings, site, site["base_url"] == self.settings["base_url"])
+                if patch["primary_enabled"] and not (credentials["api_key"] and text_value(site.get("model", ""))):
+                    raise AlbumError("启用站点前请填写它自己的密钥和模型")
+                # Reuse the normalized identities; replacement keys must not rotate twice.
+                patch.update(credentials)
+                new = not self.settings["base_url"]
+            else:
+                providers = list(self.settings["providers"])
+                index = next((i for i, p in enumerate(providers) if p["id"] == key), None)
+                new = index is None
+                if new:
+                    providers.append(site)
+                else:
+                    providers[index] = site
+                patch["providers"] = providers
+            if new:
+                known = ["primary", *(p["id"] for p in self.settings["providers"])]
+                order = [p for p in self.settings["provider_order"] if p in known and p != key]
+                patch["provider_order"] = list(dict.fromkeys([*order, *(p for p in known if p != key), key]))
+            return self.save_settings(patch)
+
     def save_settings(self, patch: dict) -> dict:
         with self.lock:
             settings = dict(self.settings)
@@ -885,16 +939,20 @@ class Store:
                 settings["preferred_provider"] = "primary"
             settings["settings_revision"] += 1
             tmp = self.settings_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
             try:
-                tmp.chmod(0o600)
+                tmp.write_text(
+                    json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                try:
+                    tmp.chmod(0o600)
+                except OSError:
+                    pass
+                os.replace(tmp, self.settings_path)
             except OSError:
-                pass
-            os.replace(tmp, self.settings_path)
+                tmp.unlink(missing_ok=True)
+                raise
             self.settings = settings
-        return self.public_settings()
+            return self.public_settings()
 
     def public_settings(self) -> dict:
         return {
@@ -988,7 +1046,30 @@ class Store:
                 (scope, fingerprint),
             ).fetchone()
             if old:
-                return self.job(old["id"]), False
+                existing = self.job(old["id"])
+                if existing.get("origin_proactive_id", "") != payload.get("origin_proactive_id", ""):
+                    raise AlbumError("同一图片任务的主动来源不能改变")
+                if existing.get("origin_proactive_id") and any(
+                    existing.get(field) != payload.get(field) for field in ("conversation_id", "character_id")
+                ):
+                    raise AlbumError("同一图片任务的主动来源归属不能改变")
+                return existing, False
+            origin_key = payload.get("origin_proactive_id", "")
+            if origin_key:
+                origin = self.get("proactive_message", origin_key)
+                if (
+                    origin.get("state") != "sent"
+                    or origin.get("scope") != scope
+                    or origin.get("cid") != payload.get("conversation_id")
+                    or origin.get("character_id") != payload.get("character_id")
+                    or origin.get("body_compacted")
+                    or not origin.get("text")
+                ):
+                    raise AlbumError("主动来源未确认或已不可用，未创建图片任务")
+                self.db.execute(
+                    "UPDATE records SET data=json_set(data,'$.body_eligible_at',0,'$.body_eligible_reason',''),"
+                    "revision=revision+1 WHERE kind='proactive_message' AND id=?", (origin_key,)
+                )
             key = uid("job_")
             payload = {**payload, "created": now(), "scope": scope}
             self.db.execute(
@@ -1029,6 +1110,24 @@ class Store:
     def update_job(self, key: str, state: str, **patch) -> dict:
         with self.lock, self.db:
             job = self.job(key)
+            reactivated = (
+                state not in ("ready", "failed", "cancelled") and state != job["state"]
+                or patch.get("notification_state") in ("waiting", "pending")
+                and patch["notification_state"] != job.get("notification_state")
+                or any(patch.get(field) in ("pending", "prepared", "sending")
+                       and patch[field] != job.get(field)
+                       for field in ("delivery", "caption_delivery", "notice", "qzone_delivery"))
+            )
+            if reactivated:
+                # A short dependency may start and finish between maintenance
+                # polls. Invalidate its source grace period at the transition.
+                self.db.execute(
+                    "UPDATE records SET data=json_set(data,'$.body_eligible_at',0,'$.body_eligible_reason',''),"
+                    "revision=revision+1 WHERE kind='proactive_message' AND "
+                    "(id=? OR json_extract(data,'$.job_id')=?) AND "
+                    "COALESCE(json_extract(data,'$.body_compacted'),0)!=1",
+                    (job.get("origin_proactive_id", ""), key),
+                )
             data = {
                 k: v
                 for k, v in {**job, **patch}.items()
@@ -1051,6 +1150,40 @@ class Store:
                 ),
             )
         return cursor.rowcount == 1
+
+    def prepare_delivery(self, key: str, payload: dict) -> bool:
+        """Persist a resumable preparation; this is not a platform send claim."""
+        with self.lock, self.db:
+            row = self.db.execute("SELECT state,data FROM deliveries WHERE id=?", (key,)).fetchone()
+            if row:
+                if row["state"] != "prepared":
+                    return False  # Old receipts may predate the scope fields; never resend.
+                old = json.loads(row["data"])
+                if any(old.get(field) != payload.get(field) for field in (
+                    "scope", "job_id", "target", "asset_id", "asset_ids"
+                )):
+                    raise AlbumError("同一投递的归属或内容来源不能改变")
+                return True
+            self.db.execute("INSERT INTO deliveries VALUES (?,?,?)", (
+                key, "prepared", json.dumps({**payload, "created": now()}, ensure_ascii=False)
+            ))
+            return True
+
+    def start_delivery(self, key: str) -> bool:
+        """Claim the actual transport boundary once, immediately before calling it."""
+        with self.lock, self.db:
+            cursor = self.db.execute(
+                "UPDATE deliveries SET state='sending',data=json_set(data,'$.transport_started_at',?) "
+                "WHERE id=? AND state='prepared'", (now(), key)
+            )
+            return cursor.rowcount == 1
+
+    def mark_worker_error(self, key: str):
+        """Isolate one interrupted worker without stopping unrelated jobs."""
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE jobs SET data=json_set(data,'$.worker_error','LOCAL_SAVE_FAILED') WHERE id=?", (key,)
+            )
 
     def finish_delivery(self, key: str, state: str, **patch):
         with self.lock, self.db:
@@ -1088,6 +1221,7 @@ class Store:
     def recover(self):
         """Mark interrupted writes unknown; never replay a POST on restart."""
         with self.lock, self.db:
+            self.db.execute("UPDATE jobs SET data=json_remove(data,'$.worker_error') WHERE json_extract(data,'$.worker_error') IS NOT NULL")
             for job in self.jobs():
                 if job.get("providers") and (
                     job["state"] == "running"

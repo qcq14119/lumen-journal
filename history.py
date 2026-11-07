@@ -52,17 +52,21 @@ class History:
                 return "任务正在处理或结果待核对"
             if item.get("result_available"):
                 return "仍有待恢复的原图结果"
+            if item.get("notification_state") in ("pending", "running", "unknown"):
+                return "照片接话或投递尚未结束"
             if item.get("qzone_delivery") in ("pending", "sending", "unknown") or (
                 item["state"] == "ready"
                 and item.get("delivery") in ("pending", "sending", "unknown")
             ):
                 return "照片或空间投递尚未结束"
             pending = self.store.db.execute(
-                "SELECT 1 FROM deliveries WHERE json_extract(data,'$.job_id')=? AND state IN ('sending','unknown') LIMIT 1",
+                "SELECT 1 FROM deliveries WHERE json_extract(data,'$.job_id')=? AND state IN ('prepared','sending','unknown') LIMIT 1",
                 (item["id"],),
             ).fetchone()
             return "投递结果待核对" if pending else ""
-        if item["state"] not in ("sent", "failed", "held", "skipped", "cancelled"):
+        if item["state"] not in ("sent", "failed", "held", "skipped", "cancelled") and not (
+            kind == "runs" and item["state"] == "expired"
+        ):
             return "执行或投递结果待核对"
         if kind == "deliveries" and item.get("job_id"):
             try:
@@ -230,6 +234,12 @@ class History:
                         "qzone_delivery",
                         "qzone_tid",
                         "created",
+                        "origin_proactive_id",
+                        "conversation_id",
+                        "notification_state",
+                        "caption_delivery",
+                        "notice",
+                        "deliver",
                     )
                     data = {k: row[k] for k in keep if k in row}
                     data.update(archived=True)

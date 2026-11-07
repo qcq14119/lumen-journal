@@ -20,7 +20,9 @@ class Engine:
         self.provider_factory = provider_factory
         self.tasks = {}
         self.semaphore = asyncio.Semaphore(3)
-        self.notification_lock = asyncio.Lock()
+        self._generating = set()
+        self._notifying = {}
+        self._closed = False
         self.results = store.root / "results"
         self.results.mkdir(exist_ok=True)
 
@@ -30,6 +32,7 @@ class Engine:
         return self.results / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
     async def start(self):
+        self._closed = False
         self.store.recover()
         for job in self.store.jobs():
             if job.get("providers") and job["state"] == "unknown":
@@ -76,11 +79,106 @@ class Engine:
                 )
             ):
                 self.launch(job["id"])
+        self._pump()
 
     def launch(self, key: str):
-        if key not in self.tasks or self.tasks[key].done():
-            self.tasks[key] = asyncio.create_task(self.run(key))
-            self.tasks[key].add_done_callback(lambda _: self.tasks.pop(key, None))
+        job = self.store.job(key)
+        if job["state"] == "ready" and job.get("notification_state") not in ("complete", "failed"):
+            self.store.update_job(key, job["state"], notification_state="pending")
+        self._pump()
+
+    def _pump(self):
+        """Select IDs from the durable queue; keep at most 3 generation + 4 notices."""
+        if self._closed:
+            return
+        active = tuple(self.tasks)
+        excluded = " AND id NOT IN (" + ",".join("?" for _ in active) + ")" if active else ""
+        with self.store.lock:
+            pending = self.store.db.execute(
+                "SELECT id FROM jobs WHERE state IN ('queued','running','downloading') "
+                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + excluded + " ORDER BY rowid LIMIT ?",
+                (*active, max(0, 3 - len(self._generating))),
+            ).fetchall()
+        for row in pending:
+            key = row["id"]
+            self._generating.add(key)
+            task = asyncio.create_task(self._generation_worker(key))
+            self.tasks[key] = task
+            task.add_done_callback(lambda task, key=key: self._done(key, task))
+        if not self.notify:
+            return
+        scopes = tuple(self._notifying.values())
+        scope_filter = " AND scope NOT IN (" + ",".join("?" for _ in scopes) + ")" if scopes else ""
+        with self.store.lock:
+            pending = self.store.db.execute(
+                "SELECT id,scope FROM jobs WHERE rowid IN ("
+                "SELECT min(rowid) FROM jobs WHERE json_extract(data,'$.notification_state')='pending' "
+                "AND state NOT IN ('queued','submitting','running','downloading') "
+                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + scope_filter +
+                " GROUP BY scope ORDER BY min(rowid) LIMIT ?)",
+                (*scopes, max(0, 4 - len(self._notifying))),
+            ).fetchall()
+        for row in pending:
+            key = row["id"]
+            if key in self.tasks:
+                continue
+            self._notifying[key] = row["scope"]
+            task = asyncio.create_task(self._notification_worker(key))
+            self.tasks[key] = task
+            task.add_done_callback(lambda task, key=key: self._done(key, task))
+
+    def _done(self, key, task):
+        if self.tasks.get(key) is not task:
+            return
+        self.tasks.pop(key)
+        self._generating.discard(key)
+        self._notifying.pop(key, None)
+        if not task.cancelled() and task.exception() is not None:
+            # A failed local durable transition cannot be retried in a busy loop.
+            # Restart will re-evaluate the saved state and actual transport record.
+            try:
+                self.store.mark_worker_error(key)
+            except Exception:
+                return
+        self._pump()
+
+    async def _generation_worker(self, key):
+        await self.run(key)
+        job = self.store.job(key)
+        if job.get("deliver") and self.notify:
+            self.store.update_job(key, job["state"], notification_state="pending")
+
+    async def _notification_worker(self, key):
+        try:
+            await self.notify(self.store.job(key))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            job = self.store.job(key)
+            self.store.update_job(key, job["state"], notification_state="failed",
+                                  notification_error="通知处理未完成，请核对投递记录")
+        else:
+            job = self.store.job(key)
+            self.store.update_job(key, job["state"], notification_state="complete")
+
+    async def wait_idle(self):
+        """Wait for this engine's bounded workers, including queued notifications."""
+        self._pump()
+        while self.tasks:
+            await asyncio.gather(*tuple(self.tasks.values()), return_exceptions=True)
+            await asyncio.sleep(0)
+
+    async def wait_job(self, key):
+        """Explicit test/caller wait; no background waiter is created for queued IDs."""
+        self._pump()
+        while self.tasks:
+            job = self.store.job(key)
+            pending = job["state"] in ("queued", "submitting", "running", "downloading")
+            pending = pending or job.get("notification_state") in ("waiting", "pending") and bool(self.notify)
+            if not pending and key not in self.tasks:
+                break
+            await asyncio.wait(tuple(self.tasks.values()), return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.sleep(0)
 
     def submit(
         self,
@@ -91,6 +189,8 @@ class Engine:
         reference_ids=None,
         conversation_id: str = "",
         deliver: bool = False,
+        memory_generation: int | None = None,
+        origin_proactive_id: str = "",
     ) -> dict:
         sites = self.store.provider_configs()
         if not sites:
@@ -148,8 +248,11 @@ class Engine:
                 "prompt": prompt,
                 "failure_style": char["failure_style"],
                 "conversation_id": conversation_id,
+                "memory_generation": memory_generation,
+                "origin_proactive_id": text_value(origin_proactive_id, 160),
                 "deliver": deliver,
                 "delivery": "pending" if deliver else "none",
+                "notification_state": "waiting" if deliver else "none",
                 "provider_task_id": "",
                 "error": "",
                 "asset_id": "",
@@ -219,6 +322,8 @@ class Engine:
             "cancelled",
             error="已停止本地等待；上游任务可能仍会完成",
             result_available=False,
+            notification_state="complete",
+            delivery="cancelled" if job.get("delivery") == "pending" else job.get("delivery", "none"),
             **({"qzone_delivery": "cancelled"} if job.get("qzone_intent") else {}),
         )
         task = self.tasks.get(key)
@@ -383,11 +488,6 @@ class Engine:
                             except OSError:
                                 pass
                             break
-                if job.get("deliver") and self.notify:
-                    # Keep a completed photo's caption and image together while
-                    # other jobs independently generate or wait for their turn.
-                    async with self.notification_lock:
-                        await self.notify(job)
             except asyncio.CancelledError:
                 raise
             except AlbumError as exc:
@@ -406,7 +506,7 @@ class Engine:
                 current = self.store.job(key)
                 if current["state"] == "ready":
                     self.store.update_job(
-                        key, "ready", delivery="failed", error=str(exc)
+                        key, "ready", error="照片已入册，结果整理未完成"
                     )
                 else:
                     state = (
@@ -431,20 +531,13 @@ class Engine:
                             -20:
                         ],
                     )
-                    if job.get("deliver") and self.notify:
-                        try:
-                            async with self.notification_lock:
-                                await self.notify(job)
-                        except Exception:
-                            self.store.update_job(key, state, delivery="failed")
             except Exception as exc:
                 current = self.store.job(key)
                 if current["state"] == "ready":
                     self.store.update_job(
                         key,
                         "ready",
-                        delivery="unknown",
-                        error="照片已入册，通知结果需核对",
+                        error="照片已入册，结果整理未完成",
                     )
                 else:
                     self.store.update_job(
@@ -466,6 +559,7 @@ class Engine:
                     )
 
     async def close(self):
+        self._closed = True
         for task in list(self.tasks.values()):
             task.cancel()
         await asyncio.gather(*list(self.tasks.values()), return_exceptions=True)

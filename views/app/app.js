@@ -1,3 +1,5 @@
+import {mountMemory} from "./memory.js";
+
 const bridge = window.AstrBotPluginView;
 const main = document.getElementById("main");
 const dialog = document.getElementById("dialog");
@@ -6,8 +8,9 @@ const fileInput = document.getElementById("file-input");
 new ResizeObserver(([entry]) => {
   document.documentElement.style.setProperty("--header-height", `${entry.target.getBoundingClientRect().height}px`);
 }).observe(document.querySelector(".app-header"));
-const toolsObserver = new ResizeObserver(([entry]) => {
-  document.documentElement.style.setProperty("--page-tools-height", `${entry.target.getBoundingClientRect().height}px`);
+const toolsObserver = new ResizeObserver(() => {
+  const toolbar = main.querySelector(".sticky-reading-toolbar, :scope > .page-tools > .toolbar, :scope > .page-tools > .subhead, :scope > .toolbar, :scope > .subhead");
+  document.documentElement.style.setProperty("--page-tools-height", `${toolbar?.getBoundingClientRect().height || 0}px`);
 });
 dialog.addEventListener("keydown", (event) => {
   if (event.key !== "Tab") return;
@@ -47,9 +50,15 @@ const kindNames = {
 const selectedPhotos = new Map();
 const selectedPlans = new Map();
 let planSortMenuEvents;
+let albumPanelEvents;
+let settingsSession;
+let settingsWriteBusy = false;
+window.addEventListener("beforeunload", event => {
+  if (settingsWriteBusy || settingsSession && (settingsSession.saving || settingsSession.dirty())) { event.preventDefault(); event.returnValue = ""; }
+});
 const selectedHistory = new Map();
 const historyState = {kind: "jobs", status: "", character: "", query: "", offset: 0, manage: false, page: null};
-const historyNames = {jobs: "生图任务", deliveries: "照片投递", runs: "朝夕足迹"};
+const historyNames = {jobs: "生图任务", deliveries: "照片投递", runs: "朝夕足迹", memory: "拾忆日志"};
 const icons = {
   eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
   hidden: '<path d="m3 3 18 18M10.6 5.1A12 12 0 0 1 12 5c6.5 0 10 7 10 7a19 19 0 0 1-3 4M6.5 6.5A22 22 0 0 0 2 12s3.5 7 10 7a12 12 0 0 0 5.5-1.5"/>',
@@ -61,7 +70,11 @@ const icons = {
   help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 2-2.5 3M12 17h.01"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   camera: '<path d="M3 7h4l2-3h6l2 3h4v13H3Z"/><circle cx="12" cy="13" r="4"/>',
+  search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 11h18M8 15h2M14 15h2"/>',
   lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4M12 14v3"/>',
+  moon: '<path d="M20.5 13A8.5 8.5 0 0 1 11 3.5 8.5 8.5 0 1 0 20.5 13Z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5"/>',
 };
 const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ""}</svg>`;
 const photoIcon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${name === "heart" ? '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/>' : name === "pencil" ? '<path d="m16 3 5 5L8 21H3v-5ZM14 5l5 5"/>' : '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>'}</svg>`;
@@ -76,7 +89,7 @@ const statusNames = {
   unknown: "待核对",
   cancelled: "已停止",
 };
-const recordStatus = {...statusNames, sent: "已发送", sending: "发送中", held: "已保留", skipped: "已跳过"};
+const recordStatus = {...statusNames, sent: "已发送", sending: "发送中", held: "已保留", skipped: "已跳过", expired: "过期未送达"};
 const escape = (value) =>
   String(value ?? "").replace(
     /[&<>"']/g,
@@ -139,15 +152,32 @@ function toast(text, error = false) {
   toastTimer = setTimeout(() => (el.className = ""), 6000);
 }
 async function act(action, payload) {
-  return bridge.apiPost("action/" + action, payload);
+  if (!["settings", "save_provider"].includes(action)) return bridge.apiPost("action/" + action, payload);
+  if (settingsWriteBusy) throw new Error("设置正在保存，请稍后重试");
+  settingsWriteBusy = true;
+  try { return await bridge.apiPost("action/" + action, payload); }
+  finally { settingsWriteBusy = false; }
 }
 async function refreshData() {
   state.data = await bridge.apiGet("state");
+  const size = main.querySelector("#album-storage-size");
+  if (size) size.textContent = (state.data.storage_bytes / 1024 / 1024).toFixed(1);
 }
+let dialogPagePosition = null;
+dialog.addEventListener("close", () => {
+  if (dialog.open || !dialogPagePosition) return;
+  const position = dialogPagePosition;
+  dialogPagePosition = null;
+  window.scrollTo({...position, behavior: "instant"});
+});
 function showDialog(title, body, foot = "") {
+  if (!dialog.open) dialogPagePosition = {left: window.scrollX, top: window.scrollY};
   delete content.dataset.assetId;
   content.innerHTML = `<div class="dialog-head"><h2 id="dialog-title">${escape(title)}</h2><button class="close" aria-label="关闭" data-close>×</button></div>${body}${foot}`;
-  if (!dialog.open) dialog.showModal();
+  if (!dialog.open) {
+    dialog.showModal();
+    window.scrollTo({...dialogPagePosition, behavior: "instant"});
+  }
   content
     .querySelectorAll("[data-close]")
     .forEach((btn) => (btn.onclick = () => dialog.close()));
@@ -189,10 +219,13 @@ async function thumbs(root) {
   );
 }
 async function render() {
+  settingsSession?.dispose(); settingsSession = null;
   const serial = ++state.serial;
   planSortMenuEvents?.abort();
+  albumPanelEvents?.abort();
   toolsObserver.disconnect();
   main.dataset.page = state.tab;
+  document.getElementById("mobile-app-select").value = state.tab;
   main.setAttribute("aria-busy", "true");
   document.querySelectorAll("[data-tab]").forEach((b) => {
     if (b.dataset.tab === state.tab) b.setAttribute("aria-current", "page");
@@ -204,15 +237,16 @@ async function render() {
     if (state.tab === "jobs") await renderJobs(serial);
     if (state.tab === "plans") await renderPlans();
     if (state.tab === "settings") renderSettings();
+    if (state.tab === "memory") await mountMemory({main, bridge, showDialog, footer, busy, toast, escape, helpTip, serial, openDiagnostics: target => {historyState.kind="memory"; historyState.scope=target.scope; historyState.cid=target.cid; historyState.status="failed"; historyState.query=""; historyState.offset=0; state.tab="jobs"; return render();}, isCurrent: () => state.tab === "memory" && serial === state.serial});
   } catch (e) {
     if (serial === state.serial) {
       main.innerHTML = `<div class="empty"><h2>暂时无法打开</h2><p>${escape(e.message)}</p><button id="retry">重新加载</button></div>`;
       main.querySelector("#retry").onclick = () => reload();
     }
   } finally {
-    const toolbar = main.querySelector(":scope > .page-tools, :scope > .toolbar, :scope > .subhead");
+    const toolbar = main.querySelector(".sticky-reading-toolbar, :scope > .page-tools > .toolbar, :scope > .page-tools > .subhead, :scope > .toolbar, :scope > .subhead");
     document.documentElement.style.setProperty("--page-tools-height", `${toolbar?.getBoundingClientRect().height || 0}px`);
-    if (toolbar) toolsObserver.observe(toolbar);
+    toolsObserver.observe(main);
     main.setAttribute("aria-busy", "false");
   }
 }
@@ -221,7 +255,11 @@ async function reload() {
   await render();
 }
 function nav(tab) {
+  document.getElementById("mobile-app-select").value = state.tab;
   if (state.tab === tab) return;
+  if (settingsWriteBusy || settingsSession?.saving || settingsSession?.dirty() && !window.confirm("有未保存的设置，离开后将放弃这些修改。继续离开？")) {
+    return;
+  }
   selectedPhotos.clear(); state.albumManage = false;
   selectedPlans.clear(); state.planManage = false;
   selectedHistory.clear(); historyState.manage = false;
@@ -232,20 +270,25 @@ function nav(tab) {
 document
   .querySelectorAll("[data-tab]")
   .forEach((b) => (b.onclick = () => nav(b.dataset.tab)));
+document.getElementById("mobile-app-select").onchange = (event) => nav(event.target.value);
 
-async function renderAlbum(serial) {
+async function renderAlbum(serial, nextFilter = null) {
+  if (state.tab !== "album") return;
+  const filterState = {...state, ...nextFilter};
   const result = await bridge.apiGet("assets", {
-    character_id: state.character,
-    category: state.category,
-    query: state.query,
-    offset: state.offset,
-    start_date: state.startDate || "", end_date: state.endDate || "",
+    character_id: filterState.character,
+    category: filterState.category,
+    query: filterState.query,
+    offset: filterState.offset,
+    start_date: filterState.startDate || "", end_date: filterState.endDate || "",
   });
-  if (serial !== state.serial) return;
-  if (!result.items.length && result.total && state.offset >= result.total) {
-    state.offset = Math.floor((result.total - 1) / 24) * 24;
-    return renderAlbum(serial);
+  if (serial !== state.serial || state.tab !== "album") return;
+  if (!result.items.length && result.total && filterState.offset >= result.total) {
+    return renderAlbum(serial, {...nextFilter, offset: Math.floor((result.total - 1) / 24) * 24});
   }
+  if (nextFilter) { Object.assign(state, nextFilter); selectedPhotos.clear(); }
+  albumPanelEvents?.abort();
+  albumPanelEvents = new AbortController();
   state.assets = result.items;
   const filtered = Boolean(state.query || state.character || state.category !== "all" || state.startDate || state.endDate);
   let gallery = "";
@@ -264,37 +307,62 @@ async function renderAlbum(serial) {
     gallery += `<article class="photo ${selectedPhotos.has(a.id) ? "selected" : ""}"><button class="photo-open" data-detail="${a.id}" aria-label="${state.albumManage ? "选择" : "查看"} ${escape(a.description || "未命名照片")}" ${state.albumManage ? `aria-pressed="${selectedPhotos.has(a.id)}"` : ""}><img data-asset="${a.id}" alt="${escape(a.description || "相册照片")}" loading="lazy"><div class="caption"><p>${escape(a.description || "未命名照片")}</p><small>${escape(charName(a.character_id))} · ${kindNames[a.kind]}</small></div></button>${state.albumManage ? `<label class="photo-select"><input type="checkbox" data-select-photo="${a.id}" aria-label="选择照片 ${escape(a.description || a.id)}" ${selectedPhotos.has(a.id) ? "checked" : ""}></label>` : `<div class="photo-actions">${["generated", "imported"].includes(a.kind) ? `<button class="icon-button favorite-button" data-favorite="${a.id}" aria-label="${a.favorite ? "取消收藏" : "收藏照片"}" aria-pressed="${a.favorite}" title="${a.favorite ? "取消收藏" : "收藏"}">${photoIcon("heart")}</button>` : ""}${a.trash ? `<button data-restore="${a.id}">恢复</button>` : `<button class="icon-button danger" data-trash-photo="${a.id}" aria-label="删除照片" title="移到回收站">${photoIcon("trash")}</button>`}</div>${a.favorite ? '<span class="favorite-mark" aria-label="已收藏">♥</span>' : ""}`}</article>`;
   }
   if (day) gallery += "</div>";
-  main.innerHTML = `<div class="page-tools"><div class="toolbar"><div class="filters"><select id="album-character" aria-label="查看角色">${options(state.character, true)}</select><input id="search" aria-label="搜索照片" placeholder="搜索照片" value="${escape(state.query)}"></div><div class="actions"><button id="manage-album">${state.albumManage ? "完成管理" : "管理相册"}</button><button id="import">导入照片</button><button id="generate" class="primary">生成照片</button></div></div><div class="categories" role="group" aria-label="照片分类">${Object.entries(
-    {
-      all: "全部照片",
-      favorite: "收藏",
-      generated: "已生成",
-      imported: "已导入",
-      scene: "临时场景参考",
-      trash: "回收站",
-    },
-  )
-    .map(
-      ([k, v]) =>
-        `<button data-category="${k}" class="${state.category === k ? "active" : ""}" aria-pressed="${state.category === k}">${v}</button>`,
-    )
-    .join(
-      "",
-    )}</div><div class="album-range"><div class="actions"><input type="date" id="album-from" aria-label="开始日期" value="${state.startDate || ""}"><span>至</span><input type="date" id="album-to" aria-label="结束日期" value="${state.endDate || ""}"><button id="filter-dates">查看</button></div></div>${state.albumManage ? `<div class="album-batch"><span id="selection-count" role="status"></span><div class="actions"><button id="select-page">全选本页</button><button id="clear-selection">取消选择</button><button id="batch-favorite" aria-label="收藏所选照片" title="收藏所选" class="icon-button favorite-button">${photoIcon("heart")}</button><button id="batch-unfavorite">取消收藏</button><button id="batch-trash" aria-label="删除所选照片" title="移到回收站" class="icon-button danger">${photoIcon("trash")}</button>${state.category === "trash" ? `<button id="batch-restore">恢复所选</button>` : ""}</div></div>` : ""}</div>${gallery || `<div class="empty"><div class="empty-icon" aria-hidden="true">▧</div><h2>${chars().length ? filtered ? "无匹配照片" : "暂无照片" : "先创建一个角色"}</h2>${!filtered && chars().length ? "<p>导入或生成照片</p>" : ""}<div class="actions"><button id="empty-action" class="primary">${!chars().length ? "设置角色参考" : filtered ? "重置筛选" : "导入照片"}</button></div></div>`}<div class="pagination"><button id="prev" ${state.offset === 0 ? "disabled" : ""}>上一页</button><span>${result.total} 张照片 · ${Math.floor(state.offset / 24) + 1} 页</span><button id="next" ${state.offset + 24 >= result.total ? "disabled" : ""}>下一页</button></div>`;
+  const categories = Object.entries({all: "全部照片", favorite: "收藏", generated: "已生成", imported: "已导入", scene: "临时场景参考", trash: "回收站"}).map(([k,v]) => `<button data-category="${k}" class="${state.category === k ? "active" : ""}" aria-pressed="${state.category === k}">${v}</button>`).join("");
+  const batch = `<div class="album-batch"><span id="selection-count" role="status"></span><div class="actions"><button id="select-page">全选本页</button><button id="clear-selection">取消选择</button><button id="batch-favorite" aria-label="收藏所选照片" title="收藏所选" class="icon-button favorite-button">${photoIcon("heart")}</button><button id="batch-unfavorite">取消收藏</button><button id="batch-trash" aria-label="删除所选照片" title="移到回收站" class="icon-button danger">${photoIcon("trash")}</button>${state.category === "trash" ? '<button id="batch-restore">恢复所选</button>' : ""}<button id="manage-album">完成管理</button></div></div>`;
+  main.innerHTML = `<h2 class="sr-only">相册</h2><div class="page-tools album-tools"><div class="toolbar album-toolbar"><select id="album-character" aria-label="查看角色">${options(state.character, true)}</select>${state.albumManage ? batch : `<div class="actions"><button id="album-search-toggle" class="icon-button ${state.query ? 'has-filter' : ''}" aria-label="搜索照片" title="搜索照片" aria-expanded="false" aria-controls="album-filter-panel">${icon("search")}</button><button id="album-date-toggle" class="icon-button ${state.startDate || state.endDate ? 'has-filter' : ''}" aria-label="按日期筛选" title="按日期筛选" aria-expanded="false" aria-controls="album-filter-panel">${icon("calendar")}</button><button id="import"><span class="desktop-label">导入照片</span><span class="mobile-label">导入</span></button><button id="generate" class="primary"><span class="desktop-label">生成照片</span><span class="mobile-label">生成</span></button><button id="album-more-toggle" class="icon-button" aria-label="更多相册操作" title="更多操作" aria-expanded="false" aria-controls="album-filter-panel">···</button></div><div id="album-filter-panel" class="album-filter-panel" hidden></div>`}</div></div><div class="categories album-categories" role="group" aria-label="照片分类">${categories}</div><div class="album-active-filters" ${state.query || state.startDate || state.endDate ? '' : 'hidden'}>${state.query ? `<button data-clear-filter="search" class="filter-chip" aria-label="清除搜索：${escape(state.query)}">${icon("search")}${escape(state.query)}<span aria-hidden="true">×</span></button>` : ''}${state.startDate || state.endDate ? `<button data-clear-filter="date" class="filter-chip" aria-label="清除日期筛选">${icon("calendar")}${escape(state.startDate || "不限")} — ${escape(state.endDate || "不限")}<span aria-hidden="true">×</span></button>` : ''}<p class="album-filter-error" role="alert" hidden></p></div>${gallery || `<div class="empty"><div class="empty-icon" aria-hidden="true">▧</div><h2>${chars().length ? filtered ? "无匹配照片" : "暂无照片" : "先创建一个角色"}</h2>${!filtered && chars().length ? "<p>导入或生成照片</p>" : ""}<div class="actions"><button id="empty-action" class="primary">${!chars().length ? "设置角色参考" : filtered ? "重置筛选" : "导入照片"}</button></div></div>`}<div class="pagination"><button id="prev" ${state.offset === 0 ? "disabled" : ""}>上一页</button><span>${result.total} 张照片 · ${Math.floor(state.offset / 24) + 1} 页</span><button id="next" ${state.offset + 24 >= result.total ? "disabled" : ""}>下一页</button></div>`;
   main.querySelector("#album-character").onchange = (e) => {
     selectedPhotos.clear();
     state.character = e.target.value;
     state.offset = 0;
     render();
   };
-  main.querySelector("#search").onkeydown = (e) => {
-    if (e.key === "Enter") {
-      selectedPhotos.clear();
-      state.query = e.target.value.trim();
-      state.offset = 0;
-      render();
-    }
+  const manageAlbum = () => { state.albumManage = !state.albumManage; selectedPhotos.clear(); render(); };
+  const panel = main.querySelector("#album-filter-panel");
+  let panelTrigger = null;
+  const closePanel = (restore = false) => {
+    if (!panel) return;
+    panel.hidden = true;
+    panelTrigger?.setAttribute("aria-expanded", "false");
+    if (restore) panelTrigger?.focus({preventScroll: true});
+    panelTrigger = null;
   };
+  const applyFilter = async (patch, button, error) => {
+    if (state.tab !== "album") return;
+    const requestSerial = ++state.serial;
+    button.disabled = true; button.setAttribute("aria-busy", "true"); error.hidden = true;
+    try { await renderAlbum(requestSerial, {...patch, offset: 0}); }
+    catch (e) {
+      if (requestSerial === state.serial && error.isConnected) { error.textContent = e.message || "筛选暂时不可用"; error.hidden = false; }
+    } finally { if (button.isConnected) { button.disabled = false; button.removeAttribute("aria-busy"); } }
+  };
+  for (const kind of ["search", "date", "more"]) {
+    const trigger = main.querySelector(`#album-${kind}-toggle`);
+    if (!trigger) continue;
+    trigger.onclick = () => {
+      if (panelTrigger === trigger) return closePanel(true);
+      closePanel(); panelTrigger = trigger; trigger.setAttribute("aria-expanded", "true"); panel.hidden = false;
+      panel.innerHTML = kind === "more" ? '<button id="manage-album">管理相册</button>' : `<form class="album-filter-form">${kind === "search" ? `<label for="search">搜索照片</label><input id="search" type="search" value="${escape(state.query)}" placeholder="照片内容或关键词">` : `<div class="form-row"><div><label for="album-from">开始日期</label><input id="album-from" type="date" value="${state.startDate || ''}"></div><div><label for="album-to">结束日期</label><input id="album-to" type="date" value="${state.endDate || ''}"></div></div>`}<p class="album-panel-error" role="alert" hidden></p><div class="actions"><button type="button" data-panel-close>取消</button><button type="submit" class="primary">${kind === "search" ? "搜索" : "应用日期"}</button></div></form>`;
+      if (kind === "more") { panel.querySelector("#manage-album").onclick = manageAlbum; return; }
+      const form = panel.querySelector("form"), error = panel.querySelector('[role="alert"]');
+      form.querySelector('[data-panel-close]').onclick = () => closePanel(true);
+      form.onsubmit = async (event) => {
+        event.preventDefault(); if (!form.reportValidity()) return;
+        const from = form.querySelector("#album-from"), to = form.querySelector("#album-to");
+        if (from?.value && to?.value && from.value > to.value) { error.textContent = "结束日期不能早于开始日期"; error.hidden = false; to.focus(); return; }
+        await applyFilter(kind === "search" ? {query: form.querySelector("#search").value.trim()} : {startDate: from.value, endDate: to.value}, form.querySelector('[type="submit"]'), error);
+      };
+      form.querySelector("input").focus({preventScroll: true});
+    };
+  }
+  document.addEventListener("click", (event) => {
+    if (panelTrigger && !panel.contains(event.target) && !event.target.closest('[id^="album-"][id$="-toggle"]')) closePanel();
+  }, {signal: albumPanelEvents.signal});
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && panelTrigger && !event.defaultPrevented) { event.preventDefault(); closePanel(true); }
+  }, {signal: albumPanelEvents.signal});
+  main.querySelectorAll("[data-clear-filter]").forEach(button => {
+    button.onclick = () => applyFilter(button.dataset.clearFilter === "search" ? {query: ""} : {startDate: "", endDate: ""}, button, main.querySelector(".album-filter-error"));
+  });
   main.querySelectorAll("[data-category]").forEach(
     (b) =>
       (b.onclick = () => {
@@ -332,13 +400,7 @@ async function renderAlbum(serial) {
     selectedPhotos.clear(); await refreshData(); await render();
     toast(patch.trash ? "已移到回收站，可以恢复" : "照片已更新");
   };
-  main.querySelector("#manage-album").onclick = () => { state.albumManage = !state.albumManage; selectedPhotos.clear(); render(); };
-  main.querySelector("#filter-dates").onclick = () => {
-    const from = main.querySelector("#album-from"), to = main.querySelector("#album-to");
-    if (!from.reportValidity() || !to.reportValidity()) return;
-    if (from.value && to.value && from.value > to.value) { toast("结束日期不能早于开始日期", true); to.focus(); return; }
-    state.startDate = from.value; state.endDate = to.value; state.offset = 0; selectedPhotos.clear(); render();
-  };
+  if (state.albumManage) main.querySelector("#manage-album").onclick = manageAlbum;
   main.querySelectorAll("[data-select-photo]").forEach((input) => input.onchange = () => toggleSelection(result.items.find((a) => a.id === input.dataset.selectPhoto)));
   for (const [attribute, patch] of [["favorite", null], ["trash-photo", {trash:true}], ["restore", {trash:false}]]) {
     main.querySelectorAll(`[data-${attribute}]`).forEach((button) => button.onclick = () => busy(button, () => {
@@ -367,8 +429,10 @@ async function renderAlbum(serial) {
     state.offset += 24;
     render();
   };
-  main.querySelector("#import").onclick = openImport;
-  main.querySelector("#generate").onclick = openGenerate;
+  if (!state.albumManage) {
+    main.querySelector("#import").onclick = openImport;
+    main.querySelector("#generate").onclick = openGenerate;
+  }
   const empty = main.querySelector("#empty-action");
   if (empty)
     empty.onclick = () => {
@@ -665,6 +729,7 @@ function openGenerate() {
 }
 
 async function renderJobs(serial) {
+  if (historyState.kind === "memory") return renderMemoryDiagnostics(serial);
   const r = await bridge.apiGet("history", {kind: historyState.kind, status: historyState.status, character: historyState.character, query: historyState.query, offset: historyState.offset});
   if (state.tab !== "jobs" || serial !== state.serial) return;
   historyState.page = r; historyState.offset = r.offset;
@@ -683,7 +748,7 @@ async function renderJobs(serial) {
   main.querySelector('#manage-history').onclick=()=>{historyState.manage=!historyState.manage;selectedHistory.clear();render();};
   main.querySelector('#refresh-jobs').onclick=e=>busy(e.currentTarget,async()=>{selectedHistory.clear();await render();toast('记录已刷新');});
   main.querySelector('#history-policy').onclick=()=>openHistoryPolicy();
-  main.querySelectorAll('[data-history-kind]').forEach(b=>b.onclick=()=>{historyState.kind=b.dataset.historyKind;historyState.status=historyState.character=historyState.query='';historyState.offset=0;selectedHistory.clear();render();});
+  main.querySelectorAll('[data-history-kind]').forEach(b=>b.onclick=()=>{historyState.kind=b.dataset.historyKind;historyState.scope=historyState.cid="";historyState.status=historyState.character=historyState.query='';historyState.offset=0;selectedHistory.clear();render();});
   main.querySelector('#history-filter').onsubmit=e=>{e.preventDefault();historyState.status=main.querySelector('#history-status').value;historyState.character=main.querySelector('#history-character')?.value||'';historyState.query=main.querySelector('#history-query').value.trim();historyState.offset=0;selectedHistory.clear();render();};
   main.querySelector('#history-reset').onclick=()=>{historyState.status=historyState.character=historyState.query='';historyState.offset=0;selectedHistory.clear();render();};
   const emptyReset=main.querySelector('#history-empty-reset');
@@ -704,9 +769,22 @@ async function renderJobs(serial) {
   }
   main.querySelectorAll('[data-history-detail]').forEach(b=>b.onclick=()=>busy(b,async()=>{
     const j=r.items.find(x=>x.id===b.dataset.historyDetail);
-    if(kind==='jobs'){const detail=await bridge.apiGet('job/'+j.id);openJobDetail(detail.job,detail.deliveries);}
-    else showDialog(historyNames[kind]+'详情',`<div class="dialog-body"><dl><dt>状态</dt><dd>${escape(recordStatus[j.state]||j.state)}</dd><dt>时间</dt><dd>${date(j.created||j.at||0)}</dd>${j.error?`<dt>错误说明</dt><dd>${escape(j.error)}</dd>`:""}</dl>${j.protection?`<p class="help">${escape(j.protection)}</p>`:""}<details class="help-details"><summary>记录详情</summary><dl><dt>记录编号</dt><dd class="mono">${escape(j.id)}</dd>${j.message_id?`<dt>消息编号</dt><dd>${escape(j.message_id)}</dd>`:""}${j.tid?`<dt>空间编号</dt><dd>${escape(j.tid)}</dd>`:""}</dl></details></div>`);
+    if(kind==='jobs'){const detail=await bridge.apiGet('job/'+j.id);openJobDetail(detail.job,detail.deliveries,detail.proactive || []);}
+    else showDialog(historyNames[kind]+'详情',`<div class="dialog-body"><dl><dt>状态</dt><dd>${escape(recordStatus[j.state]||j.state)}</dd><dt>时间</dt><dd>${date(j.created||j.at||0)}</dd>${j.error?`<dt>错误说明</dt><dd>${escape(j.error)}</dd>`:""}</dl>${j.protection?`<p class="help">${escape(j.protection)}</p>`:""}${renderActionStages(j.stages || [])}<details class="help-details"><summary>记录详情</summary><dl><dt>记录编号</dt><dd class="mono">${escape(j.id)}</dd>${j.message_id?`<dt>消息编号</dt><dd>${escape(j.message_id)}</dd>`:""}${j.tid?`<dt>空间编号</dt><dd>${escape(j.tid)}</dd>`:""}</dl></details></div>`);
   }));
+}
+
+async function renderMemoryDiagnostics(serial) {
+  const r = await bridge.apiGet("memory/diagnostics", {scope:historyState.scope || "",cid:historyState.cid || "",status:historyState.status,query:historyState.query,offset:historyState.offset});
+  if (state.tab !== "jobs" || serial !== state.serial) return;
+  historyState.offset = r.offset;
+  const names = {reorganization_saving:"保存候选结果中",reorganization_generating:"候选生成中",reorganization_retrying:"候选重试中",reorganization_repairing:"候选AI修复中",history_generating:"历史概览生成中",history_retrying:"历史整理重试中",history_repairing:"历史概览修复中",history_completed:"历史概览已保存",history_failed:"历史整理未完成",history_save_failed:"历史候选发布失败",history_resume_failed:"原任务续跑未完成",repairing:"AI修复中",repair_validated:"修复校验通过",summary_failed:"总结失败",check_failed:"检查助手失败",check_repairing:"检查AI修复中",index_failed:"向量生成失败",recall_failed:"召回失败",recall_fallback:"召回改用字面查找",recalled:"召回完成",rerank_failed:"精排失败",summarized:"总结完成",checked:"检查完成",indexed:"向量已更新",image_described:"图片已描述",image_failed:"图片描述失败",undone:"已撤销",reset:"已重置",restored:"已恢复",copied:"已复制",imported:"已导入",inject_failed:"本轮未加入记忆",retrying:"重试中",checking:"检查中",summarizing:"总结中",queued:"等待处理",stopped:"已停止"};
+  main.innerHTML = `<div class="page-tools"><div class="subhead"><h2>任务记录</h2><button id="memory-log-refresh">刷新</button></div><div class="categories history-nav" role="group" aria-label="记录类型">${Object.entries(historyNames).map(([key,name]) => `<button data-history-kind="${key}" aria-pressed="${key === "memory"}" class="${key === "memory" ? "active" : ""}">${name}</button>`).join("")}</div><form id="memory-log-filter" class="history-filter"><label>状态<select id="memory-log-status"><option value="">全部日志</option><option value="failed" ${historyState.status === "failed" ? "selected" : ""}>仅失败</option></select></label><label>搜索<input id="memory-log-query" maxlength="200" value="${escape(historyState.query)}" placeholder="状态、错误或编号"></label><button type="submit">筛选</button>${historyState.scope || historyState.cid ? '<button id="memory-log-all" type="button">查看全部聊天</button>' : ""}</form>${historyState.scope ? `<p class="memory-binding-scope">${escape(historyState.scope.replace(':FriendMessage:', ' · 私聊 · ').replace(':GroupMessage:', ' · 群聊 · '))} · 文件 ${escape(historyState.cid?.slice(0,8) || "全部")}</p>` : ""}<div class="history-status">共 ${r.total} 条</div></div><section class="history-list" aria-label="拾忆日志">${r.items.map(item => `<article class="history-card"><div class="history-card-head"><strong>${escape(names[item.state] || item.state)}</strong><time>${date(item.at)}</time><span>#${item.id}</span></div><p class="${item.state.includes("failed") ? "memory-error" : ""}">${escape(item.detail.split(" [diag ")[0])}</p><details><summary>诊断详情</summary><dl><dt>会话对象</dt><dd>${escape(item.scope)}</dd><dt>聊天文件</dt><dd>${escape(item.cid)}</dd><dt>状态代码</dt><dd>${escape(item.state)}</dd>${item.detail.includes(" [diag ") ? `<dt>错误类别与位置</dt><dd class="memory-diagnostic-tech">${escape(item.detail.split(" [diag ")[1].replace(/\]$/, ""))}</dd>` : ""}</dl></details></article>`).join("") || '<p class="empty">暂无匹配日志</p>'}</section><div class="actions history-pager"><button id="memory-log-prev" ${r.offset === 0 ? "disabled" : ""}>上一页</button><span>第 ${Math.floor(r.offset/20)+1} / ${Math.max(1,Math.ceil(r.total/20))} 页</span><button id="memory-log-next" ${r.offset+20 >= r.total ? "disabled" : ""}>下一页</button></div>`;
+  main.querySelectorAll("[data-history-kind]").forEach(button => {button.onclick = () => {historyState.kind=button.dataset.historyKind;historyState.scope=historyState.cid=historyState.status=historyState.query="";historyState.offset=0;return render();};});
+  main.querySelector("#memory-log-refresh").onclick = () => render();
+  main.querySelector("#memory-log-filter").onsubmit = event => {event.preventDefault();historyState.status=main.querySelector("#memory-log-status").value;historyState.query=main.querySelector("#memory-log-query").value.trim();historyState.offset=0;return render();};
+  const all = main.querySelector("#memory-log-all"); if (all) all.onclick = () => {historyState.scope=historyState.cid="";historyState.offset=0;return render();};
+  for (const [name,offset] of [["prev",Math.max(0,r.offset-20)],["next",r.offset+20]]) main.querySelector(`#memory-log-${name}`).onclick = () => {historyState.offset=offset;return render();};
 }
 
 async function openHistoryPolicy() {
@@ -714,13 +792,131 @@ async function openHistoryPolicy() {
     await refreshData();
     const s=state.data.settings;
     const preview=await act('history_cleanup',{});
-    showDialog('记录保留设置',`<form id="history-policy-form" class="dialog-body"><p>超期或超量时清理已结束的详情，清理后无法恢复，照片保留。受保护记录可能超出上限。</p><label for="record-days">保留天数</label><input id="record-days" type="number" min="1" max="3650" required value="${s.records_retention_days}"><label for="record-count">每类记录数量上限</label><input id="record-count" type="number" min="20" max="10000" required value="${s.records_max_count}"><details class="help-details"><summary>清理与保护规则</summary><p>每分钟检查，每类每次最多清理200条。活动任务、待恢复、结果未知及现有计划的最后一次执行受保护。详细日志清理后无法恢复；照片生成信息与防重信息保留，数据库空间供后续复用。</p></details><ul>${Object.entries(preview).map(([k,v])=>`<li>${historyNames[k]}：${v.retained} 条，${v.protected} 条受保护，按当前规则可清理 ${v.eligible} 条</li>`).join('')}</ul></form>`,footer('<button id="cancel-policy">取消</button><button class="primary" type="submit" form="history-policy-form" id="save-policy">保存保留设置</button>'));
+    showDialog('记录保留设置',`<form id="history-policy-form" class="dialog-body"><p>超期或超量时清理已结束的详情，清理后无法恢复，照片保留。受保护记录可能超出上限。</p><label for="record-days">保留天数</label><input id="record-days" type="number" min="1" max="3650" required value="${s.records_retention_days}"><label for="record-count">每类记录数量上限</label><input id="record-count" type="number" min="20" max="10000" required value="${s.records_max_count}"><details class="help-details"><summary>清理与保护规则</summary><p>每分钟检查，每类每次最多清理200条。活动任务、待恢复、结果未知及现有计划的最后一次执行受保护。详细日志清理后无法恢复；照片生成信息与防重信息保留，数据库空间供后续复用。</p><p>拾忆日志按同样的天数和数量每小时清理；其中的召回记录另外只保留7天、最多300条。</p></details><ul>${Object.entries(preview).map(([k,v])=>`<li>${historyNames[k]}：${v.retained} 条，${v.protected} 条受保护，按当前规则可清理 ${v.eligible} 条</li>`).join('')}</ul></form>`,footer('<button id="cancel-policy">取消</button><button class="primary" type="submit" form="history-policy-form" id="save-policy">保存保留设置</button>'));
     content.querySelector('#cancel-policy').onclick=()=>dialog.close();
     content.querySelector('#history-policy-form').onsubmit=e=>{e.preventDefault();busy(content.querySelector('#save-policy'),async()=>{await act('settings',{settings_revision:s.settings_revision,records_retention_days:Number(content.querySelector('#record-days').value),records_max_count:Number(content.querySelector('#record-count').value)});dialog.close();selectedHistory.clear();await reload();toast('保留设置已保存');});};
   }catch(e){toast(e.message,true);}
 }
 
-function openJobDetail(j, receipts = null) {
+function renderProactiveMarkup(records = []) {
+  if (!records.length) return "";
+  const historyNames = {saved:"历史已保存", pending:"已发送，历史待保存", orphaned:"原聊天已删除或不可写"};
+  const kinds = {text:"主动消息", caption:"照片接话", photo:"照片引用", photo_delivery:"照片引用", notice:"照片状态", started:"拍照接单"};
+  return `<section class="proactive-records" aria-label="发送原文与聊天历史">${records.map(r=>`<details class="proactive-record"><summary>${escape(kinds[r.kind] || "主动消息")} · ${escape(r.state === "sent" ? historyNames[r.history_state] || "已发送，历史待保存" : recordStatus[r.state] || "尚未发送")}${r.sent_at ? ` · ${escape(date(r.sent_at))}` : ""}</summary>
+    <p class="preserve-text">${r.body_compacted ? "正文已清理" : escape(r.text)}</p><dl><dt>目标聊天</dt><dd class="mono">${escape(r.cid || "未记录")}</dd><dt>发送对象</dt><dd class="mono">${escape(r.scope)}</dd></dl>
+    ${r.history_error ? `<p class="history-error">${escape(r.history_error)}</p>` : ""}
+    ${r.state === "sent" && r.history_state === "pending" && !r.body_compacted && !r.chat_deleted_at ? `<button type="button" data-history-retry="${escape(r.id)}">重试保存历史</button>` : ""}
+    <p class="history-error" data-proactive-error="${escape(r.id)}" role="alert" tabindex="-1" hidden></p></details>`).join("")}</section>`;
+}
+
+function bindProactiveRetry(root, refresh) {
+  root.querySelectorAll('[data-history-retry]').forEach(button=>button.onclick=async()=>{
+    const original = button.textContent;
+    const error = [...root.querySelectorAll('[data-proactive-error]')].find(el=>el.dataset.proactiveError === button.dataset.historyRetry);
+    error.hidden = true; button.disabled = true; button.textContent = "正在保存…"; button.setAttribute("aria-busy", "true");
+    try {
+      await act("retry_proactive_history", {key:button.dataset.historyRetry});
+      if (button.isConnected) await refresh();
+    } catch (err) {
+      if (button.isConnected) {error.textContent = err.message || "历史保存失败，请稍后重试"; error.hidden = false; error.focus();}
+    } finally {
+      if (button.isConnected) {button.disabled = false; button.textContent = original; button.removeAttribute("aria-busy");}
+    }
+  });
+}
+
+function renderActionStages(stages = []) {
+  if (!stages.length) return "";
+  const labels = {generation:"生成接话",validation:"发送前校验",sending:"消息投递",history:"历史补存",photo:"附带照片",follow_up:"后续约定"};
+  const states = {ok:"完成",failed:"失败",held:"已阻止",pending:"待处理",skipped:"未执行",unknown:"待核对",fallback:"使用最小退路"};
+  return `<details class="help-details"><summary>处理诊断</summary>${stages.map(s=>`<p>${s.at ? escape(date(s.at)) + " · " : ""}${escape(labels[s.stage] || s.stage)} · ${escape(states[s.status] || s.status)}${s.code ? ` · ${escape(s.code)}` : ""}</p>`).join("")}</details>`;
+}
+
+function occurrenceLocalValue(timestamp, timezone) {
+  const parts = new Intl.DateTimeFormat("en-CA", {timeZone:timezone || "Asia/Shanghai", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hourCycle:"h23"}).formatToParts(new Date(timestamp * 1000));
+  const p = Object.fromEntries(parts.map(item=>[item.type,item.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+
+function occurrenceTimestamp(value, timezone) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) throw new Error("请选择完整的日期和时间");
+  const naive = Date.parse(value + "Z") / 1000;
+  if (!Number.isFinite(naive)) throw new Error("日期或时间无效");
+  const offsets = new Set([-36,0,36].map(h=>{
+    const sample = naive + h * 3600;
+    return Date.parse(occurrenceLocalValue(sample,timezone) + "Z") / 1000 - sample;
+  }));
+  const matches = [...offsets].map(offset=>naive-offset).filter(ts=>occurrenceLocalValue(ts,timezone) === value);
+  if (!matches.length) throw new Error("该日期或当地时间不存在，请重新选择");
+  if (matches.length > 1) throw new Error("该当地时间因夏令时重复，请选择其他时间");
+  return matches[0];
+}
+
+function occurrenceTarget(scope, data) {
+  const [bot, kind, target] = String(scope || "").split(":");
+  if (data.bots?.some(b=>b.id === bot) && ["FriendMessage","GroupMessage"].includes(kind) && target) {
+    return `QQ ${kind === "GroupMessage" ? "群聊" : "私聊"} ${target}${data.bots.length > 1 ? ` · ${data.bots.find(b=>b.id === bot).name || bot}` : ""}`;
+  }
+  return scope || "目标未记录";
+}
+
+function renderTodayMarkup(data) {
+  const scope = data.calendar_scope || "";
+  const items = data.today || [];
+  const states = {pending:"待到点", sent:"已发送", running:"执行中", skipped:"本次未打扰", held:"已保留", failed:"生成或发送失败", unknown:"投递待核对", delayed:"临时延后", expired:"时间已过"};
+  const progress = {ongoing:"聊天中正在进行", completed:"聊天中已说完成", cancelled:"聊天中已取消"};
+  const decisions = {continue:"承接已有进展", skip:"本次不打扰", delay:"临时改时间", replace:"替换本次情境"};
+  return `<section class="today-workspace"><div class="today-scope"><label for="today-scope">聊天对象</label><select id="today-scope"><option value="">所有当前聊天</option>${chars().flatMap(c=>c.sessions.map(s=>`<option value="${escape(s)}" ${s === scope ? "selected" : ""}>${escape(c.name)} · ${escape(s)}</option>`)).join("")}</select>${data.conversation_id ? `<details><summary>当前聊天</summary><p class="mono">${escape(data.conversation_id)}</p></details>` : ""}</div>
+    ${items.map(r=>{
+      const changed = r.effective_ts !== r.default_ts;
+      const when = occurrenceLocalValue(r.effective_ts,r.timezone).replace("T"," ");
+      return `<article class="panel today-card"><div class="today-card-head"><h3>${escape(r.name)}</h3><span class="status ${["failed","unknown"].includes(r.state)?r.state:""}">${escape(states[r.state] || r.state || "待到点")}</span></div>
+        <p class="today-time">${changed ? `<del>${escape(occurrenceLocalValue(r.default_ts,r.timezone).replace("T"," "))}</del><span aria-label="改为"> → </span>` : ""}<time>${escape(when)}</time>${r.timezone && r.timezone !== "Asia/Shanghai" ? ` · ${escape(r.timezone)}` : ""}${changed || r.decision && r.decision !== "keep" ? '<span class="badge">仅本次</span>' : ""}</p>
+        ${progress[r.progress] || decisions[r.decision] || r.mode === "reminder" || !scope ? `<p class="help">${[progress[r.progress], decisions[r.decision], r.mode === "reminder" ? "按约提醒" : "", !scope ? `${chars().find(c=>c.sessions.includes(r.scope))?.name || "角色"} · ${occurrenceTarget(r.scope,data)}` : ""].filter(Boolean).map(escape).join(" · ")}</p>` : ""}
+        ${r.reason ? `<p>${escape(r.reason)}</p>` : ""}
+        <details><summary>安排与依据</summary><p class="preserve-text">${escape(r.instruction)}</p>${(r.sources || []).map(s=>`<blockquote class="preserve-text">${escape(s.role === "user" ? "用户" : "角色")}：${escape(s.text)}${s.at?`<footer>${escape(date(s.at))}</footer>`:""}</blockquote>`).join("")}${r.source_ids?.length ? `<p class="help mono">来源：${r.source_ids.map(escape).join("、")}</p>` : ""}</details>
+        ${r.editable ? `<div class="actions today-actions"><button type="button" data-occurrence="${escape(r.id)}" data-decision="delay">改时间</button><button type="button" data-occurrence="${escape(r.id)}" data-decision="skip">本次不打扰</button>${changed || r.decision && r.decision !== "keep" ? `<button type="button" data-occurrence="${escape(r.id)}" data-decision="restore">恢复本次默认</button>` : ""}</div>` : ""}</article>`;
+    }).join("") || `<div class="empty"><h3>${"今天没有可显示的安排"}</h3></div>`}</section>`;
+}
+
+function editOccurrence(row, decision, data) {
+  if (!row.editable) return;
+  const title = {delay:"修改本次时间",skip:"本次不打扰",restore:"恢复本次默认"}[decision];
+  const scope = row.scope || data.calendar_scope;
+  const cid = row.cid || row.conversation_id || data.conversation_id;
+  const source = document.activeElement;
+  showDialog(title, `<form id="occurrence-form" class="dialog-body occurrence-editor"><p><strong>${escape(row.name)}</strong> · 仅本次</p><p class="help">${escape(occurrenceTarget(scope,data))}</p><details><summary>目标聊天</summary><p class="mono">${escape(cid)}</p></details>
+    ${decision === "delay" ? `<label for="occurrence-time">执行时间 · ${escape(row.timezone || "Asia/Shanghai")}</label><input id="occurrence-time" type="datetime-local" step="60" required value="${escape(occurrenceLocalValue(row.effective_ts,row.timezone))}">` : `<p>${decision === "restore" ? "恢复本次原定时间；已经错过的时间不会补发。" : row.mode === "reminder" ? "这次约定提醒将不再发送。" : "这次安排不主动联系；下次仍按默认作息。"}</p>`}
+    <label for="occurrence-reason">备注（可选）</label><input id="occurrence-reason" maxlength="300" value="">
+    <p class="history-error" id="occurrence-error" role="alert" tabindex="-1" hidden></p></form>`, footer('<button type="button" data-close>取消</button><button type="submit" form="occurrence-form" id="save-occurrence" class="primary">确认本次调整</button>'));
+  const form = content.querySelector('#occurrence-form'), save = content.querySelector('#save-occurrence'), error = content.querySelector('#occurrence-error');
+  dialog.addEventListener("close", ()=>{if(source?.isConnected)source.focus();}, {once:true});
+  form.onsubmit = async e=>{
+    e.preventDefault(); if(save.disabled || !form.reportValidity())return;
+    error.hidden = true; save.disabled = true; save.textContent = "正在保存…"; save.setAttribute("aria-busy","true");
+    try {
+      const payload = {scope,cid,occurrence_id:row.id,revision:row.revision,decision,reason:content.querySelector('#occurrence-reason').value.trim(),source_ids:[]};
+      if(decision === "delay") payload.effective_ts = occurrenceTimestamp(content.querySelector('#occurrence-time').value,row.timezone);
+      await act("adjust_occurrence",payload);
+      if(form.isConnected && dialog.open) {dialog.close(); await render(); toast("本次安排已更新");}
+    } catch(err) {
+      if(form.isConnected && dialog.open) {error.textContent = err.message || "调整失败，请重试"; error.hidden = false; error.focus();}
+    } finally {
+      if(form.isConnected) {save.disabled = false; save.textContent = "确认本次调整"; save.removeAttribute("aria-busy");}
+    }
+  };
+}
+
+function bindTodayView(data) {
+  const selector = main.querySelector('#today-scope');
+  selector.onchange = ()=>{state.calendarScope = selector.value; render();};
+  main.querySelectorAll('[data-occurrence]').forEach(button=>button.onclick=()=>{
+    const row = (data.today || []).find(r=>r.id === button.dataset.occurrence);
+    if(row) editOccurrence(row,button.dataset.decision,data);
+  });
+}
+
+function openJobDetail(j, receipts = null, proactive = []) {
   const stageNames = {provider: "请求 / 查询上游", download: "下载成图", import: "校验并收入相册"};
   const resumable = j.result_available || j.provider_task_id || j.attempts?.some(a=>a.task_id && ["running","unknown"].includes(a.state));
   const waiting = ["queued","submitting","running","unknown","downloading","download_failed"].includes(j.state);
@@ -734,6 +930,8 @@ function openJobDetail(j, receipts = null) {
     ${j.upstream_completed||j.asset_id?"<dt>上游成图</dt><dd>已返回图片结果</dd>":j.state==='unknown'?"<dt>上游成图</dt><dd>结果待核对</dd>":""}
     ${j.error?`<dt>错误说明</dt><dd>${escape(j.error)}</dd>`:""}${recovery?`<dt>恢复方式</dt><dd>${escape(recovery)}</dd>`:""}</dl>
     ${latest.length?`<h3>投递结果</h3>${latest.map(([label,d])=>`<p>${label}：${escape(recordStatus[d.state]||d.state)}${d.error?` · ${escape(d.error)}`:""}</p>`).join("")}`:""}
+    ${renderProactiveMarkup(proactive)}
+    ${renderActionStages(j.notification_stages || [])}
     ${waiting?'<p class="help">停止本地等待不会取消上游任务，上游仍可能完成或计费。</p>':""}
     <details class="help-details"><summary>诊断与完整回执</summary><p class="mono">任务编号：${escape(j.id)}</p>
     ${!j.upstream_completed&&!j.asset_id?'<p>未记录成图结果，不能仅凭失败状态判断上游是否完成。</p>':""}
@@ -744,17 +942,19 @@ function openJobDetail(j, receipts = null) {
 
   for(const action of ['resume','cancel']) {
     const button=content.querySelector('#detail-'+action);
-    if(button)button.onclick=()=>busy(button,async()=>{await act(action,{id:j.id});const detail=await bridge.apiGet('job/'+j.id);openJobDetail(detail.job,detail.deliveries);toast(action==='cancel'?'已停止本地等待，记录保留；上游可能仍会完成':'已恢复处理原任务，不会重新生图');});
+    if(button)button.onclick=()=>busy(button,async()=>{await act(action,{id:j.id});const detail=await bridge.apiGet('job/'+j.id);openJobDetail(detail.job,detail.deliveries,detail.proactive || []);toast(action==='cancel'?'已停止本地等待，记录保留；上游可能仍会完成':'已恢复处理原任务，不会重新生图');});
   }
   const photo=content.querySelector('#detail-photo');
   if(photo)photo.onclick=()=>busy(photo,async()=>openDetail(await bridge.apiGet('asset/'+j.asset_id)));
+  const retryAnchor = content.querySelector('.proactive-records');
+  bindProactiveRetry(content,async()=>{const detail=await bridge.apiGet('job/'+j.id);if(retryAnchor?.isConnected && dialog.open)openJobDetail(detail.job,detail.deliveries,detail.proactive || []);});
 }
 
 async function renderPlans() {
   const serial = state.serial;
   const data = await bridge.apiGet("plans", {scope: state.calendarScope || ""});
   if (state.tab !== "plans" || serial !== state.serial) return;
-  const names = {sent: "已发送", skipped: "已跳过", held: "已保留", running: "执行中", unknown: "待核对", failed: "发送失败"};
+  const names = {delayed: "临时延后", sent: "已发送", skipped: "本次未打扰", held: "已保留", running: "执行中", unknown: "待核对", failed: "发送失败", expired: "过期未送达"};
   const photoLabels = {auto: "按内容自动拍照", always: "每次附带拍照", never: "仅发文字"};
   const dayModeLabels = {cron: "固定规则", school_day: "上课日", holiday_rest: "休息日", sleep_before_work: "明日早起", night_owl_before_rest: "明日休息"};
   const deltaText = (d) => typeof d === "number" && d !== 0 ? (d < 0 ? `早 ${Math.abs(d)} 分钟` : `晚 ${d} 分钟`) : "准点";
@@ -800,9 +1000,9 @@ async function renderPlans() {
     return value.mode === "custom" ? "自定义规则" : `${value.mode === "daily" ? "每天" : value.mode === "monthly" ? `每月 ${value.day} 日` : value.days.map(d => days[d]).join("、")} ${value.time}`;
   };
   const cards = plans.map((p) => `<article class="panel plan-card ${selectedPlans.has(p.id) ? "selected" : ""}"><div class="plan-head"><div class="plan-title">${state.planManage ? `<input type="checkbox" data-select-plan="${p.id}" aria-label="选择计划 ${escape(p.name)}" ${selectedPlans.has(p.id) ? "checked" : ""}>` : ""}<h3>${escape(p.name)}</h3>${p.run_once ? '<span class="badge">一次性</span>' : ""}${p.run_once && p.override_day_wake ? `<span class="badge">单日起床${p.override_date ? ` (${escape(p.override_date)})` : ""}</span>` : (!p.run_once && p.day_mode && p.day_mode !== "cron" ? `<span class="badge">${escape(dayModeLabels[p.day_mode] || p.day_mode)}</span>` : "")}${p.window_before || p.window_after ? helpTip("执行浮动", windowText(p), "clock") : ""}${helpTip("拍照方式", photoLabels[p.photo_mode || "auto"] || "按内容自动拍照", "camera")}</div><div class="actions">${p.deleted ? `<button data-restore-plan="${p.id}">恢复计划</button>` : `<label class="plan-switch"><input type="checkbox" role="switch" data-toggle-plan="${p.id}" aria-label="启用计划 ${escape(p.name)}" ${p.enabled ? "checked" : ""}><span aria-hidden="true"></span><span>${p.enabled ? "已启用" : "已停用"}</span></label>${p.run_once ? "" : `<button class="icon-button" data-edit-plan="${p.id}" aria-label="编辑计划 ${escape(p.name)}" title="编辑计划">${photoIcon("pencil")}</button>`}<button data-delete-plan="${p.id}" class="icon-button danger" aria-label="删除计划 ${escape(p.name)}" title="移到回收站">${photoIcon("trash")}</button>`}</div></div><p>${escape(scheduleText(p))}${p.timezone && p.timezone !== "Asia/Shanghai" ? ` · ${escape(p.timezone)}` : ""}</p><p class="help">${escape(charName(p.character_id))} · ${escape(recipient(p.scope))}</p><div class="plan-times"><p><span>上次执行时间</span>${p.last_run ? `${escape(wallTime(p.last_run.at, p.timezone))}${p.last_run.delta_minutes ? `（${escape(deltaText(p.last_run.delta_minutes))}）` : ""} · ${escape(names[p.last_run.state] || p.last_run.state)}` : "尚未执行"}</p><p><span>下次预计触发</span>${p.deleted ? "已删除，不会执行" : `${escape(wallTime(p.next_times[0], p.timezone))}${p.next_details?.[0] && p.next_details[0].delta_minutes ? `（较基准${escape(deltaText(p.next_details[0].delta_minutes))}）` : ""}${p.next_details?.[0]?.day_label ? ` · ${escape(p.next_details[0].day_label)}` : ""}${p.enabled ? "" : "（停用中，仅预览）"}`}</p></div><details><summary>计划详情</summary><p class="preserve-text">${escape(p.instruction)}</p><p class="help mono">${p.run_once && p.trigger_at ? `基准 ${escape(wallTime(p.trigger_at, p.timezone))} · 触发后自动移除` : `Cron：${escape(p.cron)}`} · ${escape(p.timezone)}<br>${escape(p.scope)}</p></details></article>`).join("");
-  const runs = data.runs.map((r) => `<details class="panel plan-run"><summary>${escape(wallTime(r.at, r.timezone))} · ${escape(r.name)}${r.run_once ? "（一次性）" : ""}${r.delta_minutes ? ` · ${escape(deltaText(r.delta_minutes))}` : ""} · ${escape(names[r.state] || r.state)}</summary><p class="help">${escape(r.timezone)}${r.anchor_at ? ` · 基准时间 ${escape(wallTime(r.anchor_at, r.timezone))}` : ""}</p>${r.summary ? `<p class="preserve-text">${escape(r.summary)}</p>` : ""}${r.error || r.code || r.message_id || r.job_id || r.follow_up_name ? `<p>${escape(r.error || "")}${r.code ? ` · ${escape(r.code)}` : ""}${r.message_id ? ` · 消息 ${escape(r.message_id)}` : ""}${r.job_id ? ` · 伴随拍照任务 ${escape(r.job_id)}` : ""}${r.follow_up_name ? ` · 延续约定「${escape(r.follow_up_name)}」` : ""}</p>` : ""}</details>`).join("");
+  const runs = data.runs.map((r) => `<details class="panel plan-run"><summary>${escape(wallTime(r.at, r.timezone))} · ${escape(r.name)}${r.run_once ? "（一次性）" : ""}${r.delta_minutes ? ` · ${escape(deltaText(r.delta_minutes))}` : ""} · ${escape(names[r.state] || r.state)}</summary><p class="help">${escape(r.timezone)}${r.anchor_at ? ` · 基准时间 ${escape(wallTime(r.anchor_at, r.timezone))}` : ""}</p>${(data.proactive || []).some(p=>p.run_id === r.id) ? renderProactiveMarkup(data.proactive.filter(p=>p.run_id === r.id)) : r.summary ? `<p class="preserve-text">${escape(r.summary)}</p>` : ""}${r.error || r.code || r.message_id || r.job_id || r.follow_up_name ? `<p>${escape(r.error || "")}${r.code ? ` · ${escape(r.code)}` : ""}${r.message_id ? ` · 消息 ${escape(r.message_id)}` : ""}${r.job_id ? ` · 伴随拍照任务 ${escape(r.job_id)}` : ""}${r.follow_up_name ? ` · 延续约定「${escape(r.follow_up_name)}」` : ""}</p>` : ""}${renderActionStages(r.stages || [])}</details>`).join("");
   const todaySummary = data.today_profile ? `${escape(data.today_profile.date)} ${escape(data.today_profile.weekday_cn)} · ${escape(data.today_profile.label)}${data.today_profile.active_trip ? ` · 行程「${escape(data.today_profile.active_trip.title)}」` : ""}` : "";
-  main.innerHTML = `<div class="page-tools"><div class="subhead"><div><h2>朝夕拾记</h2></div><div class="actions">${view !== "runs" && view !== "calendar" ? `<button id="manage-plans">${state.planManage ? "完成管理" : "管理计划"}</button>` : view === "runs" ? '<button id="all-run-history">查看全部执行记录</button>' : ''}<button id="import-plans">导入</button><button id="export-plans">导出 JSON</button><button id="new-plan" class="primary">新建计划</button></div></div><div class="plan-view-tools"><div class="categories plan-nav" role="group" aria-label="计划导航">${Object.entries({list:"朝夕列表",calendar:"时令日历",runs:"朝夕足迹",trash:"回收站"}).map(([key,label])=>`<button data-plan-view="${key}" class="${key === view ? "active" : ""}" aria-pressed="${key === view}">${label}</button>`).join("")}</div>${sortControl}</div>${todaySummary && view !== "calendar" ? `<p class="help plan-rule">${todaySummary}</p>` : ""}${state.planManage && view !== "runs" && view !== "calendar" ? `<div class="plan-batch"><span id="plan-selection-count" role="status"></span><div class="actions"><button id="select-all-plans">全选</button><button id="clear-plans">取消选择</button>${view === "trash" ? '<button data-plan-batch="restore">恢复所选</button>' : '<button data-plan-batch="enable" aria-label="启用所选">启用</button><button data-plan-batch="disable" aria-label="关闭所选">关闭</button><button data-plan-batch="delete" class="danger" aria-label="删除所选">删除</button>'}</div></div>` : ""}</div>${data.scheduler_error || !data.scheduler_running ? `<p class="help" role="status">${escape(data.scheduler_error || "朝夕拾记检查未运行")}</p>` : ""}<div class="plan-list">${view === "calendar" ? renderCalendarMarkup(data) : view === "runs" ? runs || '<div class="empty"><h3>暂无朝夕足迹</h3></div>' : cards || `<div class="empty"><h3>${view === "trash" ? "回收站是空的" : "暂无计划"}</h3><p>${view === "trash" ? "可恢复为停用状态。" : "导入或新建计划。"}</p></div>`}</div>`;
+  main.innerHTML = `<div class="page-tools"><div class="subhead"><div><h2>朝夕拾记</h2></div><div class="actions">${view !== "runs" && view !== "calendar" && view !== "today" ? `<button id="manage-plans">${state.planManage ? "完成管理" : "管理计划"}</button>` : view === "runs" ? '<button id="all-run-history">查看全部执行记录</button>' : ''}<details class="toolbar-more"><summary>更多</summary><div class="actions"><button id="import-plans">导入计划</button><button id="export-plans">导出 JSON</button></div></details><button id="new-plan" class="primary">新建计划</button></div></div><div class="plan-view-tools"><div class="categories plan-nav" role="group" aria-label="计划导航">${Object.entries({list:"朝夕列表",today:"今日",calendar:"时令日历",runs:"朝夕足迹",trash:"回收站"}).map(([key,label])=>`<button data-plan-view="${key}" class="${key === view ? "active" : ""}" aria-pressed="${key === view}">${label}</button>`).join("")}</div>${sortControl}</div>${todaySummary && view !== "calendar" ? `<p class="help plan-rule">${todaySummary}</p>` : ""}${state.planManage && view !== "runs" && view !== "calendar" && view !== "today" ? `<div class="plan-batch"><span id="plan-selection-count" role="status"></span><div class="actions"><button id="select-all-plans">全选</button><button id="clear-plans">取消选择</button>${view === "trash" ? '<button data-plan-batch="restore">恢复所选</button>' : '<button data-plan-batch="enable" aria-label="启用所选">启用</button><button data-plan-batch="disable" aria-label="关闭所选">关闭</button><button data-plan-batch="delete" class="danger" aria-label="删除所选">删除</button>'}</div></div>` : ""}</div>${data.scheduler_error || !data.scheduler_running ? `<p class="help" role="status">${escape(data.scheduler_error || "朝夕拾记检查未运行")}</p>` : ""}<div class="plan-list">${view === "today" ? renderTodayMarkup(data) : view === "calendar" ? renderCalendarMarkup(data) : view === "runs" ? runs || '<div class="empty"><h3>暂无朝夕足迹</h3></div>' : cards || `<div class="empty"><h3>${view === "trash" ? "回收站是空的" : "暂无计划"}</h3><p>${view === "trash" ? "可恢复为停用状态。" : "导入或新建计划。"}</p></div>`}</div>`;
   const sortButton = main.querySelector("#plan-sort");
   if (sortButton) {
     const menu = main.querySelector("#plan-sort-menu");
@@ -865,7 +1065,7 @@ async function renderPlans() {
     else {el.checked=false;toast('一次最多选择200条计划',true);}
     updateSelection();
   });
-  if (state.planManage && view !== "runs" && view !== "calendar") {
+  if (state.planManage && view !== "runs" && view !== "calendar" && view !== "today") {
     main.querySelector('#select-all-plans').onclick=()=>{const clear=plans.slice(0,200).every(p=>selectedPlans.has(p.id)); if(clear)selectedPlans.clear();else plans.slice(0,200).forEach(p=>selectedPlans.set(p.id,p));updateSelection();if(!clear&&plans.length>200)toast('已选择前200条，可分批处理');};
     main.querySelector('#clear-plans').onclick=()=>{selectedPlans.clear();updateSelection();};
     main.querySelectorAll('[data-plan-batch]').forEach((b)=>b.onclick=()=>busy(b,()=>applyPlans([...selectedPlans.values()],b.dataset.planBatch)));
@@ -893,6 +1093,8 @@ async function renderPlans() {
     });
   };
   if (view === "calendar") bindCalendarView(data);
+  if (view === "today") bindTodayView(data);
+  if (view === "runs") bindProactiveRetry(main,()=>render());
   main.querySelector("#export-plans").onclick = (e) => busy(e.target, async () => {
     const data = await bridge.apiGet("plans/export");
     const blob = new Blob([JSON.stringify(data, null, 2)], {type: "application/json"});
@@ -1323,8 +1525,9 @@ function editPlan(p = {}, bots = []) {
       <div class="form-row"><div><label for="plan-window-before">最多提前（分钟，0–120）</label><input id="plan-window-before" type="number" min="0" max="120" required value="${p.window_before ?? 0}"></div><div><label for="plan-window-after">最多延后（分钟，0–120）</label><input id="plan-window-after" type="number" min="0" max="120" required value="${p.window_after ?? 0}"></div></div>
       <div class="actions weekday-presets"><button type="button" data-window="0,0">准点 (0)</button><button type="button" data-window="5,5">±5 分钟</button><button type="button" data-window="10,10">±10 分钟</button><button type="button" data-window="15,15">±15 分钟</button><button type="button" data-window="10,20">-10 ~ +20 分钟</button></div>
       <div><label for="plan-day-mode">作息模式</label><select id="plan-day-mode">${Object.entries({cron:'固定规则',school_day:'上课 / 工作日',holiday_rest:'休息 / 假期',sleep_before_work:'明日早起催睡',night_owl_before_rest:'明日休息夜猫子'}).map(([v,l])=>`<option value="${v}" ${(p.day_mode||'cron')===v?'selected':''}>${l}</option>`).join('')}</select></div>
+      <div><label for="plan-contact-mode">联系规则</label><select id="plan-contact-mode"><option value="adaptive" ${(p.contact_mode||"adaptive")==="adaptive"?"selected":""}>随聊天调整</option><option value="reminder" ${p.contact_mode==="reminder"?"selected":""}>按约提醒</option></select></div>
       <div><label for="plan-photo-mode">拍照方式</label><select id="plan-photo-mode">${Object.entries({auto:'按内容自动决定',always:'每次拍照',never:'仅发文字'}).map(([v,l])=>`<option value="${v}" ${(p.photo_mode||'auto')===v?'selected':''}>${l}</option>`).join('')}</select></div>
-      <details><summary>作息与拍照说明</summary><p class="help">固定规则不随调休切换。上课/工作日避开寒暑假、法定假日与广西壮族三月三，调休补班日自动补位；休息/假期与其相反。催睡与夜猫子按次日是否早起安排。特殊行程可临时调整作息。拍照先发文字，再异步生成照片。</p></details><p class="help" id="schedule-note"></p><div class="schedule-preview" aria-live="polite"><strong>接下来 5 次</strong><p id="schedule-summary"></p><ol id="plan-preview"></ol><p class="help">按所选时区与浮动区间预览。保存并启用才执行，不补发错过的时间。</p></div>
+      <details><summary>作息与拍照说明</summary><p class="help">固定规则不随调休切换。上课/工作日避开寒暑假、法定假日与广西壮族三月三，调休补班日自动补位；休息/假期与其相反。催睡与夜猫子按次日是否早起安排。特殊行程可临时调整作息。随聊天调整只影响当天这一次；按约提醒保留明确约定，不因正在聊天自动取消。拍照先发文字，再异步生成照片。</p></details><p class="help" id="schedule-note"></p><div class="schedule-preview" aria-live="polite"><strong>接下来 5 次</strong><p id="schedule-summary"></p><ol id="plan-preview"></ol><p class="help">按所选时区与浮动区间预览。保存并启用才执行，不补发错过的时间。</p></div>
     </fieldset>
     <label for="plan-instruction">生活情境</label><textarea id="plan-instruction" maxlength="8000" rows="6" required>${escape(p.instruction)}</textarea>
     <label class="check"><input type="checkbox" id="plan-enabled" ${p.enabled?'checked':''}>启用此计划并按时主动聊天</label>
@@ -1338,7 +1541,7 @@ function editPlan(p = {}, bots = []) {
     const wb = Number($('plan-window-before').value || 0), wa = Number($('plan-window-after').value || 0);
     if (!Number.isInteger(wb) || !Number.isInteger(wa) || wb < 0 || wb > 120 || wa < 0 || wa > 120) throw new Error('浮动时间区间须为 0 至 120 分钟的整数');
     const sc = $('recipient-mode').value === 'qq' ? `${$('plan-bot').value}:${$('plan-kind').value}:${$('plan-number').value}` : $('plan-scope').value;
-    return {id:p.id||'',name:$('plan-name').value.trim(),cron:JSON.stringify(scheduleValue())===initialValue ? initialCron : buildPlanCron(scheduleValue()),timezone:$('plan-zone').value.trim(),window_before:wb,window_after:wa,photo_mode:$('plan-photo-mode').value,day_mode:$('plan-day-mode').value,scope:sc||p.scope||''};
+    return {id:p.id||'',name:$('plan-name').value.trim(),cron:JSON.stringify(scheduleValue())===initialValue ? initialCron : buildPlanCron(scheduleValue()),timezone:$('plan-zone').value.trim(),window_before:wb,window_after:wa,photo_mode:$('plan-photo-mode').value,contact_mode:$('plan-contact-mode').value,day_mode:$('plan-day-mode').value,scope:sc||p.scope||''};
   };
   const targetVisibility = () => {
     const qq=$('recipient-mode').value==='qq';
@@ -1409,50 +1612,73 @@ function editPlan(p = {}, bots = []) {
 }
 
 function providerFields(s) {
-  const panel = main.querySelector("#site-panel");
+  const panel = main.querySelector("#site-panel"), form = main.querySelector("#settings-form");
   const fields = ["name", "base_url", "api_keys", "active_key_id", "model", "size", "reference_field", "enabled", "id"];
-  const primary = {id: "primary", name: s.primary_name, enabled: s.primary_enabled, ...Object.fromEntries(["base_url", "model", "size", "reference_field", "api_key_set", "api_keys", "active_key_id"].map((key) => [key, s[key]]))};
-  let drafts = [...(s.base_url || s.api_key_set || s.model ? [primary] : []), ...s.providers.map((p) => ({...p}))];
-  drafts = drafts.map((p) => ({name: "", ...p, api_keys: (p.api_keys || []).map((k) => ({...k, value: "", saved: true}))}));
-  const order = s.provider_order || [];
-  drafts.sort((a, b) => (order.includes(a.id) ? order.indexOf(a.id) : 99) - (order.includes(b.id) ? order.indexOf(b.id) : 99));
-  let selected = drafts.some((p) => p.id === state.settingsSite) ? state.settingsSite : drafts[0]?.id;
-  let preferred = s.preferred_provider;
-  let editing;
-  let settingsChanged = false;
-  const staged = new Set();
-  const savedIds = new Set(drafts.map((p) => p.id));
-  const dirty = () => {
-    const saved = drafts.find((p) => p.id === selected);
-    return editing && fields.some((key) => JSON.stringify(editing[key]) !== JSON.stringify(saved?.[key]));
-  };
-  const updateStatus = () => {
-    const changed = dirty();
-    panel.querySelector("#save-site").disabled = !editing || !changed;
-    const siteStatus = panel.querySelector("#site-status"), settingsStatus = main.querySelector("#settings-status");
-    siteStatus.textContent = changed ? "未暂存；切换站点会舍弃修改。" : editing && !savedIds.has(selected) && !staged.has(selected) ? "新站点，请填写后暂存。" : "";
-    settingsStatus.textContent = changed ? "请先暂存站点。" : staged.size || settingsChanged ? "有未保存的更改。" : "";
-    siteStatus.hidden = !siteStatus.textContent; settingsStatus.hidden = !settingsStatus.textContent;
-  };
+  const globalFields = [...form.querySelectorAll("[name]")];
+  const globals = () => Object.fromEntries(globalFields.map(el => [el.name, el.type === "checkbox" ? el.checked : Number(el.value)]));
   const title = (p) => {
     if (p.name?.trim()) return p.name.trim();
     try { return new URL(p.base_url).hostname; } catch { return "未命名站点"; }
   };
-  const read = () => {
-    const site = editing;
-    if (!site) return;
-    panel.querySelectorAll("[data-field]").forEach((el) => site[el.dataset.field] = el.type === "checkbox" ? el.checked : el.value);
+  const sitesFrom = (settings) => {
+    const primary = {id: "primary", name: settings.primary_name, enabled: settings.primary_enabled,
+      ...Object.fromEntries(["base_url", "model", "size", "reference_field", "api_keys", "active_key_id"].map(key => [key, settings[key]]))};
+    const sites = [...(settings.base_url || settings.api_key_set || settings.model ? [primary] : []), ...settings.providers];
+    const order = settings.provider_order || [];
+    return sites.map(p => ({...p, api_keys: (p.api_keys || []).map(k => ({...k, value: "", saved: true}))}))
+      .sort((a, b) => (order.includes(a.id) ? order.indexOf(a.id) : 99) - (order.includes(b.id) ? order.indexOf(b.id) : 99));
   };
+  const address = (site, value = site.base_url) => site.id === "primary" ? value.trim() : value.trim().replace(/\/+$/, "");
+  const payload = (site) => Object.fromEntries(fields.map(key => [key, key === "name" ? title(site) : key === "base_url" ? address(site) : key === "api_keys"
+    ? site.api_keys.map(k => ({id: k.id, name: k.name.trim(), value: k.value || ""}))
+    : typeof site[key] === "string" ? site[key].trim() : site[key]]));
+  const signature = (site) => JSON.stringify(payload(site));
+  const connection = (site) => JSON.stringify([address(site), site.active_key_id, site.api_keys.find(k => k.id === site.active_key_id)?.value || ""]);
+  let baseline = sitesFrom(s), drafts = structuredClone(baseline), saved = structuredClone(s);
+  let selected = drafts.some(p => p.id === state.settingsSite) ? state.settingsSite : drafts[0]?.id;
+  let preferred = s.preferred_provider, editing, saving = false, disposed = false, viewVersion = 0;
+  let hideKeys = () => {}, closeKeys = () => {};
+  const events = new AbortController();
+  const read = () => {
+    if (!editing || saving) return;
+    panel.querySelectorAll("[data-field]").forEach(el => editing[el.dataset.field] = el.type === "checkbox" ? el.checked : el.value);
+  };
+  const dirty = (site = editing) => !!site && signature(site) !== (baseline.find(p => p.id === site.id) ? signature(baseline.find(p => p.id === site.id)) : "");
+  const anyDirty = () => {
+    return drafts.some(p => dirty(p)) || JSON.stringify(drafts.map(p => p.id)) !== JSON.stringify(baseline.map(p => p.id))
+      || preferred !== saved.preferred_provider || globalFields.some(el => globals()[el.name] !== saved[el.name]);
+  };
+  const valid = () => !disposed && panel.isConnected;
   const updateSelectors = () => {
-    panel.querySelector("#site-select").innerHTML = drafts.map((p) => `<option value="${escape(p.id)}">${escape(title(p))}${p.enabled ? "" : " · 停用"}</option>`).join("") || '<option value="">尚未添加站点</option>';
+    panel.querySelector("#site-select").innerHTML = drafts.map(p => `<option value="${escape(p.id)}">${escape(title(p))}${p.enabled ? "" : " · 停用"}</option>`).join("") || '<option value="">尚未添加站点</option>';
     panel.querySelector("#site-select").value = selected || "";
-    const enabled = drafts.filter((p) => p.enabled);
+    const enabled = drafts.filter(p => p.enabled);
     const select = main.querySelector("#preferred-provider");
-    select.innerHTML = enabled.map((p) => `<option value="${escape(p.id)}">${escape(title(p))}</option>`).join("") || '<option value="primary">暂无启用站点</option>';
-    if (!enabled.some((p) => p.id === preferred)) preferred = enabled[0]?.id || "primary";
-    select.value = preferred;
-    main.querySelector("#site-order").textContent = drafts.map(title).join(" → ") || "添加站点后可设置顺序";
-    panel.querySelector("#add-provider").disabled = drafts.length >= 5;
+    select.innerHTML = '<option value="" disabled>请选择首选站点</option>' + enabled.map(p => `<option value="${escape(p.id)}">${escape(title(p))}</option>`).join("");
+    select.value = enabled.some(p => p.id === preferred) ? preferred : "";
+    panel.querySelector("#add-provider").disabled = saving || drafts.length >= 5;
+    const eligible = drafts.filter(p => p.enabled && p.base_url.trim() && p.model.trim() && p.api_keys.some(k => k.id === p.active_key_id && (k.saved || k.value)));
+    const effectivePreferred = enabled.some(p => p.id === preferred) ? preferred : "primary";
+    const ordered = [...eligible.filter(p => p.id === effectivePreferred), ...eligible.filter(p => p.id !== effectivePreferred)];
+    main.querySelector("#site-order").textContent = (anyDirty() ? "保存后预览：" : "") + (ordered.map(title).join(" → ") || "暂无可用站点");
+  };
+  const updateStatus = (error = "") => {
+    const changed = dirty();
+    main.querySelector("#save-settings").hidden = !anyDirty();
+    for (const id of ["save-site", "cancel-site"]) {
+      const button = panel.querySelector("#" + id);
+      button.hidden = !changed; button.disabled = saving || !changed;
+    }
+    const siteStatus = panel.querySelector("#site-status"), settingsStatus = main.querySelector("#settings-status");
+    siteStatus.textContent = changed ? "本站有未保存修改" : "";
+    settingsStatus.textContent = error || (saving ? "正在保存…" : anyDirty() ? "有未保存的更改" : "");
+    siteStatus.hidden = !siteStatus.textContent; settingsStatus.hidden = !settingsStatus.textContent;
+    settingsStatus.classList.toggle("error", !!error);
+    updateSelectors();
+  };
+  const invalidateModels = (site, message = "连接已修改，请重新获取模型。") => {
+    site.modelRequest = (site.modelRequest || 0) + 1; site.models = []; site.modelStatus = message;
+    if (editing === site) { const button = panel.querySelector("#load-models"); if (button) button.disabled = saving; }
   };
   const drawModels = (site) => {
     const select = panel.querySelector("#site-model-list");
@@ -1464,36 +1690,82 @@ function providerFields(s) {
     status.hidden = !status.textContent;
   };
   const drawKeys = (site) => {
-    const area = panel.querySelector("#site-keys");
-    const current = site.api_keys.find((k) => k.id === site.active_key_id);
-    area.innerHTML = `<label for="current-key">当前密钥 · ${site.api_keys.length} 把</label><div class="key-summary"><input id="current-key" readonly placeholder="尚未选择密钥"><button type="button" id="reveal-current-key" class="icon-button" aria-label="显示当前密钥" aria-pressed="false" title="显示当前密钥" ${current ? "" : "disabled"}>${icon("eye")}</button><button type="button" id="manage-keys" class="icon-button" aria-label="管理站点密钥" title="管理站点密钥">${icon("key")}</button></div>`;
-    const display = area.querySelector("#current-key");
-    let revealVersion = 0;
-    display.value = current?.name || "";
-    area.querySelector("#reveal-current-key").onclick = (event) => {
-      const button = event.currentTarget;
-      const requestVersion = ++revealVersion;
-      busy(button, async () => {
-        const visible = button.getAttribute("aria-pressed") === "true";
-        if (visible) display.value = current.name;
-        else {
-          const result = current.value || (await act("reveal_key", {id: site.id, base_url: site.base_url, key_id: current.id, settings_revision: s.settings_revision})).value;
-          if (!display.isConnected || editing !== site || site.active_key_id !== current.id || requestVersion !== revealVersion) return;
-          display.value = result;
-        }
-        button.setAttribute("aria-pressed", String(!visible));
-        button.setAttribute("aria-label", visible ? "显示当前密钥" : "隐藏当前密钥");
-        button.title = visible ? "显示当前密钥" : "隐藏当前密钥";
-        button.innerHTML = icon(visible ? "eye" : "hidden");
+    hideKeys();
+    const area = panel.querySelector("#site-keys"), keyEntries = site.api_keys;
+    area.innerHTML = `<label id="key-label">当前密钥 · ${keyEntries.length} 把</label><div class="key-summary"><div class="key-picker"><button type="button" id="current-key" aria-labelledby="key-label" aria-haspopup="listbox" aria-expanded="false" aria-controls="site-key-options"></button><div id="site-key-options" role="listbox" aria-label="本站密钥" hidden></div></div><button type="button" id="reveal-current-key" class="icon-button" aria-label="显示本站密钥" aria-pressed="false" title="显示本站密钥" ${keyEntries.length ? "" : "disabled"}>${icon("eye")}</button><button type="button" id="manage-keys" class="icon-button" aria-label="管理站点密钥" title="管理站点密钥">${icon("key")}</button></div>`;
+    const display = area.querySelector("#current-key"), list = area.querySelector("#site-key-options"), eye = area.querySelector("#reveal-current-key");
+    let revealVersion = 0, revealed = false, values = new Map();
+    const active = () => valid() && display.isConnected && editing === site;
+    list.innerHTML = keyEntries.map(entry => `<button type="button" role="option" aria-selected="${entry.id === site.active_key_id}" data-key-option="${escape(entry.id)}"></button>`).join("");
+    const drawValues = () => {
+      const current = keyEntries.find(k => k.id === site.active_key_id);
+      const label = entry => entry.name + (revealed ? ` · ${values.get(entry.id) ?? "读取中…"}` : "");
+      display.textContent = current ? label(current) : "尚未选择密钥";
+      display.disabled = saving || !keyEntries.length;
+      list.querySelectorAll("[data-key-option]").forEach(button => {
+        const entry = keyEntries.find(k => k.id === button.dataset.keyOption);
+        button.textContent = label(entry) + (entry.id === site.active_key_id ? " ✓" : "");
+        button.setAttribute("aria-selected", String(entry.id === site.active_key_id));
+        button.onclick = () => {
+          if (saving) return;
+          const before = connection(site); site.active_key_id = button.dataset.keyOption;
+          if (connection(site) !== before) { invalidateModels(site); drawModels(site); }
+          closeList(); updateStatus(); display.focus();
+        };
       });
+      eye.setAttribute("aria-pressed", String(revealed));
+      eye.setAttribute("aria-label", revealed ? "隐藏本站密钥" : "显示本站密钥");
+      eye.title = revealed ? "隐藏本站密钥" : "显示本站密钥";
+      eye.innerHTML = icon(revealed ? "hidden" : "eye");
     };
+    hideKeys = () => {
+      revealVersion++; revealed = false; values.clear();
+      if (area.isConnected) drawValues();
+    };
+    const closeList = () => { list.hidden = true; display.setAttribute("aria-expanded", "false"); hideKeys(); };
+    closeKeys = closeList;
+    const openList = (last = false) => {
+      if (saving || !keyEntries.length) return;
+      list.hidden = false; display.setAttribute("aria-expanded", "true");
+      const options = [...list.querySelectorAll("[data-key-option]")];
+      (last ? options.at(-1) : options.find(el => el.dataset.keyOption === site.active_key_id) || options[0])?.focus();
+    };
+    display.onclick = () => list.hidden ? openList() : closeList();
+    display.onkeydown = event => {
+      if (["ArrowDown", "ArrowUp"].includes(event.key)) { event.preventDefault(); openList(event.key === "ArrowUp"); }
+      if (event.key === "Escape") { event.preventDefault(); closeList(); }
+    };
+    list.onkeydown = event => {
+      const options = [...list.querySelectorAll("[data-key-option]")], index = options.indexOf(document.activeElement);
+      if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+        options[next]?.focus();
+      }
+      if (event.key === "Escape") { event.preventDefault(); closeList(); display.focus(); }
+      if (event.key === "Tab") closeList();
+    };
+    eye.onclick = async () => {
+      if (saving) return;
+      if (revealed) { hideKeys(); return; }
+      revealed = true; const version = ++revealVersion; drawValues();
+      await Promise.all(keyEntries.map(async entry => {
+        try {
+          const value = entry.value || (await act("reveal_key", {id: site.id, base_url: address(site), key_id: entry.id, settings_revision: saved.settings_revision})).value;
+          if (!active() || !revealed || version !== revealVersion) return;
+          values.set(entry.id, value); drawValues();
+        } catch {
+          if (!active() || !revealed || version !== revealVersion) return;
+          values.set(entry.id, "读取失败"); drawValues(); toast("密钥读取失败，请重新显示后重试", true);
+        }
+      }));
+    };
+    drawValues();
     area.querySelector("#manage-keys").onclick = () => {
-      revealVersion++;
-      display.value = current?.name || "";
-      const eye = area.querySelector("#reveal-current-key");
-      eye.setAttribute("aria-pressed", "false"); eye.setAttribute("aria-label", "显示当前密钥"); eye.title = "显示当前密钥"; eye.innerHTML = icon("eye");
+      if (saving) return;
+      closeList();
       let entries = structuredClone(site.api_keys), active = site.active_key_id;
-      let editingEntry = null;
+      let editingEntry = null, viewedKeyValue = null, originalValueRead = Promise.resolve(), committing = null;
       showDialog("管理站点密钥", `<div class="dialog-body key-manager"><div class="key-manager-head"><p>${escape(title(site))}</p><button type="button" id="add-key">添加密钥</button></div><div id="key-list"></div><div id="key-editor"></div><p class="help">完成后仅应用到站点草稿；取消会舍弃本次修改。</p></div>`, footer('<button type="button" id="cancel-keys">取消</button><button type="button" id="apply-keys" class="primary">完成</button>'));
       const manager = content.querySelector(".key-manager");
       const drawList = () => {
@@ -1504,8 +1776,8 @@ function providerFields(s) {
           const input = button.previousElementSibling;
           button.onclick = () => busy(button, async () => {
             const visible = input.type === "text";
-            const value = visible ? "" : entry.value || (await act("reveal_key", {id: site.id, base_url: site.base_url, key_id: entry.id, settings_revision: s.settings_revision})).value;
-            if (!button.isConnected || !dialog.open || editing !== site || !entries.includes(entry)) return;
+            const value = visible ? "" : entry.value || (await act("reveal_key", {id: site.id, base_url: address(site), key_id: entry.id, settings_revision: saved.settings_revision})).value;
+            if (!valid() || !button.isConnected || !dialog.open || editing !== site || !entries.includes(entry)) return;
             input.value = value; input.type = visible ? "password" : "text";
             button.setAttribute("aria-pressed", String(!visible));
             button.setAttribute("aria-label", `${visible ? "显示" : "隐藏"}密钥 ${i + 1} 内容`);
@@ -1520,65 +1792,89 @@ function providerFields(s) {
           drawList(); content.querySelector("#add-key").focus();
         });
       };
-      const commitEntry = () => {
+      const commitEntry = async () => {
         if (!editingEntry) return true;
-        const form = content.querySelector("#key-edit-form");
-        form.elements.key_value.setCustomValidity(!editingEntry.saved && !form.elements.key_value.value.trim() ? "请填写本站密钥" : "");
-        if (!form.reportValidity()) return false;
-        editingEntry.name = form.elements.key_name.value.trim() || `密钥 ${entries.length + 1}`;
-        if (form.dataset.keyEdited === "true") editingEntry.value = form.elements.key_value.value.trim();
-        const index = entries.findIndex((k) => k.id === editingEntry.id);
-        if (index < 0) entries.push(editingEntry); else entries[index] = editingEntry;
-        active ||= editingEntry.id;
-        editingEntry = null; content.querySelector("#key-editor").innerHTML = ""; drawList();
-        return true;
+        if (committing === editingEntry) return false;
+        const entry = editingEntry, form = content.querySelector("#key-edit-form"), button = content.querySelector("#apply-keys");
+        committing = entry; button.disabled = true; button.setAttribute("aria-busy", "true");
+        try {
+          // A saved key edited in an earlier dialog still needs its original value
+          // as private comparison evidence; a slow read cannot commit a closed form.
+          if (entry.saved && form.dataset.keyEdited === "true") await originalValueRead;
+          if (!valid() || !form.isConnected || !dialog.open || editingEntry !== entry || editing !== site) return false;
+          form.elements.key_value.setCustomValidity(!entry.saved && !form.elements.key_value.value.trim() ? "请填写本站密钥" : "");
+          if (!form.reportValidity()) return false;
+          entry.name = form.elements.key_name.value.trim() || `密钥 ${entries.length + 1}`;
+          if (form.dataset.keyEdited === "true") {
+            const entered = form.elements.key_value.value.trim();
+            entry.value = entry.saved && entered === viewedKeyValue ? "" : entered;
+          }
+          const index = entries.findIndex(k => k.id === entry.id);
+          if (index < 0) entries.push(entry); else entries[index] = entry;
+          active ||= entry.id;
+          editingEntry = null; viewedKeyValue = null;
+          content.querySelector("#key-editor").innerHTML = ""; drawList();
+          return true;
+        } finally {
+          if (committing === entry) {
+            committing = null;
+            if (button.isConnected) { button.disabled = false; button.removeAttribute("aria-busy"); }
+          }
+        }
       };
       const openEditor = (entry) => {
         editingEntry = entry ? {...entry} : {id: "key_" + crypto.randomUUID(), name: "", value: "", saved: false};
+        viewedKeyValue = null; originalValueRead = Promise.resolve();
         content.querySelector("#key-editor").innerHTML = `<form id="key-edit-form" class="key-edit-form"><h3>${entry ? "编辑密钥" : "添加密钥"}</h3><label for="key-edit-name">密钥名称</label><input id="key-edit-name" name="key_name" maxlength="80" placeholder="给这把密钥起个名字"><label for="key-edit-value">密钥内容</label><input id="key-edit-value" name="key_value" type="text" autocomplete="new-password" maxlength="2000" ${editingEntry.saved ? "" : "required"} placeholder="${editingEntry.saved ? "留空保留已保存密钥" : "填写本站密钥"}">${editingEntry.saved ? '<p class="help">留空保留原密钥；替换内容后，恢复旧任务需核对原密钥。</p>' : ""}<div class="actions"><button type="button" id="cancel-key-edit">取消编辑</button><button type="submit">应用编辑</button></div></form>`;
         const form = content.querySelector("#key-edit-form");
         form.elements.key_name.value = editingEntry.name; form.elements.key_value.value = editingEntry.value || "";
         let valueVersion = 0;
         form.elements.key_value.oninput = () => { valueVersion++; form.dataset.keyEdited = "true"; form.elements.key_value.setCustomValidity(""); };
-        if (editingEntry.saved && !editingEntry.value) {
+        if (editingEntry.saved) {
           const entry = editingEntry, version = valueVersion;
-          form.elements.key_value.placeholder = "正在读取已保存密钥…";
-          act("reveal_key", {id: site.id, base_url: site.base_url, key_id: entry.id, settings_revision: s.settings_revision}).then((result) => {
-            if (form.isConnected && dialog.open && editing === site && editingEntry === entry && version === valueVersion) form.elements.key_value.value = result.value;
-          }).catch(() => { if (form.isConnected) toast("密钥读取失败，可取消后重试；留空仍保留原密钥。", true); })
-            .finally(() => { if (form.isConnected) form.elements.key_value.placeholder = "留空保留已保存密钥"; });
+          if (!entry.value) form.elements.key_value.placeholder = "正在读取已保存密钥…";
+          originalValueRead = act("reveal_key", {id: site.id, base_url: address(site), key_id: entry.id, settings_revision: saved.settings_revision}).then((result) => {
+            if (valid() && form.isConnected && dialog.open && editing === site && editingEntry === entry) {
+              viewedKeyValue = result.value;
+              if (!entry.value && version === valueVersion) form.elements.key_value.value = result.value;
+            }
+          }).catch(() => { if (valid() && form.isConnected) toast("密钥读取失败，可取消后重试；留空仍保留原密钥。", true); })
+            .finally(() => { if (valid() && form.isConnected) form.elements.key_value.placeholder = "留空保留已保存密钥"; });
         }
-        form.onsubmit = (event) => { event.preventDefault(); if (commitEntry()) content.querySelector("#add-key").focus(); };
-        content.querySelector("#cancel-key-edit").onclick = () => { editingEntry = null; content.querySelector("#key-editor").innerHTML = ""; drawList(); content.querySelector("#add-key").focus(); };
+        form.onsubmit = async event => { event.preventDefault(); if (await commitEntry()) content.querySelector("#add-key").focus(); };
+        content.querySelector("#cancel-key-edit").onclick = () => {
+          editingEntry = null; viewedKeyValue = null; committing = null;
+          const button = content.querySelector("#apply-keys"); button.disabled = false; button.removeAttribute("aria-busy");
+          content.querySelector("#key-editor").innerHTML = ""; drawList(); content.querySelector("#add-key").focus();
+        };
         drawList(); form.elements.key_name.focus();
       };
       content.querySelector("#add-key").onclick = () => openEditor();
       content.querySelector("#cancel-keys").onclick = () => dialog.close();
-      content.querySelector("#apply-keys").onclick = () => {
-        if (!commitEntry() || editing !== site || !area.isConnected) return;
-        if (JSON.stringify(entries) !== JSON.stringify(site.api_keys) || active !== site.active_key_id) {
-          site.api_keys = entries; site.active_key_id = active;
-          site.models = []; site.modelStatus = "密钥配置已修改，请重新获取模型。"; drawModels(site);
-        }
+      content.querySelector("#apply-keys").onclick = async () => {
+        if (!await commitEntry() || !valid() || editing !== site || !area.isConnected || !dialog.open) return;
+        const before = connection(site);
+        site.api_keys = entries; site.active_key_id = active;
+        if (connection(site) !== before) { invalidateModels(site); drawModels(site); }
         dialog.close(); drawKeys(site); updateStatus(); panel.querySelector("#manage-keys").focus();
       };
       dialog.addEventListener("close", () => {
         if (manager.isConnected) { manager.replaceChildren(); if (area.isConnected) panel.querySelector("#manage-keys").focus(); }
-        entries = []; editingEntry = null;
+        entries = []; editingEntry = null; viewedKeyValue = null;
       }, {once: true});
       drawList();
     };
   };
-  const draw = (reset = true) => {
-    updateSelectors();
+  const draw = () => {
+    hideKeys(); viewVersion++;
     state.settingsSite = selected;
-    const saved = drafts.find((p) => p.id === selected);
-    if (reset) editing = saved ? {...structuredClone(saved), modelStatus: saved.modelStatus === "正在获取模型…" ? "" : saved.modelStatus} : null;
+    editing = drafts.find(p => p.id === selected);
     const site = editing;
+    if (site?.modelStatus === "正在获取模型…") site.modelStatus = "";
     const editor = panel.querySelector("#site-editor");
     updateStatus();
     if (!site) { panel.querySelector("#site-controls").innerHTML = ""; editor.innerHTML = '<p class="help">添加一个图片站点开始配置。</p>'; return; }
-    const index = drafts.indexOf(saved);
+    const index = drafts.indexOf(site);
     editor.innerHTML = `<div class="form-row"><div><label for="site-name">站点名称</label><input id="site-name" data-field="name" maxlength="120" placeholder="留空时使用域名"></div><div><label for="site-url">API 基础地址</label><input id="site-url" data-field="base_url" type="url" required placeholder="https://example.com/v1"></div></div><div id="site-keys"></div><div class="site-model-head"><div class="actions"><label for="site-model-list">图片模型</label>${helpTip("模型选择说明", "填写地址和密钥后获取模型，选择支持图片生成的模型；也可手动填写模型名称。")}</div><button type="button" id="load-models">获取模型</button></div><select id="site-model-list"></select><p class="help" id="model-status" role="status" aria-live="polite"></p><label for="site-model">模型名称</label><input id="site-model" data-field="model" placeholder="选择或手动填写"><label class="check"><input data-field="enabled" type="checkbox">启用此站点</label><details class="site-advanced"><summary>更多连接选项</summary><div class="form-row"><div><label for="site-size">图片尺寸</label><input id="site-size" data-field="size"></div><div><label for="site-field">多参考图字段</label><select id="site-field" data-field="reference_field"><option>image[]</option><option>image</option></select></div></div><p class="help">使用 Images generations/edits 接口，基础地址通常以 /v1 结尾。</p></details>`;
     panel.querySelector("#site-controls").innerHTML = `<button type="button" id="site-up" ${index === 0 ? "disabled" : ""}>顺序提前</button><button type="button" id="site-down" ${index === drafts.length - 1 ? "disabled" : ""}>顺序延后</button><button type="button" id="remove-provider" class="danger">移除站点</button>`;
     drawKeys(site);
@@ -1586,10 +1882,13 @@ function providerFields(s) {
       if (el.type === "checkbox") el.checked = !!site[el.dataset.field];
       else el.value = site[el.dataset.field] || "";
       el.addEventListener("input", () => {
+        if (saving) return;
+        const before = address(site);
         read();
-        if (el.dataset.field === "base_url") {
-          site.api_keys = []; site.active_key_id = "";
-          site.models = []; site.modelStatus = "地址已修改，请添加此站点的密钥。";
+        if (el.dataset.field === "base_url" && before !== address(site)) {
+          const original = baseline.find(p => p.id === site.id && address(p) === address(site));
+          site.api_keys = original ? structuredClone(original.api_keys) : []; site.active_key_id = original?.active_key_id || "";
+          invalidateModels(site, original ? "" : "地址已修改，请添加此站点的密钥。");
           drawKeys(site); drawModels(site);
         }
         if (el.dataset.field === "model") drawModels(site);
@@ -1598,20 +1897,19 @@ function providerFields(s) {
     });
     drawModels(site);
     panel.querySelector("#site-model-list").onchange = (event) => {
+      if (saving) return;
       if (event.target.value === "__manual__") { panel.querySelector("#site-model").focus(); return; }
       site.model = event.target.value; panel.querySelector("#site-model").value = site.model;
       updateStatus();
     };
-    panel.querySelector("#load-models").onclick = (event) => busy(event.target, async () => {
+    panel.querySelector("#load-models").onclick = async () => {
+      if (saving) return;
       read();
-      const query = {id: site.id, base_url: site.base_url.trim(), key_id: site.active_key_id, api_key: site.api_keys.find((k) => k.id === site.active_key_id)?.value || "", clear_api_key: !site.active_key_id};
-      const signature = JSON.stringify(query);
-      const requestNumber = site.modelRequest = (site.modelRequest || 0) + 1;
+      const query = {id: site.id, base_url: site.base_url.trim(), key_id: site.active_key_id, api_key: site.api_keys.find(k => k.id === site.active_key_id)?.value || "", clear_api_key: !site.active_key_id};
+      const before = connection(site), version = viewVersion, requestNumber = site.modelRequest = (site.modelRequest || 0) + 1;
+      const button = panel.querySelector("#load-models"); button.disabled = true;
       site.modelStatus = "正在获取模型…"; drawModels(site);
-      const unchanged = () => {
-        read();
-        return panel.isConnected && editing === site && site.modelRequest === requestNumber && signature === JSON.stringify({id: site.id, base_url: site.base_url.trim(), key_id: site.active_key_id, api_key: site.api_keys.find((k) => k.id === site.active_key_id)?.value || "", clear_api_key: !site.active_key_id});
-      };
+      const unchanged = () => valid() && editing === site && viewVersion === version && site.modelRequest === requestNumber && before === connection(site);
       try {
         const result = await act("models", query);
         if (!unchanged()) return;
@@ -1620,70 +1918,137 @@ function providerFields(s) {
       } catch (error) {
         if (!unchanged()) return;
         site.modelStatus = error.message || "获取模型失败，请检查地址和密钥。";
-      }
-      if (selected === site.id) drawModels(site);
-    });
+      } finally { if (unchanged()) button.disabled = saving; }
+      if (unchanged()) drawModels(site);
+    };
     panel.querySelector("#remove-provider").onclick = () => {
-      drafts = drafts.filter((p) => p.id !== site.id); staged.delete(site.id); settingsChanged = true;
+      if (saving) return;
+      drafts = drafts.filter(p => p.id !== site.id);
+      if (preferred === site.id) preferred = "primary";
       selected = drafts[Math.min(index, drafts.length - 1)]?.id;
       draw(); panel.querySelector("#site-select").focus();
     };
     for (const [id, delta] of [["site-up", -1], ["site-down", 1]]) {
       panel.querySelector("#" + id).onclick = () => {
-        read(); [drafts[index], drafts[index + delta]] = [drafts[index + delta], drafts[index]]; settingsChanged = true;
-        draw(false); panel.querySelector("#site-select").focus();
+        if (saving) return;
+        read(); [drafts[index], drafts[index + delta]] = [drafts[index + delta], drafts[index]];
+        draw(); panel.querySelector("#site-select").focus();
       };
     }
   };
-  panel.innerHTML = `<div class="subhead"><div class="actions"><h3>图片站点</h3>${helpTip("站点保存方式", "编辑后先暂存站点，可继续编辑其他站点；最后点击“保存设置”统一生效。")}</div><div class="actions"><button type="button" id="add-provider">添加站点</button></div></div><p id="site-status" class="help" role="status" aria-live="polite"></p><label for="site-select">选择站点</label><select id="site-select"></select><div id="site-editor"></div><div class="actions site-actions"><div id="site-controls" class="actions"></div><button type="button" id="save-site">暂存站点</button></div>`;
-  panel.querySelector("#save-site").onclick = () => {
-    read();
-    for (const el of panel.querySelectorAll("[data-field]")) if (!el.reportValidity()) return;
-    if (editing.api_keys.some((k) => !k.value && !k.saved)) { toast("请填写新增密钥", true); return; }
-    if (!editing.base_url.trim() || (editing.enabled && !editing.model.trim())) {
-      toast("请补全站点地址及启用站点的模型", true); return;
+  panel.innerHTML = `<div class="subhead"><div class="actions"><h3>图片站点</h3>${helpTip("站点保存方式", "保存站点仅保存本站；保存设置会提交全部修改。切换查看会保留草稿。")}</div><button type="button" id="add-provider">添加站点</button></div><p id="site-status" class="help" role="status" aria-live="polite"></p><label for="site-select">选择站点</label><select id="site-select"></select><div id="site-editor"></div><div class="actions site-actions"><div id="site-controls" class="actions"></div><div class="actions"><button type="button" id="cancel-site" title="放弃本站未保存修改" hidden>取消保存</button><button type="button" id="save-site" hidden>保存站点</button></div></div>`;
+  const validateSite = (site) => {
+    let selector = "", message = "";
+    try { const url = new URL(site.base_url); if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) throw new Error(); }
+    catch { selector = "#site-url"; message = "请填写公开 HTTPS 基础地址，不含凭据、查询参数或片段"; }
+    if (!message && site.enabled && !site.model.trim()) { selector = "#site-model"; message = "启用站点前请填写模型名称"; }
+    if (!message && (site.api_keys.some(k => !k.value && !k.saved) || site.enabled && !site.api_keys.some(k => k.id === site.active_key_id && (k.saved || k.value)))) {
+      selector = "#manage-keys"; message = "启用站点前请填写并选用本站密钥";
     }
-    drafts[drafts.findIndex((p) => p.id === selected)] = structuredClone(editing);
-    staged.add(selected); updateSelectors(); updateStatus();
-    toast("本站已暂存，保存设置后生效");
+    if (message) {
+      if (selected !== site.id) { selected = site.id; draw(); }
+      panel.querySelector(selector).focus(); throw new Error(`${title(site)}：${message}`);
+    }
   };
-  panel.querySelector("#site-select").onchange = (event) => {
-    const discarded = dirty(); selected = event.target.value; draw();
-    if (discarded) toast("已舍弃未暂存的站点修改");
+  const fullPayload = () => {
+    const primary = drafts.find(p => p.id === "primary");
+    const first = primary ? payload(primary) : {base_url: "", api_keys: [], active_key_id: "", model: ""};
+    return {...Object.fromEntries(["base_url", "api_keys", "active_key_id", "model", "size", "reference_field"].filter(k => k in first).map(k => [k, first[k]])),
+      primary_name: primary ? title(primary) : "", primary_enabled: !!primary?.enabled,
+      providers: drafts.filter(p => p.id !== "primary").map(payload), provider_order: drafts.map(p => p.id), preferred_provider: preferred, ...globals()};
+  };
+  const save = async (siteOnly = false) => {
+    if (saving || disposed || dialog.open) return;
+    read();
+    const target = siteOnly ? editing : null;
+    try {
+      for (const site of target ? [target] : drafts) validateSite(site);
+      if (!siteOnly) for (const el of globalFields) if (!el.reportValidity()) { el.focus(); return; }
+    } catch (error) { updateStatus(error.message); toast(error.message, true); return; }
+    const data = siteOnly ? {site: payload(target)} : fullPayload();
+    const oldPreferred = saved.preferred_provider;
+    saving = true; hideKeys(); viewVersion++;
+    const controls = [...form.querySelectorAll("input, select, button"), main.querySelector("#save-settings")];
+    const disabled = controls.map(el => [el, el.disabled]); controls.forEach(el => el.disabled = true);
+    const writeButton = main.querySelector(siteOnly ? "#save-site" : "#save-settings"); writeButton.setAttribute("aria-busy", "true");
+    updateStatus();
+    try {
+      const result = await act(siteOnly ? "save_provider" : "settings", {...data, settings_revision: saved.settings_revision});
+      if (!valid()) return;
+      const normalized = sitesFrom(result);
+      if (siteOnly) {
+        const replacement = normalized.find(p => p.id === target.id);
+        if (!replacement) throw new Error("保存回执缺少本站，请刷新后核对");
+        Object.assign(target, replacement);
+        if (preferred === oldPreferred) preferred = result.preferred_provider;
+      } else {
+        for (const site of drafts) Object.assign(site, normalized.find(p => p.id === site.id));
+        preferred = result.preferred_provider;
+        for (const el of globalFields) { if (el.type === "checkbox") el.checked = result[el.name]; else el.value = result[el.name]; }
+      }
+      baseline = normalized; saved = structuredClone(result); state.data.settings = structuredClone(result);
+      // Keep this editor, scroll position, details and focus. Only normalized fields change.
+      if (editing && (!siteOnly || editing === target)) {
+        panel.querySelectorAll("[data-field]").forEach(el => { if (el.type === "checkbox") el.checked = editing[el.dataset.field]; else el.value = editing[el.dataset.field] || ""; });
+      }
+      toast(siteOnly ? "本站已保存" : "设置已保存");
+    } catch (error) {
+      if (valid()) { updateStatus(error.message || "保存失败，修改已保留"); toast(error.message || "保存失败，修改已保留", true); }
+      return;
+    } finally {
+      saving = false;
+      for (const [el, wasDisabled] of disabled) if (el.isConnected) el.disabled = wasDisabled;
+      writeButton.removeAttribute("aria-busy");
+      if (valid()) {
+        // A late models read is invalidated by the write; its button can be used again.
+        const modelsButton = panel.querySelector("#load-models"); if (modelsButton) modelsButton.disabled = false;
+        if (editing) {
+          if (editing.modelStatus === "正在获取模型…") editing.modelStatus = "";
+          drawKeys(editing); drawModels(editing);
+        }
+        for (const id of ["save-site", "cancel-site"]) { const button = panel.querySelector("#" + id); button.hidden = !dirty(); button.disabled = !dirty(); }
+        updateSelectors();
+      }
+    }
+    updateStatus();
+  };
+  panel.querySelector("#save-site").onclick = () => save(true);
+  panel.querySelector("#cancel-site").onclick = () => {
+    if (saving || !editing) return;
+    hideKeys();
+    const original = baseline.find(p => p.id === selected), index = drafts.indexOf(editing);
+    if (original) drafts[index] = structuredClone(original);
+    else {
+      drafts.splice(index, 1);
+      if (preferred === selected) preferred = saved.preferred_provider;
+      selected = drafts[Math.min(index, drafts.length - 1)]?.id;
+    }
+    draw(); panel.querySelector("#site-select").focus();
+  };
+  panel.querySelector("#site-select").onchange = event => {
+    if (saving) return;
+    read(); selected = event.target.value; draw();
   };
   panel.querySelector("#add-provider").onclick = () => {
-    const discarded = dirty(); selected = drafts.some((p) => p.id === "primary") ? "site_" + crypto.randomUUID() : "primary";
+    if (saving || drafts.length >= 5) return;
+    read(); selected = drafts.some(p => p.id === "primary") ? "site_" + crypto.randomUUID() : "primary";
     drafts.push({id: selected, name: "", base_url: "", api_keys: [], active_key_id: "", model: "", size: "1024x1024", reference_field: "image[]", enabled: false});
-    settingsChanged = true;
     draw(); panel.querySelector("#site-name").focus();
-    if (discarded) toast("已舍弃未暂存的站点修改");
   };
-  main.querySelector("#preferred-provider").onchange = (event) => { preferred = event.target.value; settingsChanged = true; updateStatus(); };
-  main.querySelector("#settings-form").addEventListener("input", (event) => {
-    if (event.target.name) { settingsChanged = true; updateStatus(); }
-  });
+  main.querySelector("#preferred-provider").onchange = event => { if (!saving) { preferred = event.target.value; updateStatus(); } };
+  form.addEventListener("input", event => { if (event.target.name && !saving) updateStatus(); });
+  document.addEventListener("pointerdown", event => { if (!panel.querySelector("#site-keys")?.contains(event.target)) closeKeys(); }, {signal: events.signal});
+  const controller = {
+    get saving() { return saving; }, dirty: anyDirty, saveAll: () => save(),
+    dispose() { disposed = true; hideKeys(); events.abort(); drafts = []; },
+  };
   draw();
-  return () => {
-    read();
-    if (dirty()) {
-      panel.querySelector("#save-site").focus();
-      throw new Error("请先暂存站点；切换站点会舍弃当前修改。");
-    }
-    const invalid = drafts.find((p) => !p.base_url.trim() || (p.enabled && !p.model.trim()));
-    if (invalid) { selected = invalid.id; draw(); throw new Error("请补全站点地址及启用站点的模型"); }
-    const first = drafts.find((p) => p.id === "primary");
-    return {
-      ...(first ? Object.fromEntries(["base_url", "api_keys", "active_key_id", "model", "size", "reference_field"].map((key) => [key, first[key]])) : {base_url: "", api_keys: [], active_key_id: "", model: ""}),
-      primary_name: first ? title(first) : "", primary_enabled: !!first?.enabled,
-      providers: drafts.filter((p) => p !== first).map((p) => Object.fromEntries(fields.map((key) => [key, key === "name" ? title(p) : p[key]]))),
-      provider_order: drafts.map((p) => p.id), preferred_provider: preferred,
-    };
-  };
+  return controller;
 }
 
 function renderSettings() {
   const s = state.data.settings;
-  main.innerHTML = `<div class="page-tools"><div class="subhead"><h2>设置</h2><div class="savebar"><p class="help" id="settings-status" role="status" aria-live="polite"></p><button id="save-settings" class="primary" type="submit" form="settings-form">保存设置</button></div></div></div>
+  main.innerHTML = `<div class="page-tools"><div class="subhead"><h2>设置</h2><div class="savebar"><p class="help" id="settings-status" role="status" aria-live="polite"></p><button id="save-settings" class="primary" type="submit" form="settings-form" hidden>保存设置</button></div></div></div>
   <form id="settings-form" novalidate><div class="settings-grid"><section class="panel" id="site-panel"></section>
   <section class="panel"><h3>生成与重试</h3>
   <label for="preferred-provider">首选生成站点</label><select id="preferred-provider"></select>
@@ -1700,43 +2065,29 @@ function renderSettings() {
   <div class="form-row"><div><label for="retention-days">成图保留天数</label><input id="retention-days" name="generated_retention_days" type="number" min="1" max="365" value="${s.generated_retention_days}"></div><div><label for="max-photos">成图数量上限</label><input id="max-photos" name="generated_max_count" type="number" min="1" max="1000" value="${s.generated_max_count}"></div></div>
   <p class="help">超期或超量会清理旧成图，清理后无法恢复。收藏和使用中的图片保留，可能暂时超限。</p>
   <div class="form-row"><div><label for="task-timeout">等待任务时限（秒）</label><input id="task-timeout" name="task_timeout" type="number" min="60" max="3600" value="${s.task_timeout}"></div><div><label for="poll">查询间隔（秒）</label><input id="poll" name="poll_interval" type="number" min="3" max="60" value="${s.poll_interval}"></div></div>
-  <details><summary>存储与超时说明</summary><p class="help">原图占用 ${(state.data.storage_bytes / 1024 / 1024).toFixed(1)} MB</p>
+  <details><summary>存储与超时说明</summary><p class="help">相册原图占用 <span id="album-storage-size">${(state.data.storage_bytes / 1024 / 1024).toFixed(1)}</span> MB</p>
   <p class="help">每分钟检查保留规则；没有可删图片时暂停新生图。回收站可在自动清理前恢复，清理后只保留任务元数据，用户源文件不受影响。</p>
   <p class="help">场景参考保留24小时，角色参考不自动清理，两者仅用于生图。</p>
   <p class="help">超时有任务编号时保留查询；无编号按“结果未知时允许重试”设置处理。</p></details></section></div></form>`;
-  const readProviders = providerFields(s);
-  main.querySelector("#settings-form").onsubmit = (e) => {
-    e.preventDefault();
-    const form = e.target;
-    busy(main.querySelector("#save-settings"), async () => {
-      const f = form.elements;
-      const sites = readProviders();
-      for (const el of form.querySelectorAll("[name]")) if (!el.reportValidity()) return;
-      const viewed = state.settingsSite;
-      await act("settings", {
-        ...sites,
-        max_retries: Number(f.max_retries.value),
-        retry_delay: Number(f.retry_delay.value),
-        parallel_backup: f.parallel_backup.checked,
-        retry_unknown: f.retry_unknown.checked,
-        settings_revision: s.settings_revision,
-        qzone_enabled: f.qzone_enabled.checked,
-        qzone_visibility: Number(f.qzone_visibility.value),
-        generated_retention_days: Number(f.generated_retention_days.value),
-        generated_max_count: Number(f.generated_max_count.value),
-        task_timeout: Number(f.task_timeout.value),
-        poll_interval: Number(f.poll_interval.value),
-      });
-      state.settingsSite = viewed;
-      await reload();
-      toast("设置已保存");
-    });
-  };
+  settingsSession = providerFields(s);
+  main.querySelector("#settings-form").onsubmit = event => { event.preventDefault(); return settingsSession.saveAll(); };
 }
 
 try {
   if (!bridge) throw new Error("请从 AstrBot 的“扩展功能”打开此页面");
   await bridge.ready();
+  const themeToggle = document.getElementById("theme-toggle");
+  const updateTheme = () => {
+    const dark = document.documentElement.dataset.theme === "dark";
+    themeToggle.innerHTML = icon(dark ? "sun" : "moon");
+    themeToggle.title = dark ? "切换亮色主题" : "切换暗色主题";
+    themeToggle.setAttribute("aria-label", themeToggle.title);
+  };
+  themeToggle.onclick = () => {
+    document.documentElement.dataset.theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  };
+  new MutationObserver(updateTheme).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+  updateTheme();
   await reload();
 } catch (e) {
   main.innerHTML = `<div class="empty"><h2>相册尚未连接</h2><p>${escape(e.message)}</p></div>`;
