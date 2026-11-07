@@ -19,6 +19,43 @@ RECOVERABLE = ("kind='proactive_message' AND (json_extract(data,'$.state')='send
                "(json_extract(data,'$.state')='sent' AND json_extract(data,'$.history_state') IN ('pending','orphaned') "
                "AND COALESCE(json_extract(data,'$.chat_deleted_at'),0)=0))")
 HAS_BODY = "kind='proactive_message' AND COALESCE(json_extract(data,'$.body_compacted'),0)!=1"
+OWN_TOOLS = frozenset({
+    "memory_search", "memory_read", "album_today", "album_plan_adjust",
+    "album_search", "album_favorite", "album_save_scene", "album_generate",
+    "album_send", "album_publish_qzone", "album_plan_schedule",
+    "album_plan_cancel", "album_schedule_trip",
+})
+_ENVELOPE_OR_JSON = re.compile(
+    r'\[Tool result for (?P<tool>[A-Za-z_][A-Za-z_0-9]*)\]\s*:\s*|[\[{"]'
+)
+
+
+def clean_tool_echo(text: str) -> str:
+    """Remove complete owned envelopes, never JSON examples or other payloads."""
+    decoder = json.JSONDecoder()
+    cursor = kept_from = 0
+    parts = []
+    while match := _ENVELOPE_OR_JSON.search(text, cursor):
+        tool = match.group("tool")
+        try:
+            _, end = decoder.raw_decode(text, match.end() if tool else match.start())
+        except RecursionError:
+            # A deeply nested value is not a verified envelope. Preserve its
+            # tail without repeatedly decoding each nested opening bracket.
+            break
+        except ValueError:
+            cursor = match.end()
+            continue
+        # Consume the complete JSON before looking for another envelope. A
+        # quoted envelope inside normal JSON or another tool is only data.
+        cursor = end
+        if tool in OWN_TOOLS:
+            parts.append(text[kept_from:match.start()])
+            kept_from = end
+            while kept_from < len(text) and text[kept_from] in "\r\n ":
+                kept_from += 1
+            cursor = kept_from
+    return ("".join(parts) + text[kept_from:]).strip() if parts else text
 
 
 def body_fingerprint(text: str) -> str:
@@ -54,18 +91,26 @@ def host_body(record: dict, history: list) -> str:
     return text if isinstance(text, str) and body_matches(record, text) else ""
 
 
-def clean_speech(value: str) -> str:
-    """Remove private payloads and internal control tags without clipping speech."""
+def clean_speech(value: str, *, public=False) -> str:
+    """Clean new public speech; keep legacy normalization at persistence boundaries.
+
+    Only the new-output parser opts into public mode. Already determined bodies
+    re-entering prepare/recovery must retain their original identity and wording.
+    """
     if not isinstance(value, str) or len(value) > 16000:
         raise AlbumError("待发正文格式或长度不正确")
+    if public:
+        value = clean_tool_echo(value)
     value = re.sub(
         r"(?is)<(?:think(?:ing)?|photo_scene|follow_up|plan_decision|schedule_decision)\b[^>]*>.*?</(?:think(?:ing)?|photo_scene|follow_up|plan_decision|schedule_decision)>",
         "",
         value,
     )
-    value = re.sub(r"data:[^\s,]+;base64,[A-Za-z0-9+/=]+", "[媒体数据已省略]", value)
-    value = re.sub(r"base64://[A-Za-z0-9+/=]+", "[媒体数据已省略]", value)
-    value = re.sub(r"https?://\S+\?\S+", "[带参数链接已省略]", value)
+    media = "" if public else "[媒体数据已省略]"
+    link = "" if public else "[带参数链接已省略]"
+    value = re.sub(r"data:[^\s,]+;base64,[A-Za-z0-9+/=]+", media, value)
+    value = re.sub(r"base64://[A-Za-z0-9+/=]+", media, value)
+    value = re.sub(r"https?://\S+\?\S+", link, value)
     return value.strip()
 
 

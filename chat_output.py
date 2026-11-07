@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+from weakref import ref
 
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
@@ -13,8 +14,6 @@ class AlbumOutput:
     # A typical reply is far smaller. Never flush an undecided prefix on overflow.
     MAX_CHARS = 65536
     MAX_STEPS = 128
-    OVERFLOW = "本轮回复过长，未发送未确认的工具前文。"
-    UNVERIFIED = "本轮部分中间回复未能核对，已省略。"
     INCOMPLETE = "模型未能完成本次回复，请稍后再试。"
 
     def __init__(self, context, *, image_turn=False):
@@ -29,7 +28,9 @@ class AlbumOutput:
         self.overflow = False
         self.tools = set()
         self.executing = 0
-        self.seen = set(self._tool_groups())
+        messages = getattr(context, "messages", ())
+        self.cursor = len(messages)
+        self.boundary = ref(messages[-1]) if messages else None
         self.steps = []
         self.steps_invalid = False
         self.had_tools = False
@@ -39,35 +40,42 @@ class AlbumOutput:
     def _signature(text):
         return len(text), sha256(text.encode("utf-8")).digest()
 
-    def _tool_groups(self):
-        groups = {}
-        for message in getattr(self.context, "messages", ()):
+    def observe(self):
+        # Follow actual append occurrences, not provider call IDs (which may
+        # repeat even with identical bodies). Keep only one weak boundary and
+        # bounded signatures; compression must not retain old message payloads.
+        messages = getattr(self.context, "messages", ())
+        start = self.cursor
+        if start:
+            boundary = self.boundary() if self.boundary else None
+            if boundary is None:
+                start = len(messages)
+                self.steps_invalid = True
+            elif start > len(messages) or messages[start - 1] is not boundary:
+                start = next((i + 1 for i, message in enumerate(messages) if message is boundary), None)
+                if start is None:
+                    start = len(messages)
+                    self.steps_invalid = True
+        for index in range(start, len(messages)):
+            message = messages[index]
             calls = getattr(message, "tool_calls", None)
             if getattr(message, "role", "") != "assistant" or not calls:
                 continue
-            ids = tuple(call.id for call in calls)
-            content = getattr(message, "content", None)
-            text = content if isinstance(content, str) else "".join(
-                part.text for part in content or () if getattr(part, "type", "") == "text"
-            )
-            groups[ids] = ({call.function.name for call in calls}, self._signature(text))
-        return groups
-
-    def observe(self):
-        # The runner appends the whole assistant tool set only after that step.
-        # Hooks retain its names if context compression removes the appended step.
-        groups = self._tool_groups()
-        for ids, (names, signature) in groups.items():
-            if ids not in self.seen:
-                self.had_tools = True
-                if len(self.steps) < self.MAX_STEPS:
-                    self.steps.append((signature, self.image_turn or "album_generate" in names))
-                else:
-                    self.steps_invalid = True
-                self.tools.update(names)
-                self.executing = 0
-                self._resolve()
-        self.seen.update(groups)
+            names = {call.function.name for call in calls}
+            self.had_tools = True
+            if len(self.steps) < self.MAX_STEPS:
+                content = getattr(message, "content", None)
+                text = content if isinstance(content, str) else "".join(
+                    part.text for part in content or () if getattr(part, "type", "") == "text"
+                )
+                self.steps.append((self._signature(text), self.image_turn or "album_generate" in names))
+            else:
+                self.steps_invalid = True
+            self.tools.update(names)
+            self.executing = 0
+            self._resolve()
+        self.cursor = len(messages)
+        self.boundary = ref(messages[-1]) if messages else None
 
     def tool_start(self, name):
         self.observe()
@@ -83,7 +91,7 @@ class AlbumOutput:
         if not self.image_turn and "album_generate" not in self.tools:
             self.ready.extend(self.pending)
         else:
-            self.size -= sum(len(part.text) for part in self.pending)
+            self.size -= sum(max(1, len(part.text)) for part in self.pending)
         self.pending = []
         self.tools.clear()
 
@@ -93,20 +101,20 @@ class AlbumOutput:
                 continue
             if self.overflow:
                 continue
-            if self.size + len(part.text) > self.MAX_CHARS:
+            if self.size + max(1, len(part.text)) > self.MAX_CHARS:
                 self.pending.clear()
                 self.ready.clear()
                 self.size = 0
                 self.overflow = True
                 continue
             self.pending.append(Plain(part.text))
-            self.size += len(part.text)
+            self.size += max(1, len(part.text))
 
     def take_ready(self):
         if self.tools and not self.executing:
             self._resolve()
         result, self.ready = self.ready, []
-        self.size -= sum(len(part.text) for part in result)
+        self.size -= sum(max(1, len(part.text)) for part in result)
         return result
 
     def decorate(self, result):
@@ -114,8 +122,6 @@ class AlbumOutput:
         if self.done:
             prefix = self.take_ready()
             self.pending.clear()
-            if self.overflow:
-                prefix.append(Plain(self.OVERFLOW))
             if self.had_tools and not self.saw_intermediate:
                 result.chain = self._filter_merged(result.chain)
             else:
@@ -131,41 +137,56 @@ class AlbumOutput:
 
     def _filter_merged(self, chain):
         # run_agent merges complete step chains. Match their exact public text
-        # against stable tool-call identities; media keep their original order.
+        # against each observed occurrence; media keep their original order.
         # Only hashes/lengths are retained, never another copy of step bodies.
-        expected = [(sig, drop) for sig, drop in self.steps if sig[0]]
+        expected = list(self.steps)
         if self.final_text:
             expected.append((self._signature(self.final_text), False))
-        position, size, digest, plain_count = 0, 0, sha256(), 0
+        cursor, empty_steps = 0, 0
         removed = set()
         valid = not self.steps_invalid
-        for index, part in enumerate(chain):
-            if not isinstance(part, Plain) or not part.text:
+        for (length, fingerprint), drop in expected:
+            if not length:
+                # Host history cannot distinguish absent text from one empty
+                # Plain. Both have no public content; only this zero-length
+                # ambiguity is optional when matching the next complete step.
+                empty_steps += 1
                 continue
-            if position >= len(expected):
-                valid = False
-                break
-            (length, fingerprint), drop = expected[position]
-            if plain_count:
-                digest.update(b" ")  # Host MessageChain.get_plain_text separator.
-                size += 1
-            digest.update(part.text.encode("utf-8"))
-            size += len(part.text)
-            plain_count += 1
-            if drop:
-                removed.add(index)
-            if size > length or (size == length and digest.digest() != fingerprint):
-                valid = False
-                break
-            if size == length:
-                position += 1
+            start, matched = cursor, False
+            for _ in range(empty_steps + 1):
                 size, digest, plain_count = 0, sha256(), 0
-        if valid and position == len(expected) and not size:
+                for index in range(start, len(chain)):
+                    part = chain[index]
+                    if not isinstance(part, Plain):
+                        continue
+                    if plain_count:
+                        digest.update(b" ")  # Host get_plain_text separator.
+                        size += 1
+                    digest.update(part.text.encode("utf-8"))
+                    size += len(part.text)
+                    plain_count += 1
+                    if size >= length:
+                        matched = size == length and digest.digest() == fingerprint
+                        break
+                if matched:
+                    if drop:
+                        removed.update(i for i in range(start, index + 1) if isinstance(chain[i], Plain))
+                    cursor = index + 1
+                    break
+                while start < len(chain) and not isinstance(chain[start], Plain):
+                    start += 1
+                if start == len(chain) or chain[start].text:
+                    break
+                start += 1
+            if not matched:
+                valid = False
+                break
+            empty_steps = 0
+        if valid and all(not isinstance(part, Plain) or not part.text for part in chain[cursor:]):
             return [part for index, part in enumerate(chain) if index not in removed]
         # Context compression or a changed chain cannot certify an old prefix.
         # Keep media and the confirmed final answer, without guessing boundaries.
         kept = [part for part in chain if not isinstance(part, Plain)]
-        kept.append(Plain(self.UNVERIFIED))
         if self.final_text:
             kept.append(Plain(self.final_text))
         return kept
@@ -181,7 +202,8 @@ class AlbumOutput:
         self.pending.clear()
         self.ready.clear()
         self.tools.clear()
-        self.seen.clear()
+        self.cursor = 0
+        self.boundary = None
         self.steps.clear()
         self.final_text = ""
         self.context = None
@@ -214,11 +236,9 @@ async def guard_stream(source, event, key):
             ready = flow.take_ready()
             if ready:
                 yield MessageChain(chain=ready)
-            if flow.overflow:
-                yield MessageChain().message(flow.OVERFLOW)
             if flow.done and flow.final_text:
                 yield MessageChain().message(flow.final_text)
-            elif not flow.done and not flow.overflow and not (
+            elif not flow.done and not (
                 event.is_stopped() or event.get_extra("agent_user_aborted")
                 or event.get_extra("agent_stop_requested")
             ):

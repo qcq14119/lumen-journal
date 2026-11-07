@@ -41,7 +41,7 @@ from .plans import (
     next_times,
 )
 from .provider import ImageProvider, PublicResolver, validate_url
-from .proactive import ProactiveHistory, marker
+from .proactive import ProactiveHistory, clean_tool_echo, marker
 from .store import (
     MAX_BYTES,
     AlbumError,
@@ -74,21 +74,9 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.2")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.3")
 class CompanionAlbum(Star):
-    @staticmethod
-    def clean_tool_echo(text: str) -> str:
-        """Remove only complete album tool envelopes, retaining surrounding prose."""
-        pattern = r"\[Tool result for (?:album_save_scene|album_search|album_favorite|album_send|album_generate|album_publish_qzone|album_plan_schedule|album_plan_cancel|album_schedule_trip|album_today|album_plan_adjust)\]\s*:\s*"
-        original = text
-        for match in reversed(list(re.finditer(pattern, text))):
-            tail = text[match.end() :]
-            try:
-                _, end = json.JSONDecoder().raw_decode(tail)
-            except ValueError:
-                continue
-            text = text[: match.start()] + tail[end:].lstrip("\r\n ")
-        return text.strip() if text != original else text
+    clean_tool_echo = staticmethod(clean_tool_echo)
 
     @filter.on_llm_response(priority=100000)
     async def clean_album_response(
@@ -156,13 +144,14 @@ class CompanionAlbum(Star):
 
     @filter.on_agent_done(priority=100000)
     async def album_chat_done(self, event: AstrMessageEvent, run_context, response):
-        if event.get_extra(NAME + "_generation") and run_context.messages:
+        if run_context.messages:
             last = run_context.messages[-1]
-            if last.role == "assistant" and last.content:
-                # Keep the saved final text consistent with the grounded reply.
+            if last.role == "assistant" and not last.tool_calls and last.content:
+                # The host appends this final TextPart before response hooks.
+                # Sync even an empty cleaned reply, only for this new final turn.
                 text_parts = [p for p in last.content if isinstance(p, TextPart)]
-                if len(text_parts) == 1 and response.completion_text:
-                    text_parts[0].text = response.completion_text
+                if len(text_parts) == 1:
+                    text_parts[0].text = response.completion_text or ""
         if getattr(self, "memory_runtime", None):
             try:
                 await self.memory_runtime.done(event)
@@ -3162,7 +3151,6 @@ class CompanionAlbum(Star):
         output = (response.completion_text or "").strip()
         if not life_plan:
             output, _, _ = self.parse_plan_output(output)
-            output = self.clean_tool_echo(output)
         return output if len(output) <= (2400 if life_plan else 200) else ""
 
     async def _completion_snapshot(self, scope, cid):

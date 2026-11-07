@@ -231,7 +231,7 @@ def parse_plan_controls(raw, sources=None, *, reminder=False):
             or type(follow.get("with_photo", False)) is not bool
         ):
             raise protocol_error("FIELDS")
-    return decision, clean_speech(body)[:800], plain_text(scene), follow
+    return decision, clean_speech(body, public=True)[:800], plain_text(scene), follow
 
 
 def parse_decision(raw, sources, *, reminder=False):
