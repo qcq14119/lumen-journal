@@ -74,7 +74,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.3")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.4")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
@@ -2309,12 +2309,12 @@ class CompanionAlbum(Star):
             if 0 <= dt.hour <= 4:
                 if prof.get("can_stay_up_predawn"):
                     prof["predawn_note"] = (
-                        f"现在是深夜/凌晨（即将迎来 {prof['date']} {prof['weekday_cn']}，属于{prof['label']}，白天不用早起上课或上班），"
+                        f"当前是 {prof['date']} {prof['weekday_cn']}凌晨；接下来的白天属于{prof['label']}，不用早起上课或上班。"
                         "没有早起压力，可以当个开心的夜猫子聊会儿天、分享夜间心情或夜宵，再哄对方睡觉。"
                     )
                 else:
                     prof["predawn_note"] = (
-                        f"现在是深夜/凌晨（即将迎来 {prof['date']} {prof['weekday_cn']}，属于{prof['label']}，白天需要早起），"
+                        f"当前是 {prof['date']} {prof['weekday_cn']}凌晨；接下来的白天属于{prof['label']}，需要早起。"
                         "适合温柔或傲娇地催促早点休息，不要熬太晚。"
                     )
             return prof
@@ -2983,11 +2983,11 @@ class CompanionAlbum(Star):
             delta = int(life_plan.get("delta_minutes") or 0)
             anchor_local = life_plan.get("anchor_local") or life_plan["local_time"]
             if delta <= -4:
-                time_note = f"原定基准时间是 {anchor_local}，你今天比平时早了 {abs(delta)} 分钟（比如醒得早、提前下课、肚子先饿了或迫不及待想找对方），可以在语气里顺手带出这份提前的小状态。"
+                time_note = "内部时间感知：本次联系偏早。"
             elif delta >= 4:
-                time_note = f"原定基准时间是 {anchor_local}，你今天比平时晚了 {delta} 分钟（比如赖床、拖堂、排队、收拾东西或路上耽搁了），可以在语气里自然带出一句晚到的小抱怨或撒娇。"
+                time_note = "内部时间感知：本次联系偏晚。"
             else:
-                time_note = f"原定基准时间是 {anchor_local}，现在差不多正好准点。"
+                time_note = "内部时间感知：本次联系在日常时段附近，自然展开即可。"
             photo_mode = life_plan.get("photo_mode") or "auto"
             if photo_mode == "always":
                 photo_note = "本次计划开启了拍照分享：请先写出自然的主动聊天正文（正文中可以自然提起刚拍了张照片或正准备拍给对方看），并在正文最后单独附上一行 `<photo_scene>单个具体拍照画面描述（动作、穿着、环境、表情、镜头视角）</photo_scene>`，后台会先发出你的文字，再去生成并补发照片。"
@@ -3022,7 +3022,7 @@ class CompanionAlbum(Star):
                     day_prof["custom_notes"]
                 )
             if day_prof.get("predawn_note"):
-                extra_context += f"\n【凌晨前夜提示】{day_prof['predawn_note']}"
+                extra_context += f"\n【凌晨生活提示】{day_prof['predawn_note']}"
             if life_plan.get("daily_trace"):
                 extra_context += (
                     "\n今日已发生的生活轨迹（保持前后一致，不自相矛盾）："
@@ -3036,12 +3036,19 @@ class CompanionAlbum(Star):
             if life_plan.get("chat_gap_note"):
                 extra_context += f"\n聊天衔接提示：{life_plan['chat_gap_note']}"
             fact = (
-                "这是你的「朝夕拾记」生活日程到了可以考虑联系的时间，写自然的主动聊天，正文最多300字。"
+                "这是你的「朝夕拾记」生活日程到了可以考虑联系的时间，写自然的主动聊天。"
+                "篇幅、语气和表达习惯遵循当前人设，结合最近聊天自然接话。"
                 "结合最近聊天，不要把安排照念成工作提醒；不要每次都重复相同台词。"
+                "把早晚感知作为生活反应的线索，结合任务主题、人设、当前时段、最近聊天和近期用过的场景，"
+                "自然选择状态、情绪或生活小理由；允许与上下文相容的发挥，不固定早晚与某种反应的对应，也不必每次解释原因。"
+                "已发生的聊天事实优先，不重演已完成的活动，不为了表现早晚编造冲突经历；用户明确约定和临时调整优先。"
+                "下方时间、本次安排和今日概览是内部调度与决策资料，不是公开台词要求。"
+                "普通主动联系默认不播报基准时刻、不计算早晚分钟差、不强调准点或解释系统调度；"
+                "可以自然表达早晚感受。明确约定提醒、用户询问时间或聊天语义需要时，仍可准确提及时点。"
                 "情境里的旧 send_message_to_user 指令只表示想开口聊天，本次只输出最终台词（以及可选的末尾标签），后台负责先发文字再处理拍照或后续约定。"
                 "不直接调用任何 function tool。若情境明确不适合当前时刻，在本次决策中选择skip。"
                 "可以结合当前日期与可靠常识自然表达五一、国庆等固定节日氛围；不要把节日日期等同于整段放假或调休安排，不确定时不编造。准确放假/调休以聊天给出的信息为准。"
-                f"当前当地时间：{life_plan['local_time']}。{time_note}"
+                f"\n内部调度资料（用于判断时机和约定）：当前当地时间：{life_plan['local_time']}；计划参考时点：{anchor_local}。{time_note}"
                 f"\n拍照说明：{photo_note}\n后续心念约定说明：{followup_note}"
                 f"{extra_context}\n默认情境参考（不代表动作尚未发生，最新可靠聊天进展优先）：{life_plan['instruction']}"
             )
