@@ -77,7 +77,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.5")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.6")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
