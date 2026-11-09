@@ -77,7 +77,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.6")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.7")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
@@ -862,7 +862,10 @@ class CompanionAlbum(Star):
                 )
             if action == "plans_import":
                 return json_response(
-                    self.plans.import_data(data.get("document"), data.get("scope", ""))
+                    self.plans.import_data(
+                        data.get("document"), data.get("scope", ""),
+                        overwrite=data.get("overwrite", False),
+                    )
                 )
             if action == "calendar_save":
                 scope = text_value(data.get("scope", ""), 300)

@@ -1994,7 +1994,9 @@ class LifePlans:
             return self.store.get("life_plan", key)
 
     @managed
-    def import_data(self, payload: dict, scope: str = "") -> dict:
+    def import_data(self, payload: dict, scope: str = "", *, overwrite: bool = False) -> dict:
+        if type(overwrite) is not bool:
+            raise AlbumError("同名覆盖选项须为开或关")
         if not isinstance(payload, dict) or payload.get("format") not in (
             FORMAT,
             "astrbot-cron-dashboard-extract-v1",
@@ -2003,16 +2005,17 @@ class LifePlans:
         source = payload.get("plans", payload.get("jobs", []))
         if not isinstance(source, list) or not 1 <= len(source) <= 200:
             raise AlbumError("每次导入 1–200 条计划")
-        prepared, keys = [], set()
+        scope = text_value(scope, 300)
+        prepared = []
         for item in source:
             if not isinstance(item, dict) or item.get("run_once"):
                 raise AlbumError("当前导入支持周期生活计划，请先移除一次性任务")
             target = scope or item.get("scope", item.get("session", ""))
-            identity = json.dumps([item.get("name"), target], ensure_ascii=False)
-            key = hashlib.sha256(identity.encode()).hexdigest()
-            if key in keys:
-                raise AlbumError("文件含重复的计划名称和会话")
-            keys.add(key)
+            try:
+                window_before = int(item.get("window_before") or 0)
+                window_after = int(item.get("window_after") or 0)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise AlbumError("浮动时间区间格式不正确") from exc
             prepared.append(
                 {
                     "name": item.get("name", ""),
@@ -2021,29 +2024,67 @@ class LifePlans:
                     "timezone": item.get("timezone") or "Asia/Shanghai",
                     "scope": target,
                     "enabled": False,
-                    "window_before": int(item.get("window_before") or 0),
-                    "window_after": int(item.get("window_after") or 0),
+                    "window_before": window_before,
+                    "window_after": window_after,
                     "photo_mode": item.get("photo_mode") or "auto",
+                    "contact_mode": item.get("contact_mode", "adaptive"),
                     "day_mode": item.get("day_mode") or "cron",
-                    "import_key": key,
                 }
             )
-        existing = {(p["name"], p["scope"]) for p in self.store.all("life_plan")}
-        created, skipped = [], 0
-        # Validate the entire document before an atomic batch insert.
+        counts = {"created": 0, "updated": 0, "restored": 0, "skipped": 0}
+        # Normalize before matching, and retain IDs so execution dedupe survives.
         with self.store.lock, self.store.db:
+            existing = {}
+            for plan in self.store.all("life_plan"):
+                identity = (text_value(plan["name"], 120), text_value(plan["scope"], 300))
+                existing.setdefault(identity, []).append(plan)
+            writes, keys = [], set()
             for item in prepared:
-                payload = self.save(item, validate_only=True)
-                if (payload["name"], payload["scope"]) in existing:
-                    skipped += 1
-                else:
-                    created.append(
-                        (uid("plan_"), json.dumps(payload, ensure_ascii=False))
+                checked = self.save(item, validate_only=True)
+                identity = (checked["name"], checked["scope"])
+                if identity in keys:
+                    raise AlbumError("文件含重复的计划名称和会话")
+                keys.add(identity)
+                matches = existing.get(identity, [])
+                if len(matches) > 1:
+                    raise AlbumError("此会话有多条同名计划，请先处理重名后再导入")
+                old = matches[0] if matches else None
+                if old and not old.get("deleted") and not overwrite:
+                    counts["skipped"] += 1
+                    continue
+                if old:
+                    if old.get("run_once") or old.get("source") in ("chat", "chain"):
+                        raise AlbumError("同名计划是一次性约定，请修改导入名称后重试")
+                    self.store.restore_guard.check_object("life_plan", old["id"])
+                    saved = {k: v for k, v in old.items() if k not in ("id", "revision", "deleted")}
+                    saved.update(
+                        {key: checked[key] for key in (
+                            "name", "instruction", "scope", "character_id", "cron",
+                            "timezone", "enabled", "window_before", "window_after",
+                            "photo_mode", "contact_mode", "day_mode",
+                        )}
                     )
-            self.store.db.executemany(
-                "INSERT INTO records VALUES ('life_plan',?,?,1)", created
-            )
-        return {"created": len(created), "skipped": skipped, "enabled": False}
+                    counts["restored" if old.get("deleted") else "updated"] += 1
+                    writes.append((old["id"], saved, old["revision"]))
+                else:
+                    checked["import_key"] = hashlib.sha256(
+                        json.dumps(list(identity), ensure_ascii=False).encode()
+                    ).hexdigest()
+                    counts["created"] += 1
+                    writes.append((uid("plan_"), checked, None))
+            # No row changes until every item and target has passed validation.
+            for key, saved, revision in writes:
+                raw = json.dumps(saved, ensure_ascii=False)
+                if revision is None:
+                    self.store.db.execute("INSERT INTO records VALUES ('life_plan',?,?,1)", (key, raw))
+                else:
+                    cursor = self.store.db.execute(
+                        "UPDATE records SET data=?,revision=revision+1 WHERE kind='life_plan' AND id=? AND revision=?",
+                        (raw, key, revision),
+                    )
+                    if cursor.rowcount != 1:
+                        raise AlbumError("计划已更新，请刷新后重新导入")
+        return {**counts, "enabled": False}
 
     @managed
     def manage(self, patches: list[dict], action: str) -> dict:

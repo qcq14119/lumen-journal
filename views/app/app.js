@@ -1110,15 +1110,44 @@ async function renderPlans() {
   main.querySelector("#new-plan").onclick = () => editPlan({}, data.bots);
   main.querySelectorAll("[data-edit-plan]").forEach((b) => b.onclick = () => editPlan(data.plans.find((p) => p.id === b.dataset.editPlan), data.bots));
   main.querySelector("#import-plans").onclick = () => {
-    showDialog("导入朝夕拾记", `<div class="dialog-body"><p>支持拾光手账 JSON 和已有 AstrBot 计划导出。相同名称与会话不会重复导入；全部先停用。</p><label for="plan-file">选择 JSON 文件</label><input id="plan-file" type="file" accept=".json,application/json"><label for="import-scope">迁入会话（留空使用文件原值）</label><select id="import-scope"><option value="">使用文件原会话</option>${chars().flatMap((c) => c.sessions.map((s) => `<option value="${escape(s)}">${escape(c.name)} · ${escape(s)}</option>`)).join("")}</select><p class="help">旧文件没有时区时，明确采用 Asia/Shanghai。所有会话须先绑定角色。</p></div>`, footer('<button id="confirm-import" class="primary">导入并停用</button>'));
-    content.querySelector("#confirm-import").onclick = (e) => busy(e.target, async () => {
-      const file = content.querySelector("#plan-file").files[0];
-      if (!file || file.size > 2 * 1024 * 1024) throw new Error("请选择不超过 2 MB 的 JSON 文件");
-      let document;
-      try { document = JSON.parse(await file.text()); } catch { throw new Error("文件不是有效 JSON"); }
-      const result = await act("plans_import", {document, scope: content.querySelector("#import-scope").value});
-      dialog.close(); await render(); toast(`导入 ${result.created} 条，跳过重复 ${result.skipped} 条；全部停用`);
-    });
+    showDialog("导入朝夕拾记", `<div class="dialog-body"><label for="plan-file">选择 JSON 文件</label><input id="plan-file" type="file" accept=".json,application/json"><label for="import-scope">迁入会话</label><select id="import-scope"><option value="">使用文件原会话</option>${chars().flatMap((c) => c.sessions.map((s) => `<option value="${escape(s)}">${escape(c.name)} · ${escape(s)}</option>`)).join("")}</select><label class="check"><input id="import-overwrite" type="checkbox" aria-describedby="import-overwrite-help">同名覆盖（同一会话）</label><p id="import-overwrite-help" class="help">勾选后替换同名计划的内容和时间设置，并停用；未勾选则跳过。回收站同名计划会重新导入为停用状态。</p><p class="help">导入的计划先停用。会话须已绑定角色；旧文件缺少时区时使用 Asia/Shanghai。</p><p id="import-result" role="status" hidden></p><p id="import-error" role="alert" tabindex="-1" hidden></p></div>`, footer('<button id="confirm-import" class="primary">导入并停用</button>'));
+    const fileInput = content.querySelector("#plan-file"), scopeInput = content.querySelector("#import-scope");
+    const overwriteInput = content.querySelector("#import-overwrite"), button = content.querySelector("#confirm-import");
+    const error = content.querySelector("#import-error"), status = content.querySelector("#import-result");
+    let importing = false, closed = false;
+    dialog.addEventListener("close", () => { closed = true; }, {once:true});
+    const current = () => !closed && dialog.open && button.isConnected;
+    button.onclick = async () => {
+      if (importing || !current()) return;
+      const file = fileInput.files[0], scope = scopeInput.value, overwrite = overwriteInput.checked;
+      importing = true; error.hidden = true; status.hidden = true;
+      [fileInput, scopeInput, overwriteInput, button].forEach(el => { el.disabled = true; });
+      button.textContent = "正在导入…"; button.setAttribute("aria-busy", "true");
+      try {
+        if (!file || file.size > 2 * 1024 * 1024) throw new Error("请选择不超过 2 MB 的 JSON 文件");
+        let document;
+        try { document = JSON.parse(await file.text()); } catch { throw new Error("文件不是有效 JSON"); }
+        if (!current()) return;
+        const result = await act("plans_import", {document, scope, overwrite});
+        if (!current()) return;
+        const created = result.created || 0, updated = result.updated || 0, restored = result.restored || 0, skipped = result.skipped || 0;
+        const summary = `新增 ${created} 条，覆盖 ${updated} 条，从回收站重新导入 ${restored} 条，跳过 ${skipped} 条`;
+        if (!created && !updated && !restored) {
+          status.textContent = `${summary}；已有计划未修改。需要替换时可勾选“同名覆盖”后重试。`;
+          status.hidden = false;
+        } else {
+          dialog.close(); await render(); toast(`${summary}；本次导入的计划均已停用`);
+        }
+      } catch (err) {
+        if (current()) { error.textContent = err.message || "导入失败，请重试"; error.hidden = false; error.focus(); }
+      } finally {
+        importing = false;
+        if (current()) {
+          [fileInput, scopeInput, overwriteInput, button].forEach(el => { el.disabled = false; });
+          button.textContent = "导入并停用"; button.removeAttribute("aria-busy");
+        }
+      }
+    };
   };
   if (view === "calendar") bindCalendarView(data);
   if (view === "today") bindTodayView(data);
