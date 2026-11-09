@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..restore_guard import managed
+
 import asyncio
 import hashlib
 import json
@@ -194,10 +196,16 @@ class MemoryService:
         """The host saves after on_agent_done; shutdown owns this delayed work."""
         if self._closed:
             return
+        self.store.restore_guard.check()
+        epoch = self.store.restore_guard.epoch
 
         def start():
             self._backup_handles.discard(handle)
             if self._closed:
+                return
+            try:
+                self.store.restore_guard.check_epoch(epoch)
+            except Exception:
                 return
             task = asyncio.create_task(callback())
             self._backup_tasks.add(task)
@@ -206,8 +214,11 @@ class MemoryService:
         handle = asyncio.get_running_loop().call_later(3, start)
         self._backup_handles.add(handle)
 
+    @managed
     def describe_images(self, scope, cid, *, refs, manual=False):
         """Only the caller's frozen image set can start work; never drain a backlog."""
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         if self._closed or (scope, cid) in self.tasks or (scope, cid) in self.busy:
             return False
         settings = self.store.state(scope, cid)["settings"]
@@ -218,6 +229,7 @@ class MemoryService:
     def vectors_on(self, settings):
         return bool(settings.get("vector_enabled")) and self.optional_model("embedding", settings) is not None
 
+    @managed
     def refresh_vectors(self, scope, cid, *, rebuild=False, manual=False):
         """Bring this chat's vectors up to date in the background.
 
@@ -225,6 +237,8 @@ class MemoryService:
         a failure is logged once and the user can press 补齐 later.
         Returns False when vectors are off or a refresh is already running.
         """
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         if self._closed:
             return False
         settings = self.store.state(scope, cid)["settings"]
@@ -456,8 +470,11 @@ class MemoryService:
 
     # ------------------------------------------------------------- work ----
 
+    @managed
     def request(self, scope, cid, *, manual=False):
         """Start background summarizing if due. Returns immediately."""
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         key = (scope, cid)
         if self._closed or key in self.tasks or key in self.images.tasks:
             return False
@@ -480,6 +497,7 @@ class MemoryService:
             return True
         return False
 
+    @managed
     async def _run(self, scope, cid, manual):
         key = (scope, cid)
         self.failed.pop(key, None)

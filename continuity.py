@@ -91,7 +91,8 @@ def safe_stage(stage, status, exc=None, code=None):
         raise ValueError("Invalid local diagnostic stage")
     if status not in {"ok", "failed", "held", "pending", "skipped", "unknown", "fallback"}:
         raise ValueError("Invalid local diagnostic status")
-    allowed = {"TIMEOUT", "CONNECTION", "STORAGE", "VALIDATION", "INTERNAL", "TIMER_ONLY", "PROTOCOL_THOUGHT", "PROTOCOL_STRUCTURE", "PROTOCOL_JSON", "PROTOCOL_FIELDS"}
+    allowed = {"TIMEOUT", "CONNECTION", "STORAGE", "VALIDATION", "INTERNAL", "TIMER_ONLY", "PROTOCOL_THOUGHT", "PROTOCOL_STRUCTURE", "PROTOCOL_JSON", "PROTOCOL_FIELDS",
+               "PHOTO_DISABLED", "PHOTO_NO_SCENE", "PHOTO_ENGINE_UNAVAILABLE", "PHOTO_SUBMIT_FAILED", "PHOTO_TASK_CREATED"}
     code = safe_failure(exc) if exc is not None else code
     return {"stage": stage, "status": status, "at": now(), **({"code": code if code in allowed else "INTERNAL"} if code else {})}
 

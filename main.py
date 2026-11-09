@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import managed
+
 import asyncio
 import base64
 import hashlib
@@ -23,6 +25,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .engine import Engine
+from .backup import BackupAPI
 from .chat_output import AlbumOutput, guard_stream
 from .continuity import plain_text, recent_text, watermark
 from .daily import DailyEvidence
@@ -74,7 +77,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.4")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.5")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
@@ -144,6 +147,12 @@ class CompanionAlbum(Star):
 
     @filter.on_agent_done(priority=100000)
     async def album_chat_done(self, event: AstrMessageEvent, run_context, response):
+        guard = getattr(getattr(self, "store", None), "restore_guard", None)
+        if guard:
+            try:
+                guard.check_event(event)
+            except AlbumError:
+                return
         if run_context.messages:
             last = run_context.messages[-1]
             if last.role == "assistant" and not last.tool_calls and last.content:
@@ -171,6 +180,7 @@ class CompanionAlbum(Star):
                 )
 
     def _observe_daily(self, scope, cid, history, *, capture=False):
+        self.store.restore_guard.check_chat(scope, cid)
         generation = (
             self.memory_store.state(scope, cid)["generation"]
             if getattr(self, "memory_store", None)
@@ -261,11 +271,17 @@ class CompanionAlbum(Star):
         )
         self.proactive = ProactiveHistory(self.store, context, self.memory_runtime)
         self.daily_evidence = DailyEvidence(self.store)
+        self.store.restore_guard.plugin = self
         self.memory_api = MemoryAPI(self)
         self.memory_api.register(NAME)
+        self.backup_api = BackupAPI(self)
+        self.backup_api.register(NAME)
         routes = [
             ("state", self.api_state, ["GET"]),
             ("history", self.api_history, ["GET"]),
+            ("diagnostics/options", self.api_diagnostics_options, ["GET"]),
+            ("diagnostics/preview", self.api_diagnostics_preview, ["POST"]),
+            ("diagnostics/chat-preview", self.api_diagnostics_chat_preview, ["POST"]),
             ("job/<job_id>", self.api_job, ["GET"]),
             ("assets", self.api_assets, ["GET"]),
             ("asset/<asset_id>", self.api_asset, ["GET"]),
@@ -305,6 +321,7 @@ class CompanionAlbum(Star):
                 )
 
     async def terminate(self):
+        await self.backup_api.service.close()
         await self.proactive.close()
         await self.memory_service.close()
         await self.plans.close()
@@ -347,6 +364,7 @@ class CompanionAlbum(Star):
         out["search_schemes"] = schemes
         return out
 
+    @managed
     async def api_plans(self):
         scope = text_value(request.query.get("scope", ""), 300)
         cal = self._public_calendar(self.plans.get_calendar(scope), scope)
@@ -396,9 +414,11 @@ class CompanionAlbum(Star):
                 result.append({"id": meta.id, "name": meta.id})
         return result
 
+    @managed
     async def api_export_plans(self):
         return json_response(self.plans.export_data())
 
+    @managed
     async def api_state(self):
         assets = self.store.all("asset")
         expired = {a["id"] for a in assets if a.get("expired")}
@@ -426,6 +446,7 @@ class CompanionAlbum(Star):
             }
         )
 
+    @managed
     async def api_assets(self):
         try:
             return json_response(
@@ -441,6 +462,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=400)
 
+    @managed
     async def api_history(self):
         try:
             return json_response(
@@ -456,6 +478,53 @@ class CompanionAlbum(Star):
         except (AlbumError, ValueError) as exc:
             return error_response(str(exc), status_code=400)
 
+    async def api_diagnostics_options(self):
+        return await self._api_diagnostics(operation="options")
+
+    async def api_diagnostics_preview(self):
+        return await self._api_diagnostics(operation="preview")
+
+    async def api_diagnostics_chat_preview(self):
+        return await self._api_diagnostics(operation="chat-preview")
+
+    async def _api_diagnostics(self, *, operation):
+        from .diagnostics import DiagnosticError, Diagnostics
+
+        private = {"Cache-Control": "no-store"}
+        if not request.username:
+            return error_response("请登录后导出诊断包", status_code=401, headers=private)
+        busy_field = {"preview": "_diagnostics_busy", "chat-preview": "_diagnostics_chat_busy"}.get(operation)
+        if busy_field and getattr(self, busy_field, False):
+            return error_response("已有诊断预览正在生成，请稍后重试", status_code=409, headers=private)
+        if busy_field:
+            setattr(self, busy_field, True)
+        try:
+            service = Diagnostics(self.store, self.context)
+            if busy_field:
+                raw = await request.body()
+                if len(raw) > (2048 if operation == "chat-preview" else 65536):
+                    return error_response("诊断选择内容过大", status_code=413, headers=private)
+                if operation == "chat-preview":
+                    result = await service.chat_preview(json.loads(raw))
+                else:
+                    result = await service.preview(json.loads(raw))
+                    # Send one canonical preview instead of a second full copy.
+                    result = {key: value for key, value in result.items() if key != "document"}
+            else:
+                scope, cid = request.query.get("scope", ""), request.query.get("cid", "")
+                result = await service.options(current={"scope": scope, "cid": cid}) if scope or cid else await service.options()
+            return json_response(result, headers=private)
+        except DiagnosticError as exc:
+            return error_response(str(exc), status_code=400, headers=private)
+        except (ValueError, TypeError):
+            return error_response("诊断选择格式不正确", status_code=400, headers=private)
+        except Exception:
+            return error_response("诊断预览未完成，请重试或缩小范围", status_code=500, headers=private)
+        finally:
+            if busy_field:
+                setattr(self, busy_field, False)
+
+    @managed
     async def api_job(self, job_id: str):
         try:
             job = self.store.job(job_id)
@@ -482,6 +551,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=404)
 
+    @managed
     async def api_asset(self, asset_id: str):
         try:
             asset = self.store.get("asset", asset_id)
@@ -547,6 +617,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=404)
 
+    @managed
     async def api_preview(self):
         try:
             asset = self.store.get("asset", request.query.get("id", ""))
@@ -565,6 +636,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=400)
 
+    @managed
     async def api_download(self, asset_id: str):
         try:
             asset = self.store.get("asset", asset_id)
@@ -576,6 +648,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=404)
 
+    @managed
     async def api_upload(self, character_id: str, kind: str):
         try:
             upload = (await request.files()).get("file")
@@ -594,7 +667,9 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=400)
 
+    @managed
     async def api_models(self, draft: dict | None = None):
+        self.store.restore_guard.external_allowed()
         try:
             site_id = text_value(
                 draft.get("id", "")
@@ -653,6 +728,7 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             return error_response(str(exc), status_code=400)
 
+    @managed
     async def api_action(self, action: str):
         """Handle authenticated management writes with validated domain methods.
 
@@ -951,6 +1027,7 @@ class CompanionAlbum(Star):
             )
 
     @filter.on_llm_request(priority=-100000)
+    @managed
     async def memory_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """Back up rounds, trim summarized history and add memory temporarily.
 
@@ -976,6 +1053,7 @@ class CompanionAlbum(Star):
         return run["scope"], run["cid"]
 
     @filter.llm_tool(name="memory_search")
+    @managed
     async def memory_search(self, event: AstrMessageEvent, query: str) -> dict:
         """Search this chat's long-term memory: past events, profiles and open plans.
 
@@ -1010,6 +1088,7 @@ class CompanionAlbum(Star):
             return {"items": [], "message": "暂时没有可用的相关记忆"}
 
     @filter.llm_tool(name="memory_read")
+    @managed
     async def memory_read(self, event: AstrMessageEvent, memory_id: str) -> dict:
         """Read one memory returned by memory_search, with its causes and follow-ups.
 
@@ -1026,6 +1105,7 @@ class CompanionAlbum(Star):
             return {"item": None, "message": "暂时无法读取这条记忆"}
 
     @filter.on_llm_request()
+    @managed
     async def album_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """Expose a small album index without changing existing image history.
 
@@ -1033,6 +1113,13 @@ class CompanionAlbum(Star):
             event: Current message and routing scope.
             req: Provider request to receive a temporary text-only hint.
         """
+        guard = getattr(getattr(self, "store", None), "restore_guard", None)
+        if guard:
+            try:
+                guard.check()
+                guard.check_event(event)
+            except AlbumError:
+                return
         scope = event.unified_msg_origin
         self.seen_sessions[scope] = {
             "id": scope,
@@ -1064,8 +1151,7 @@ class CompanionAlbum(Star):
             except (ValueError, TypeError):
                 logger.warning("Saved daily baseline unavailable")
         if getattr(self, "memory_store", None) and conversation_id:
-            # Kept for album/plan job records; memory no longer changes epochs.
-            event.set_extra(NAME + "_memory_generation", 1)
+            event.set_extra(NAME + "_memory_generation", self.memory_store.state(scope, conversation_id)["generation"])
         self.latest_chat[(scope, conversation_id)] = {
             "text": plain_text(event.message_str),
             "at": now(),
@@ -1287,6 +1373,7 @@ class CompanionAlbum(Star):
         return sources[:3]
 
     @filter.llm_tool(name="album_today")
+    @managed
     async def album_today(self, event: AstrMessageEvent) -> dict:
         """Read today's concrete occurrences in this conversation, without editing defaults."""
         scope = event.unified_msg_origin
@@ -1324,6 +1411,7 @@ class CompanionAlbum(Star):
         }
 
     @filter.llm_tool(name="album_plan_adjust")
+    @managed
     async def album_plan_adjust(
         self,
         event: AstrMessageEvent,
@@ -1408,6 +1496,7 @@ class CompanionAlbum(Star):
             return {"error": str(exc), "retry": False}
 
     @filter.llm_tool(name="album_search")
+    @managed
     async def album_search(
         self,
         event: AstrMessageEvent,
@@ -1473,6 +1562,7 @@ class CompanionAlbum(Star):
             return {"status": "unavailable", "message": str(exc)}
 
     @filter.llm_tool(name="album_favorite")
+    @managed
     async def album_favorite(
         self, event: AstrMessageEvent, asset_ids: str, favorite: bool = True
     ) -> dict:
@@ -1508,6 +1598,7 @@ class CompanionAlbum(Star):
             }
 
     @filter.llm_tool(name="album_save_scene")
+    @managed
     async def album_save_scene(
         self, event: AstrMessageEvent, asset_id: str, description: str
     ) -> dict:
@@ -1535,6 +1626,7 @@ class CompanionAlbum(Star):
             return {"status": "unavailable", "message": str(exc)}
 
     @filter.llm_tool(name="album_generate")
+    @managed
     async def album_generate(
         self,
         event: AstrMessageEvent,
@@ -1620,6 +1712,7 @@ class CompanionAlbum(Star):
             }
 
     @filter.llm_tool(name="album_send")
+    @managed
     async def album_send(self, event: AstrMessageEvent, asset_id: str) -> dict:
         """Send an existing album photo to this conversation without generating again.
 
@@ -1674,6 +1767,7 @@ class CompanionAlbum(Star):
             }
 
     @filter.llm_tool(name="album_publish_qzone")
+    @managed
     async def album_publish_qzone(
         self,
         event: AstrMessageEvent,
@@ -1794,6 +1888,7 @@ class CompanionAlbum(Star):
             return {"status": "failed", "message": str(exc), "retry": False}
 
     @filter.llm_tool(name="album_plan_schedule")
+    @managed
     async def album_plan_schedule(
         self,
         event: AstrMessageEvent,
@@ -1892,6 +1987,7 @@ class CompanionAlbum(Star):
             }
 
     @filter.llm_tool(name="album_plan_cancel")
+    @managed
     async def album_plan_cancel(self, event: AstrMessageEvent, plan_id: str) -> dict:
         """Cancel and remove a pending one-shot life plan (心念约定) in this conversation.
 
@@ -1923,6 +2019,7 @@ class CompanionAlbum(Star):
             return {"status": "failed", "message": str(exc)}
 
     @filter.llm_tool(name="album_schedule_trip")
+    @managed
     async def album_schedule_trip(
         self,
         event: AstrMessageEvent,
@@ -2191,6 +2288,7 @@ class CompanionAlbum(Star):
                 continue
         return "\n".join(snippets[:8])
 
+    @managed
     async def sync_year_calendar(self, data: dict) -> dict:
         """Replace one year's calendar only after a complete official search result.
 
@@ -2354,12 +2452,14 @@ class CompanionAlbum(Star):
         except Exception:
             logger.warning("Memory business fact capture could not complete")
 
+    @managed
     async def complete_job(self, job: dict):
         """Continue a persisted post intent before reporting the photo result.
 
         Args:
             job: Original generation task; current state is read from the store.
         """
+        self.store.restore_guard.check_job(job)
         job = self.store.job(job["id"])
         if job.get("state") == "ready" or job.get("upstream_completed"):
             await self._memory_business(
@@ -2404,6 +2504,7 @@ class CompanionAlbum(Star):
                 )
         await self.notify_job(job)
 
+    @managed
     async def publish_qzone(
         self,
         scope: str,
@@ -2553,6 +2654,7 @@ class CompanionAlbum(Star):
                 else "空间发布准备未完成，照片和意图已保留。",
             }
 
+    @managed
     async def send_chat(self, scope: str, chain: MessageChain, event=None):
         """Send album media and retain OneBot acknowledgements.
 
@@ -2612,6 +2714,7 @@ class CompanionAlbum(Star):
 
         return send_other
 
+    @managed
     async def notify_job(self, job: dict, *, started: bool = False):
         from astrbot.core.utils.session_lock import session_lock_manager
 
@@ -2865,6 +2968,7 @@ class CompanionAlbum(Star):
                 error="图片/状态通知未完成，请核对任务详情",
             )
 
+    @managed
     async def completion_line(
         self, job: dict, char: dict, conversation_id: str, *, started: bool = False
     ) -> str:
@@ -2879,6 +2983,7 @@ class CompanionAlbum(Star):
         Returns:
             A short character line, or an empty string for the neutral fallback.
         """
+        self.store.restore_guard.external_allowed()
         persona_prompt = ""
         conversation = await self._completion_snapshot(job["scope"], conversation_id)
         if job.get("state") != "life_plan":
@@ -2989,10 +3094,21 @@ class CompanionAlbum(Star):
             else:
                 time_note = "内部时间感知：本次联系在日常时段附近，自然展开即可。"
             photo_mode = life_plan.get("photo_mode") or "auto"
+            photo_guidance = (
+                "从本次生活主题、人设、当前心情、最近聊天和行程中，选择一个愿意分享的自然瞬间。"
+                "计划中的示例只是灵感，不是可选画面的菜单；动作、表情、穿着、环境和视角按画面需要发挥。"
+                "保留明确偏好和约定，承接已发生事实；已吃完饭不重新开饭，已经起床不重演刚醒来，"
+                "不为套示例强行转场或增加同行人物。最终选定一个具体可画且与本轮正文一致的画面，不给多个备选。"
+                "决定拍照时，必须在最终输出的正文之后提供完整 `<photo_scene>具体画面</photo_scene>`；"
+                "不能只在正文口头说要拍照或把画面留在思考区。后台先发正文，再生成并补发照片。"
+            )
             if photo_mode == "always":
-                photo_note = "本次计划开启了拍照分享：请先写出自然的主动聊天正文（正文中可以自然提起刚拍了张照片或正准备拍给对方看），并在正文最后单独附上一行 `<photo_scene>单个具体拍照画面描述（动作、穿着、环境、表情、镜头视角）</photo_scene>`，后台会先发出你的文字，再去生成并补发照片。"
+                photo_note = "本次要求拍照分享，随自然的公开正文附上画面。" + photo_guidance
             elif photo_mode == "auto":
-                photo_note = "若生活安排或你选定的分支情境中适合顺便拍一张照片分享给对方，可在聊天正文最后单独附上一行 `<photo_scene>单个具体拍照画面描述（动作、穿着、环境、表情、镜头视角）</photo_scene>`（后台会先发送正文，再异步生成照片发过去；若生成失败也能趁机撒娇）；若本次情境不需要拍照，则不要输出 `<photo_scene>` 标签。"
+                photo_note = (
+                    "日常小事也可以主动拍照分享，无需等待用户要求或特别事件；也可以只聊天不拍。"
+                    "本次不拍时不输出 `<photo_scene>` 标签。" + photo_guidance
+                )
             else:
                 photo_note = "本次仅发送文字消息，不输出 `<photo_scene>` 标签。"
             chain_depth = int(life_plan.get("chain_depth") or 0)
@@ -3013,7 +3129,7 @@ class CompanionAlbum(Star):
                     f"\n【当前特殊行程：{trip['title']}（第 {trip['day_index']}/{trip['total_days']} 天，"
                     f"{trip['start_date']} ~ {trip['end_date']}）】"
                     + (f"行程说明：{trip['note']}。" if trip.get("note") else "")
-                    + "请将今天的聊天话题与可选 <photo_scene> 拍照画面自然融入这段旅途或特殊行程中！"
+                    + "行程是当前生活背景，话题与可选拍照画面按实际进展自然选择，不为表现行程强行转场。"
                 )
             if day_prof.get("label"):
                 extra_context += f"\n【今日时令与作息状态：{day_prof['label']}】{day_prof.get('mood_note', '')}"
@@ -3037,7 +3153,8 @@ class CompanionAlbum(Star):
                 extra_context += f"\n聊天衔接提示：{life_plan['chat_gap_note']}"
             fact = (
                 "这是你的「朝夕拾记」生活日程到了可以考虑联系的时间，写自然的主动聊天。"
-                "篇幅、语气和表达习惯遵循当前人设，结合最近聊天自然接话。"
+                "公开聊天正文的篇幅、语气和表达习惯遵循当前人设，结合最近聊天自然接话。"
+                "内部控制标签不计入该篇幅目标，仍须完整输出。只输出最终结果，不输出思考内容。"
                 "结合最近聊天，不要把安排照念成工作提醒；不要每次都重复相同台词。"
                 "把早晚感知作为生活反应的线索，结合任务主题、人设、当前时段、最近聊天和近期用过的场景，"
                 "自然选择状态、情绪或生活小理由；允许与上下文相容的发挥，不固定早晚与某种反应的对应，也不必每次解释原因。"
@@ -3057,7 +3174,8 @@ class CompanionAlbum(Star):
                     "\n先核对今日来源，再生成台词。区分用户/角色/其他人、今天/昨天、准备/完成/否定，"
                     "只把最终已保存陈述作为剧情依据，不当作现实行为证明。已聊过同一生活动作时，可承接感受或不打扰，不能再演一遍或编造别人代发。"
                     "缺乏可靠来源就用unknown，不猜完成；默认计划不是已发生事实。"
-                    '\n必须单独输出一次 <schedule_decision>{"contact":"keep","progress":"unknown","source_ids":[],"reason":""}</schedule_decision>。'
+                    '\n最终输出顺序：先单独输出一次决策标签 <schedule_decision>{"contact":"keep","progress":"unknown","source_ids":[],"reason":""}</schedule_decision>，'
+                    "再写公开聊天正文，最后放本次需要的photo_scene与follow_up完整标签，各最多一次；所有标签都在最终输出中，不放在思考区。"
                     "contact只能keep/continue/skip/delay/replace，progress只能unknown/planned/ongoing/completed/cancelled；"
                     "引用只能使用下列日内来源id。delay还需effective_ts（Unix秒，至少3分钟后，本日内），同一次最多自主延后一次。"
                     "skip/delay不输出台词、photo_scene或follow_up。若为按约提醒，不得自主skip/delay/replace；只能按约提醒，调整语气。"
@@ -3187,6 +3305,7 @@ class CompanionAlbum(Star):
             return ""
         return job.get("origin_reply", "")
 
+    @managed
     async def _send_recorded(
         self,
         key,
@@ -3329,9 +3448,12 @@ class CompanionAlbum(Star):
         _, body, scene, follow = parse_plan_controls(raw)
         return body, scene, follow
 
+    @managed
     async def execute_plan(
         self, plan: dict, run_id: str, instruction: str, local_time: str
     ):
+        self.store.restore_guard.check_object("life_plan", plan["id"])
+        self.store.restore_guard.external_allowed()
         runtime = getattr(self, "memory_runtime", None)
         cid = (
             plan["_conversation_id"]
@@ -3670,12 +3792,18 @@ class CompanionAlbum(Star):
                     )
                     extra["job_id"] = job["id"]
                     extra["photo_scene"] = photo_scene[:240]
-                    stages.append(safe_stage("photo", "ok"))
-                except Exception as exc:
+                    stages.append(safe_stage("photo", "ok", code="PHOTO_TASK_CREATED"))
+                except Exception:
                     extra["photo_error"] = "照片任务未建立"
-                    stages.append(safe_stage("photo", "failed", exc))
+                    stages.append(safe_stage("photo", "failed", code="PHOTO_SUBMIT_FAILED"))
             else:
-                stages.append(safe_stage("photo", "skipped"))
+                reason = (
+                    "TIMER_ONLY" if any(s.get("code") == "TIMER_ONLY" for s in stages)
+                    else "PHOTO_DISABLED" if photo_mode == "never"
+                    else "PHOTO_NO_SCENE" if not photo_scene
+                    else "PHOTO_ENGINE_UNAVAILABLE"
+                )
+                stages.append(safe_stage("photo", "skipped", code=reason))
             if (
                 follow_up
                 and int(latest.get("chain_depth") or 0) < 1

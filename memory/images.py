@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..restore_guard import managed
+
 import asyncio
 import hashlib
 import json
@@ -468,7 +470,10 @@ class ImageIndex:
         self._current[(scope, cid)].update(batch_count=len(batches), blocked_images=len(blocked))
         return self.status(scope, cid)
 
+    @managed
     def start(self, scope, cid, refs, model_provider, *, manual=False, window=32000):
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         key = (scope, cid)
         refs = tuple(dict.fromkeys(r for r in refs if isinstance(r, str) and re.fullmatch(r"[a-f0-9]{32}", r)))[:MAX_BATCH]
         if self._closed or key in self.tasks or len(self.tasks) >= MAX_TASKS or not refs:
@@ -484,6 +489,7 @@ class ImageIndex:
         task.add_done_callback(done)
         return True
 
+    @managed
     async def _run(self, scope, cid, refs, model_provider, manual, window):
         completed, failed, skipped, requests = 0, 0, 0, 0
         cancelled = False

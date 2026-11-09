@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import managed
+
 import asyncio
 import functools
 import hashlib
@@ -941,9 +943,9 @@ def day_profile(d: date, calendar: dict | None = None, scope: str = "") -> dict:
             label = f"法定长假连休周末（{fest}）"
             tomorrow_free = next_d["is_rest_day"] and next_d["brother_rest"]
             mood_note = (
-                f"今天是「{fest}」长假连休期间的{cur['weekday_cn']}，充满浓厚的过节与长假狂欢感，适合聊出游、聚餐、追番或节日活动。"
+                f"今天是「{fest}」长假连休期间的{cur['weekday_cn']}，节日与休息状态可作为生活背景，心情和活动按人设、聊天及已知安排自然选择。"
                 + (
-                    "明天依然是假期不用早起上班/上课，完全没有普通周日晚上的收心焦虑！"
+                    "明天依然是假期，没有普通周日晚上的收心焦虑也很自然，仍以当前心情和实际安排为准。"
                     if d.weekday() == 6 and tomorrow_free
                     else ""
                 )
@@ -954,7 +956,7 @@ def day_profile(d: date, calendar: dict | None = None, scope: str = "") -> dict:
             label = "调休单休周末"
             mood_note = (
                 f"因为这个周末另一天要调休补班（{other_weekend['workday_name']}），今天（{cur['weekday_cn']}）是仅剩的一天宝贵单休日！"
-                "语气里会格外心疼对方只休一天太辛苦，主张宅家躺平补觉、点好吃的或黏在一起温柔充电。"
+                "可以关心对方的休息状态，具体活动和心情按当天安排自然展开，不预设宅家或双方同处。"
             )
         elif cur["vacation"]:
             weekend_kind = "vacation_weekend"
@@ -962,7 +964,7 @@ def day_profile(d: date, calendar: dict | None = None, scope: str = "") -> dict:
             label = f"{cur['vacation']}周末"
             mood_note = (
                 f"今天处于学校{cur['vacation']}期间的{cur['weekday_cn']}。"
-                f"平时周一到周五只有你自己放{cur['vacation']}、对方还要上班；今天终于盼到周末对方也放假休息，可以全天黏在一起啦！"
+                f"平时周一到周五只有你自己放{cur['vacation']}、对方还要上班；今天双方可休息，按各自已知安排选择交流与分享，同休不代表同处。"
             )
         else:
             weekend_kind = "normal_weekend"
@@ -1393,6 +1395,7 @@ class LifePlans:
         cal["revision"] = int(row["revision"]) if row else 0
         return cal
 
+    @managed
     def save_calendar(
         self, data: dict, *, expected_revision: int | None = None, scope: str = ""
     ) -> dict:
@@ -1440,6 +1443,7 @@ class LifePlans:
             self.store.save("calendar", "default", normalized, rev if rev > 0 else None)
             return self.get_calendar(scope)
 
+    @managed
     def save_trip(
         self,
         title: str,
@@ -1508,6 +1512,7 @@ class LifePlans:
             self.save_calendar({**cal, "trips": trips})
             return entry
 
+    @managed
     def delete_trip(self, trip_id: str, scope: str = "") -> dict:
         """Remove a multi-day trip override by ID, title, or latest active trip in scope if ID is empty."""
         with self.store.lock:
@@ -1541,6 +1546,7 @@ class LifePlans:
             self.save_calendar({**cal, "trips": trips})
             return target
 
+    @managed
     def update_calendar_from_chat(
         self,
         *,
@@ -1609,8 +1615,11 @@ class LifePlans:
             )
             return {"changed": changed, "calendar": saved}
 
+    @managed
     def prune_expired_calendar(self, today: date) -> dict:
         """Auto-remove past-year holidays/workdays and trips that ended more than 3 days ago."""
+        if self.store.restore_guard.pending("calendar", "default"):
+            return self.get_calendar()
         with self.store.lock:
             row = self.store.db.execute(
                 "SELECT data, revision FROM records WHERE kind='calendar' AND id='default'"
@@ -1664,6 +1673,7 @@ class LifePlans:
                     dates.add(r["override_date"])
         return dates
 
+    @managed
     def save(self, data: dict, *, validate_only: bool = False, character=None) -> dict:
         old = self.store.get("life_plan", data["id"]) if data.get("id") else {}
         if old.get("deleted"):
@@ -1756,6 +1766,8 @@ class LifePlans:
             if enabled and not old.get("enabled")
             else old.get("activated_at", 0),
         }
+        if type(old.get("restore_cutoff")) is int:
+            payload["restore_cutoff"] = old["restore_cutoff"]
         if validate_only:
             return payload
         for other in self.store.all("life_plan"):
@@ -1773,6 +1785,7 @@ class LifePlans:
             "life_plan", old.get("id") or uid("plan_"), payload, data.get("revision")
         )
 
+    @managed
     def schedule_once(
         self,
         scope: str,
@@ -1873,6 +1886,7 @@ class LifePlans:
                 character=char,
             )
 
+    @managed
     def cancel_once(self, scope: str, plan_id: str, origin_cid: str = "") -> dict:
         """Cancel and remove a pending one-shot plan in the given scope."""
         key = text_value(plan_id, 100)
@@ -1887,6 +1901,7 @@ class LifePlans:
             self.destroy_plan(key, waiting_state="skipped", reason="用户已取消，未送达")
             return plan
 
+    @managed
     def destroy_plan(self, key: str, *, waiting_state=None, reason="", at=None):
         """End unsent durable waits and remove their source in one transaction."""
         with self.store.lock, self.store.db:
@@ -1912,6 +1927,7 @@ class LifePlans:
                 "DELETE FROM records WHERE kind='life_plan' AND id=?", (key,)
             )
 
+    @managed
     def save_recipient(self, data: dict, bots: list[dict]) -> dict:
         """Commit a visual QQ recipient binding and its plan in one transaction."""
         target = data.get("recipient")
@@ -1977,6 +1993,7 @@ class LifePlans:
                 )
             return self.store.get("life_plan", key)
 
+    @managed
     def import_data(self, payload: dict, scope: str = "") -> dict:
         if not isinstance(payload, dict) or payload.get("format") not in (
             FORMAT,
@@ -2028,6 +2045,7 @@ class LifePlans:
             )
         return {"created": len(created), "skipped": skipped, "enabled": False}
 
+    @managed
     def manage(self, patches: list[dict], action: str) -> dict:
         """Atomically enable, disable, trash or restore selected plans.
 
@@ -2316,6 +2334,7 @@ class LifePlans:
         )
         return detail["anchor_ts"] if detail else None
 
+    @managed
     async def tick(self, timestamp: int):
         self.daily.prune(timestamp)
         point = datetime.fromtimestamp(timestamp, ZoneInfo("UTC"))
@@ -2330,7 +2349,8 @@ class LifePlans:
         current_cids = await self.current_conversations()
         for plan in self.store.all("life_plan"):
             if (
-                plan.get("deleted")
+                self.store.restore_guard.pending("life_plan", plan["id"])
+                or plan.get("deleted")
                 or not plan["enabled"]
                 or plan.get("activated_at", 0) > timestamp
             ):
@@ -2367,6 +2387,25 @@ class LifePlans:
             if detail is None:
                 continue
             anchor_ts = detail["anchor_ts"]
+            cutoff = plan.get("restore_cutoff")
+            if type(cutoff) is int and not plan.get("run_once"):
+                # Imported v1 packages intentionally carry no execution queue.
+                # A new plan ID can pick a later jitter for a period the source
+                # already used. Suppress periods whose possible window began
+                # before activation; future periods retain normal scheduling.
+                before = int(detail.get("before", plan.get("window_before", 0)) or 0)
+                adjustment = detail.get("adjustment") or {}
+                confirmed = (adjustment.get("restore_confirmed_at") == cutoff
+                    or adjustment.get("actor") == "user" and adjustment.get("explicit") is True
+                    and type(adjustment.get("at")) is int and adjustment["at"] > cutoff)
+                confirmed_future = (confirmed
+                    and adjustment.get("plan_revision") == plan["revision"]
+                    and adjustment.get("scope") == plan["scope"] and adjustment.get("cid") == cid
+                    and adjustment.get("character_id") == plan["character_id"]
+                    and adjustment.get("decision") in ("delay", "skip")
+                    and adjustment.get("effective_ts", 0) > cutoff)
+                if anchor_ts - before * 60 <= cutoff and not confirmed_future:
+                    continue
             key = f"{plan['id']}:{anchor_ts}"
             try:
                 previous_run = self.store.get("life_run", key)
@@ -2435,6 +2474,7 @@ class LifePlans:
                     "override_day_wake": bool(plan.get("override_day_wake")),
                     "override_date": plan.get("override_date", ""),
                     "trip_wake": bool(detail.get("trip_wake")),
+                    "photo_mode": plan.get("photo_mode") if plan.get("photo_mode") in PHOTO_MODES else "auto",
                     "day_label": detail["profile"]["label"],
                     "timezone": plan["timezone"],
                     "state": "held"
@@ -2473,7 +2513,7 @@ class LifePlans:
                     f"【特殊行程早起覆写】当前处于特殊行程「{trip['title']}」（第 {trip['day_index']}/{trip['total_days']} 天，"
                     f"{trip['start_date']} ~ {trip['end_date']}），今天不再睡到中午懒觉，而是按行程约定在 {trip['wake_time']} 左右早起。"
                     + (f"行程备注：{trip['note']}。" if trip.get("note") else "")
-                    + "请自然向对方打招呼，分享早起准备出发/洗漱/期待今天行程的心情（或带一点刚睡醒的小迷糊），可顺便拍一张清晨准备出发的照片。\n\n原常驻作息参考："
+                    + "请承接当前聊天和行程进展自然打招呼；若想拍照，可分享与当前时刻相容的一个生活瞬间，具体画面自行选择，不因起床覆写就重演刚醒来或提前出发。\n\n原常驻作息参考："
                     + plan["instruction"]
                 )
             plan_with_meta = {
@@ -2499,7 +2539,10 @@ class LifePlans:
             self.workers.add(task)
             task.add_done_callback(self.workers.discard)
 
+    @managed
     async def run(self, plan: dict, run: dict, instruction: str, local_time: str):
+        self.store.restore_guard.check_object("life_plan", plan["id"])
+        self.store.restore_guard.external_allowed()
         destroy = False
         status, receipt = None, {}
         try:

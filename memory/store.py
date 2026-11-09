@@ -13,6 +13,8 @@ Old memory tables from earlier versions are left untouched.
 
 from __future__ import annotations
 
+from ..restore_guard import managed
+
 import json
 import hashlib
 import re
@@ -99,6 +101,7 @@ class MemoryStore:
     def __init__(self, album_store):
         self.db = album_store.db
         self.lock = album_store.lock
+        self.restore_guard = album_store.restore_guard
         # Operational logs follow the plugin's 任务记录 retention settings.
         self.log_policy = lambda: (
             int(album_store.settings.get("records_retention_days", 90)),
@@ -158,6 +161,7 @@ class MemoryStore:
     def transaction(self):
         """Savepoint on the shared connection; never held across an await."""
         with self.lock:
+            self.restore_guard.check()
             depth = getattr(self._depth, "value", 0)
             name = "mem_" + uuid.uuid4().hex
             self.db.execute(f"SAVEPOINT {name}")
@@ -221,6 +225,17 @@ class MemoryStore:
                     low, high = LIMITS[target]
                     if type(value) is int and low <= value <= high:
                         settings[target] = value
+            ledger_id = hashlib.sha256(_json([scope, cid]).encode()).hexdigest()
+            ledger = self.db.execute(
+                "SELECT data FROM records WHERE kind='restore_epoch' AND id=?", (ledger_id,)
+            ).fetchone()
+            if ledger:
+                recorded = json.loads(ledger[0])
+                if (not isinstance(recorded, dict) or recorded.get("scope") != scope
+                        or recorded.get("cid") != cid or type(recorded.get("generation")) is not int
+                        or not 1 <= recorded["generation"] <= 9223372036854775807):
+                    raise AlbumError("RESTORE_EPOCH_INVALID")
+                generation = max(1, generation, recorded["generation"])
             stamp = _now()
             self.db.execute(
                 "INSERT INTO mem_chats(scope,cid,enabled,generation,settings,memory,created,updated) VALUES(?,?,?,?,?,?,?,?)",
@@ -315,9 +330,7 @@ class MemoryStore:
                 "enabled": bool(row["enabled"]),
                 "deleted_at": 0,
                 "revision": row["revision"],
-                # Album and plan jobs compare this epoch; memory edits no longer
-                # replace whole generations, so it is constant.
-                "generation": 1,
+                "generation": row["generation"],
                 "settings": _settings(row["settings"]),
                 "counts": counts,
                 "images": images,
@@ -327,7 +340,9 @@ class MemoryStore:
         with self.lock:
             return core.normalized(json.loads(self._ensure(scope, cid)["memory"]))
 
+    @managed
     def configure(self, scope, cid, patch, revision):
+        self.restore_guard.check_chat(scope, cid)
         if not isinstance(patch, dict) or set(patch) - {*DEFAULTS, "enabled"}:
             raise AlbumError("记忆设置字段不正确")
         with self.transaction():
@@ -377,8 +392,10 @@ class MemoryStore:
             )
         return self.state(scope, cid)
 
+    @managed
     def save_memory(self, scope, cid, memory, revision):
         """Replace memory content after a user edit, with a revision check."""
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision != row["revision"]:
@@ -562,7 +579,9 @@ class MemoryStore:
     def resolve_turns(self, scope, cid, turns):
         return self.resolve_capture(scope, cid, turns)["resolved"]
 
+    @managed
     def capture_turns(self, scope, cid, turns):
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             self._ensure(scope, cid)
             return self._capture_turns(scope, cid, turns)
@@ -650,8 +669,10 @@ class MemoryStore:
     def _insert_turns(self, scope, cid, turns):
         return self._capture_turns(scope, cid, turns)["added"]
 
+    @managed
     def archive(self, scope, cid, turns):
         """Back up complete rounds once, in order. Returns the number added."""
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             self._ensure(scope, cid)
             return self._insert_turns(scope, cid, turns)
@@ -689,7 +710,9 @@ class MemoryStore:
 
     # ------------------------------------------------------------ batches --
 
+    @managed
     def save_result(self, scope, cid, fingerprint, raw, model):
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             self.db.execute(
                 "INSERT OR REPLACE INTO mem_results VALUES(?,?,?,?,?,?)",
@@ -704,8 +727,10 @@ class MemoryStore:
             ).fetchone()
         return row["raw"] if row else None
 
+    @managed
     def apply_batch(self, scope, cid, turns, parsed, model):
         """Merge one parsed result onto the latest memory and mark its turns done."""
+        self.restore_guard.check_chat(scope, cid)
         ids = [t["id"] for t in turns]
         with self.transaction():
             row = self._ensure(scope, cid)
@@ -759,8 +784,10 @@ class MemoryStore:
             ).fetchall()
         return [{**dict(r), "stats": json.loads(r["stats"])} for r in rows]
 
+    @managed
     def undo_last(self, scope, cid, revision, *, force=False):
         """Revert the latest applied batch; its rounds become pending again."""
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision != row["revision"]:
@@ -797,8 +824,10 @@ class MemoryStore:
             self._log(scope, cid, "undone", f"已撤销第{batch['first']}—{batch['last']}轮的整理")
         return self.state(scope, cid)
 
+    @managed
     def reset_for_resummary(self, scope, cid, revision):
         """Snapshot, clear memory, and mark every kept original round pending."""
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision != row["revision"]:
@@ -878,7 +907,9 @@ class MemoryStore:
             )
         return result
 
+    @managed
     def restore_snapshot(self, scope, cid, snapshot_id, revision):
+        self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision != row["revision"]:
@@ -923,8 +954,11 @@ class MemoryStore:
             self._log(scope, cid, "restored", "已恢复到“" + snap["reason"] + "”的记忆")
         return self.state(scope, cid)
 
+    @managed
     def copy_to(self, scope, cid, target_scope, target_cid, target_revision):
         """Overwrite another chat's memory with this chat's memory (snapshot first)."""
+        self.restore_guard.check_chat(scope, cid)
+        self.restore_guard.check_chat(target_scope, target_cid)
         if (scope, cid) == (target_scope, target_cid):
             raise AlbumError("请选择另一份聊天")
         with self.transaction():
@@ -942,12 +976,15 @@ class MemoryStore:
 
     # ------------------------------------------------------------- cleanup --
 
+    @managed
     def cleanup(self):
         """Prune old summarized originals and expired snapshots/results."""
         stamp = _now()
         pruned = 0
         with self.transaction():
             for row in self.db.execute("SELECT scope,cid,settings FROM mem_chats").fetchall():
+                if self.restore_guard.pending("memory", scope=row["scope"], cid=row["cid"]):
+                    continue
                 settings = _settings(row["settings"])
                 days = settings["retention_days"]
                 if not days:
@@ -965,12 +1002,18 @@ class MemoryStore:
                 )
                 pruned += cursor.rowcount
             self.db.execute(
-                "DELETE FROM mem_snapshots WHERE created<?", (stamp - SNAPSHOT_DAYS * 86400,)
+                "DELETE FROM mem_snapshots WHERE created<? AND NOT EXISTS (SELECT 1 FROM records r "
+                "WHERE r.kind='restore_pending' AND json_extract(r.data,'$.kind')='memory' "
+                "AND json_extract(r.data,'$.scope')=mem_snapshots.scope AND json_extract(r.data,'$.cid')=mem_snapshots.cid)",
+                (stamp - SNAPSHOT_DAYS * 86400,)
             )
             self.db.execute("DELETE FROM mem_results WHERE created<?", (stamp - 7 * 86400,))
             self.db.execute("DELETE FROM mem_turn_aliases WHERE turn_id NOT IN (SELECT id FROM mem_turns)")
             if self._table("mem_turn_images"):
-                self.db.execute("DELETE FROM mem_turn_images WHERE turn_id NOT IN (SELECT id FROM mem_turns WHERE pruned=0)")
+                self.db.execute("DELETE FROM mem_turn_images WHERE turn_id NOT IN (SELECT id FROM mem_turns WHERE pruned=0) "
+                                "AND NOT EXISTS (SELECT 1 FROM mem_turns t JOIN records r ON r.kind='restore_pending' "
+                                "AND json_extract(r.data,'$.kind')='memory' AND json_extract(r.data,'$.scope')=t.scope "
+                                "AND json_extract(r.data,'$.cid')=t.cid WHERE t.id=mem_turn_images.turn_id)")
             if self._table("mem_images"):
                 self.db.execute(
                     "DELETE FROM mem_images WHERE NOT EXISTS "

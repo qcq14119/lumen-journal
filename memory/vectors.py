@@ -13,6 +13,8 @@ process memory between requests, so a small server only pays while searching.
 
 from __future__ import annotations
 
+from ..restore_guard import managed
+
 import array
 import asyncio
 import hashlib
@@ -119,6 +121,7 @@ class VectorIndex:
 
     # -------------------------------------------------------------- sync --
 
+    @managed
     async def sync(self, scope, cid, model, *, rebuild=False):
         """Embed missing or changed items and drop removed ones. Returns counts.
 
@@ -164,7 +167,10 @@ class VectorIndex:
         with self.store.transaction():
             self.store.db.execute("DELETE FROM mem_vectors WHERE scope=? AND cid=?", (scope, cid))
 
+    @managed
     def start(self, scope, cid, model, *, rebuild=False, on_done=None):
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         """Run sync in the background once per chat. Returns False if one is running."""
         key = (scope, cid)
         if key in self.running:

@@ -76,7 +76,8 @@ class MemoryAPI:
                 if not request.username:
                     return error_response("请登录后管理记忆", status_code=401, headers=PRIVATE)
                 try:
-                    return await handler()
+                    with self.store.restore_guard.operation():
+                        return await handler()
                 except (AlbumError, ValueError, TypeError, KeyError) as exc:
                     message = str(exc) if isinstance(exc, AlbumError) else "记忆请求格式不正确"
                     conflict = any(w in message for w in ("处理中", "版本", "已变化", "修改过"))

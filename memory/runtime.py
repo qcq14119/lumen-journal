@@ -8,6 +8,8 @@ the only history change; the memory block is a temporary part and is never saved
 
 from __future__ import annotations
 
+from ..restore_guard import managed
+
 import json
 import time
 import uuid
@@ -78,6 +80,7 @@ class MemoryRuntime:
         """Register history without starting model work (including imported history)."""
         return self.capture_snapshot(scope, cid, history)["added"]
 
+    @managed
     def capture_snapshot(self, scope, cid, history):
         start = legacy_block(history)
         turns = history_turns(history[start:])
@@ -96,8 +99,11 @@ class MemoryRuntime:
         scope = event.unified_msg_origin
         if not cid or event.get_extra(RUN_KEY):
             return
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.check_event(event)
+        generation = self.store.state(scope, cid)["generation"]
         key = "run:" + uuid.uuid4().hex
-        event.set_extra(RUN_KEY, {"scope": scope, "cid": cid, "key": key, "generation": 1})
+        event.set_extra(RUN_KEY, {"scope": scope, "cid": cid, "key": key, "generation": generation})
         self.enter(scope, cid, key)
         try:
             state = self.store.state(scope, cid)
@@ -139,14 +145,21 @@ class MemoryRuntime:
             return
         scope, cid = run["scope"], run["cid"]
         self.leave(scope, cid, run["key"])
+        self.store.restore_guard.check_event(event)
+        if run["generation"] != self.store.state(scope, cid)["generation"]:
+            return
         # The host saves history after this hook; back up the finished round then.
-        self.service.defer_backup(lambda: self.after_save(scope, cid))
+        self.service.defer_backup(lambda: self.after_save(scope, cid, generation=run["generation"]))
 
-    async def after_save(self, scope, cid):
+    @managed
+    async def after_save(self, scope, cid, *, generation=None):
         try:
             if self.service._closed:
                 return
             state = self.store.state(scope, cid)
+            self.store.restore_guard.check_chat(scope, cid)
+            if generation is not None and generation != state["generation"]:
+                return
             if not state["enabled"] or self.busy(scope, cid):
                 return
             conv = await self.conversation(scope, cid)
@@ -279,7 +292,10 @@ class MemoryRuntime:
 
     # ----------------------------------------------------------- injection --
 
+    @managed
     async def injection(self, scope, cid, state, event, req):
+        self.store.restore_guard.check_chat(scope, cid)
+        self.store.restore_guard.external_allowed()
         memory = self.store.memory(scope, cid)
         if not any(memory.get(k) for k in ("overview", "events", "people", "profiles", "plans")):
             return ""
@@ -320,11 +336,15 @@ class MemoryRuntime:
 
     # ------------------------------------------------------- plugin speech --
 
+    @managed
     async def business(self, scope, cid, key, text, *, kind="business", status="sent", generation=None):
         """Record confirmed plugin actions (photo sent, Qzone post) as a backup round."""
         if not cid:
             return
         state = self.store.state(scope, cid)
+        self.store.restore_guard.check_chat(scope, cid)
+        if generation is not None and generation != state["generation"]:
+            return
         if not state["enabled"]:
             return
         self.store.archive(

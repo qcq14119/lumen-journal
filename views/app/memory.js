@@ -179,7 +179,7 @@ export async function mountMemory(env) {
     }
     const m = data.memory, enabled = data.state.enabled;
     const tabs = [["story", "剧情", m.events.length], ["people", "人物", m.people.length], ["profiles", "生活小档案", profiles().length], ["plans", "约定", openPlans().length], ["records", "整理记录", ""]];
-    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button><button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
+    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-logs">拾忆日志</button><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button><button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
     if (!enabled) {
       main.innerHTML = `<div class="lj">${topbar}<div class="lj-empty"><h2>此聊天未启用记忆</h2><p>启用后从下一条消息开始备份对话，满设定轮数自动整理。</p><button class="lj-btn lj-btn-primary" id="lj-enable">启用记忆</button></div></div>`;
       bind();
@@ -205,6 +205,7 @@ export async function mountMemory(env) {
     const more = $("details.lj-more");
     more?.querySelectorAll("div button").forEach(b => b.addEventListener("click", () => { more.open = false; }));
     $("#lj-settings")?.addEventListener("click", settingsPage);
+    $("#lj-logs")?.addEventListener("click", () => env.openDiagnostics({...params()}));
     $("#lj-bind")?.addEventListener("click", bindingDialog);
     $("#lj-enable")?.addEventListener("click", e => busy(e.target, async () => { data = await act("enable", {enabled: true}); await render(); }));
     bindHero();

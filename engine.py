@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import PENDING_JOB_SQL, managed
+
 import asyncio
 import hashlib
 import json
@@ -31,6 +33,7 @@ class Engine:
         self.store.job(key)
         return self.results / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
+    @managed
     async def start(self):
         self._closed = False
         self.store.recover()
@@ -81,6 +84,7 @@ class Engine:
                 self.launch(job["id"])
         self._pump()
 
+    @managed
     def launch(self, key: str):
         job = self.store.job(key)
         if job["state"] == "ready" and job.get("notification_state") not in ("complete", "failed"):
@@ -89,14 +93,18 @@ class Engine:
 
     def _pump(self):
         """Select IDs from the durable queue; keep at most 3 generation + 4 notices."""
-        if self._closed:
+        if self._closed or self.store.restore_guard.frozen:
+            return
+        try:
+            self.store.restore_guard.external_allowed()
+        except AlbumError:
             return
         active = tuple(self.tasks)
         excluded = " AND id NOT IN (" + ",".join("?" for _ in active) + ")" if active else ""
         with self.store.lock:
             pending = self.store.db.execute(
                 "SELECT id FROM jobs WHERE state IN ('queued','running','downloading') "
-                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + excluded + " ORDER BY rowid LIMIT ?",
+                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + PENDING_JOB_SQL + excluded + " ORDER BY rowid LIMIT ?",
                 (*active, max(0, 3 - len(self._generating))),
             ).fetchall()
         for row in pending:
@@ -114,7 +122,7 @@ class Engine:
                 "SELECT id,scope FROM jobs WHERE rowid IN ("
                 "SELECT min(rowid) FROM jobs WHERE json_extract(data,'$.notification_state')='pending' "
                 "AND state NOT IN ('queued','submitting','running','downloading') "
-                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + scope_filter +
+                "AND json_extract(data,'$.archived') IS NOT 1 AND json_extract(data,'$.worker_error') IS NULL" + PENDING_JOB_SQL + scope_filter +
                 " GROUP BY scope ORDER BY min(rowid) LIMIT ?)",
                 (*scopes, max(0, 4 - len(self._notifying))),
             ).fetchall()
@@ -142,13 +150,16 @@ class Engine:
                 return
         self._pump()
 
+    @managed
     async def _generation_worker(self, key):
         await self.run(key)
         job = self.store.job(key)
         if job.get("deliver") and self.notify:
             self.store.update_job(key, job["state"], notification_state="pending")
 
+    @managed
     async def _notification_worker(self, key):
+        self.store.restore_guard.check_job(self.store.job(key))
         try:
             await self.notify(self.store.job(key))
         except asyncio.CancelledError:
@@ -180,6 +191,7 @@ class Engine:
             await asyncio.wait(tuple(self.tasks.values()), return_when=asyncio.FIRST_COMPLETED)
             await asyncio.sleep(0)
 
+    @managed
     def submit(
         self,
         character_id: str,
@@ -192,6 +204,10 @@ class Engine:
         memory_generation: int | None = None,
         origin_proactive_id: str = "",
     ) -> dict:
+        self.store.restore_guard.external_allowed()
+        self.store.restore_guard.check_object("character", character_id)
+        if conversation_id:
+            self.store.restore_guard.check_chat(scope, conversation_id)
         sites = self.store.provider_configs()
         if not sites:
             raise AlbumError("请先配置图片服务地址、API Key 和模型")
@@ -276,8 +292,10 @@ class Engine:
             self.launch(job["id"])
         return job
 
+    @managed
     async def resume(self, key: str):
         job = self.store.job(key)
+        self.store.restore_guard.check_job(job)
         if key in self.tasks and not self.tasks[key].done():
             return
         if (
@@ -306,6 +324,7 @@ class Engine:
         self.store.update_job(key, "running", error="", polling_started=now())
         self.launch(key)
 
+    @managed
     async def cancel(self, key: str):
         job = self.store.job(key)
         if job["state"] not in (
@@ -336,9 +355,11 @@ class Engine:
             for attempt in self.store.job(key).get("attempts", []):
                 runner.cache_path(attempt).unlink(missing_ok=True)
 
+    @managed
     async def run(self, key: str):
         async with self.semaphore:
             job = self.store.job(key)
+            self.store.restore_guard.check_job(job)
             if job["state"] in ("cancelled", "failed", "unknown", "download_failed"):
                 return
             stage = "provider"

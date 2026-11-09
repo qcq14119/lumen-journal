@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import RestoreGuard, managed
+
 import hashlib
 import io
 import json
@@ -173,9 +175,14 @@ class Store:
     def __init__(self, root: Path):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        # A partial cross-file restore is repaired before settings or any live
+        # connection can observe half of the new state.
+        from .restore_journal import recover
+        recover(self.root)
         for name in ("originals", "delivery", "thumbnails", "tmp"):
             (self.root / name).mkdir(exist_ok=True)
         self.lock = threading.RLock()
+        self.restore_guard = RestoreGuard(self)
         self.db = sqlite3.connect(self.root / "album.sqlite3", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -240,6 +247,7 @@ class Store:
                 ) and not value.get("expired")
         return values
 
+    @managed
     def save(
         self, kind: str, key: str, data: dict, revision: int | None = None
     ) -> dict:
@@ -257,6 +265,7 @@ class Store:
             )
         return self.get(kind, key)
 
+    @managed
     def save_character(self, data: dict) -> dict:
         key = data.get("id") or uid("char_")
         old = (
@@ -289,8 +298,10 @@ class Store:
         ]
         if len(matches) != 1:
             raise AlbumError("请在相册管理页为当前会话绑定角色")
+        self.restore_guard.check_object("character", matches[0]["id"])
         return matches[0]
 
+    @managed
     def activate(
         self,
         character_id: str,
@@ -327,6 +338,7 @@ class Store:
             char["active_version"] = version_id
             return self.save("character", character_id, char, revision)
 
+    @managed
     def import_image(
         self,
         raw: bytes,
@@ -453,6 +465,7 @@ class Store:
     def edit_asset(self, key: str, patch: dict) -> dict:
         return self.edit_assets([{**patch, "id": key}])[0]
 
+    @managed
     def edit_assets(self, patches: list[dict]) -> list[dict]:
         """Validate every edit before committing the batch atomically.
 
@@ -558,6 +571,7 @@ class Store:
             raise AlbumError("此图片未允许用于该发送方式")
         return asset
 
+    @managed
     def cleanup_media(self) -> dict:
         """Enforce reference TTL and generated-photo retention without losing active media.
 
@@ -767,6 +781,7 @@ class Store:
             "total": len(rows),
         }
 
+    @managed
     def save_provider(self, data: dict) -> dict:
         """Save only one image site, merging against the current locked settings."""
         from .provider import validate_url
@@ -821,6 +836,7 @@ class Store:
                 patch["provider_order"] = list(dict.fromkeys([*order, *(p for p in known if p != key), key]))
             return self.save_settings(patch)
 
+    @managed
     def save_settings(self, patch: dict) -> dict:
         with self.lock:
             settings = dict(self.settings)
@@ -1037,6 +1053,7 @@ class Store:
             ),
         )
 
+    @managed
     def reserve_job(
         self, scope: str, fingerprint: str, payload: dict
     ) -> tuple[dict, bool]:
@@ -1107,6 +1124,7 @@ class Store:
             ]
         return [self.job(k) for k in keys]
 
+    @managed
     def update_job(self, key: str, state: str, **patch) -> dict:
         with self.lock, self.db:
             job = self.job(key)
@@ -1139,6 +1157,7 @@ class Store:
             )
         return self.job(key)
 
+    @managed
     def reserve_delivery(self, key: str, payload: dict) -> bool:
         with self.lock, self.db:
             cursor = self.db.execute(
@@ -1151,6 +1170,7 @@ class Store:
             )
         return cursor.rowcount == 1
 
+    @managed
     def prepare_delivery(self, key: str, payload: dict) -> bool:
         """Persist a resumable preparation; this is not a platform send claim."""
         with self.lock, self.db:
@@ -1169,6 +1189,7 @@ class Store:
             ))
             return True
 
+    @managed
     def start_delivery(self, key: str) -> bool:
         """Claim the actual transport boundary once, immediately before calling it."""
         with self.lock, self.db:
@@ -1178,6 +1199,7 @@ class Store:
             )
             return cursor.rowcount == 1
 
+    @managed
     def mark_worker_error(self, key: str):
         """Isolate one interrupted worker without stopping unrelated jobs."""
         with self.lock, self.db:
@@ -1185,6 +1207,7 @@ class Store:
                 "UPDATE jobs SET data=json_set(data,'$.worker_error','LOCAL_SAVE_FAILED') WHERE id=?", (key,)
             )
 
+    @managed
     def finish_delivery(self, key: str, state: str, **patch):
         with self.lock, self.db:
             old = self.db.execute(
@@ -1218,6 +1241,7 @@ class Store:
             raise AlbumError("发送记录不存在")
         return {**json.loads(row["data"]), "id": key, "state": row["state"]}
 
+    @managed
     def recover(self):
         """Mark interrupted writes unknown; never replay a POST on restart."""
         with self.lock, self.db:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import managed
+
 import asyncio
 import hashlib
 import json
@@ -194,6 +196,7 @@ class ProactiveHistory:
             for r in rows
         ]
 
+    @managed
     def prepare(
         self,
         key,
@@ -275,6 +278,7 @@ class ProactiveHistory:
         except Exception:
             return ""
 
+    @managed
     def observe_saved(self, scope, cid, history):
         """A caller holding the host lock supplies freshly read persisted history.
 
@@ -324,6 +328,7 @@ class ProactiveHistory:
             raise AlbumError("原聊天已删除或归属不符")
         return conv
 
+    @managed
     def finish(self, key, state, receipt=None, *, confirmed_not_sent=False):
         """Persist only a transport result; this method never acquires host locks."""
         if state not in ("sent", "failed", "unknown", "held", "skipped"):
@@ -351,7 +356,10 @@ class ProactiveHistory:
             old["revision"],
         )
 
+    @managed
     async def deliver(self, key, sender, *, preflight=None):
+        record = self.get(key)
+        self.store.restore_guard.check_chat(record["scope"], record["cid"])
         # Maintenance must never classify an in-process send as a crashed send.
         async with session_lock_manager.acquire_lock("proactive-delivery:" + key):
             self.inflight.add(key)
@@ -418,9 +426,22 @@ class ProactiveHistory:
                 await self._sync_locked(record)
             return state, record["receipt"]
 
+    @managed
     async def _sync_locked(self, record):
+        self.store.restore_guard.check_chat(record["scope"], record["cid"])
         if record["state"] != "sent" or record["history_state"] == "saved" or record.get("chat_deleted_at"):
             return record
+        with self.store.lock:
+            generation = None
+            if self.store.db.execute("SELECT 1 FROM sqlite_master WHERE name='mem_chats'").fetchone():
+                row = self.store.db.execute("SELECT generation FROM mem_chats WHERE scope=? AND cid=?", (record["scope"], record["cid"])).fetchone()
+                generation = row[0] if row else None
+            mismatch = generation is not None and record.get("generation", -1) >= 1 and record["generation"] != generation
+            if record.get("restore_obsolete") or mismatch:
+                reason = "聊天已恢复，原投递历史待人工核对"
+                if record.get("history_error") == reason:
+                    return record
+                return self.store.save(KIND, record["id"], {**record, "history_error": reason}, record["revision"])
         try:
             conv = await self.context.conversation_manager.get_conversation(record["scope"], record["cid"])
             if conv is None:
@@ -521,6 +542,7 @@ class ProactiveHistory:
                 pass
         return record
 
+    @managed
     async def retry(self, key):
         record = self.get(key)
         async with session_lock_manager.acquire_lock(record["scope"]):
@@ -540,6 +562,7 @@ class ProactiveHistory:
             task.add_done_callback(completed)
         return self.tasks[key]
 
+    @managed
     async def recover(self, limit=100):
         results = []
         for key in self._page("recover", limit):
@@ -547,6 +570,8 @@ class ProactiveHistory:
                 continue
             try:
                 record = self.get(key)
+                if self.store.restore_guard.pending("memory", scope=record["scope"], cid=record["cid"]):
+                    continue
                 if record["state"] == "sending":
                     results.append(self.finish(record["id"], "unknown"))
                 elif record["state"] == "sent" and record.get("history_state") in ("pending", "orphaned") and not record.get("chat_deleted_at"):
@@ -603,6 +628,7 @@ class ProactiveHistory:
                 return True
         return False
 
+    @managed
     def compact(self, limit=20, *, at=None):
         """Compact only duplicate bodies after a durable, continuously valid grace period."""
         at = now() if at is None else int(at)
@@ -635,6 +661,7 @@ class ProactiveHistory:
                     compacted.append(key)
         return compacted
 
+    @managed
     async def maintain(self, limit=20):
         recovered = await self.recover(limit)
         return {"recovered": len(recovered), "compacted": len(self.compact(limit))}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .restore_guard import managed
+
 import hashlib
 import json
 import re
@@ -108,6 +110,7 @@ class DailyEvidence:
                 source_at, time_kind = int(sent["sent_at"]), "sent"
         return role, text, source_at, time_kind
 
+    @managed
     def observe(
         self,
         scope: str,
@@ -279,6 +282,7 @@ class DailyEvidence:
                 break
         return result
 
+    @managed
     def capture_final(
         self,
         scope: str,
@@ -466,6 +470,7 @@ class DailyEvidence:
                 break
         return result
 
+    @managed
     def invalidate(self, scope: str, cid: str):
         """Drop rebuildable evidence only; explicit occurrence agreements survive."""
         with self.store.lock, self.store.db:
@@ -490,12 +495,15 @@ class DailySchedule:
         self.plans, self.store = plans, plans.store
         self._pruned_day = None
 
+    @managed
     def prune(self, at: int):
         if self._pruned_day == at // 86400:
             return
         with self.store.lock, self.store.db:
             self.store.db.execute(
-                "DELETE FROM records WHERE kind='life_adjustment' AND json_extract(data,'$.anchor_ts')<? AND json_extract(data,'$.effective_ts')<?",
+                "DELETE FROM records AS old WHERE kind='life_adjustment' AND json_extract(data,'$.anchor_ts')<? AND json_extract(data,'$.effective_ts')<? "
+                "AND NOT EXISTS (SELECT 1 FROM records p WHERE p.kind='restore_pending' "
+                "AND json_extract(p.data,'$.kind')='life_plan' AND json_extract(p.data,'$.target_id')=json_extract(old.data,'$.plan_id'))",
                 (at - 4 * 86400, at - 3 * 86400),
             )
         self._pruned_day = at // 86400
@@ -766,6 +774,7 @@ class DailySchedule:
                     return plan["name"], actual
         return None
 
+    @managed
     def adjust(
         self,
         scope: str,
