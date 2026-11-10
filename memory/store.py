@@ -57,6 +57,7 @@ DEFAULTS = {
     "recall_vector_min": 0.80,
     "image_describe": True,
     "image_keep_turns": 5,
+    "maintenance_paused": False,
 }
 LIMITS = {
     "summary_trigger_turns": (5, 300),
@@ -154,6 +155,8 @@ class MemoryStore:
                     username TEXT PRIMARY KEY, scope TEXT NOT NULL);
             """)
             self.db.commit()
+        from .maintenance_store import MaintenanceStore
+        self.maintenance = MaintenanceStore(self)
 
     # ------------------------------------------------------------ basics --
 
@@ -238,8 +241,8 @@ class MemoryStore:
                 generation = max(1, generation, recorded["generation"])
             stamp = _now()
             self.db.execute(
-                "INSERT INTO mem_chats(scope,cid,enabled,generation,settings,memory,created,updated) VALUES(?,?,?,?,?,?,?,?)",
-                (scope, cid, enabled, generation, _json(settings), _json(core.empty()), stamp, stamp),
+                "INSERT INTO mem_chats(scope,cid,enabled,generation,settings,memory,created,updated,maintenance_epoch) VALUES(?,?,?,?,?,?,?,?,?)",
+                (scope, cid, enabled, generation, _json(settings), _json(core.empty()), stamp, stamp, uuid.uuid4().hex),
             )
             if legacy and not legacy["deleted_at"]:
                 self._import_legacy(scope, cid, legacy["generation"])
@@ -331,6 +334,7 @@ class MemoryStore:
                 "deleted_at": 0,
                 "revision": row["revision"],
                 "generation": row["generation"],
+                "maintenance_epoch": row["maintenance_epoch"],
                 "settings": _settings(row["settings"]),
                 "counts": counts,
                 "images": images,
@@ -353,7 +357,7 @@ class MemoryStore:
             enabled = row["enabled"]
             for key, value in patch.items():
                 if key == "enabled" or key in (
-                    "auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe"
+                    "auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "maintenance_paused"
                 ):
                     if type(value) is not bool:
                         raise AlbumError("开关格式不正确")
@@ -393,16 +397,20 @@ class MemoryStore:
         return self.state(scope, cid)
 
     @managed
-    def save_memory(self, scope, cid, memory, revision):
+    def save_memory(self, scope, cid, memory, revision, *, replace=False):
         """Replace memory content after a user edit, with a revision check."""
         self.restore_guard.check_chat(scope, cid)
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision != row["revision"]:
                 raise AlbumError("记忆版本已变化，请刷新后重试")
+            memory = core.normalized(memory)
+            if replace:
+                self.maintenance.replace_epoch(scope, cid)
+            self.maintenance.record_write(scope, cid, core.empty() if replace else core.normalized(json.loads(row["memory"])), memory, kind="manual")
             self.db.execute(
                 "UPDATE mem_chats SET memory=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
-                (_json(core.normalized(memory)), _now(), scope, cid),
+                (_json(memory), _now(), scope, cid),
             )
         return self.state(scope, cid)
 
@@ -757,6 +765,8 @@ class MemoryStore:
                 times={t["ordinal"]: t["at"] for t in turns},
                 batch=batch,
             )
+            self.maintenance.record_write(scope, cid, core.normalized(json.loads(row["memory"])), memory,
+                kind="summary", writer=batch, sources=ids)
             self.db.execute(
                 "UPDATE mem_batches SET state='applied',diff=?,stats=? WHERE id=?",
                 (_json(change), _json(stats), batch),
@@ -803,12 +813,16 @@ class MemoryStore:
             ).fetchone():
                 raise AlbumError("这批原文备份已超过保留期被清理，不能撤销")
             memory, conflicts = core.undo(json.loads(row["memory"]), json.loads(batch["diff"]), force=force)
+            # Even force cannot bypass an active maintenance dependency.
+            prospective, _ = core.undo(json.loads(row["memory"]), json.loads(batch["diff"]), force=True)
+            self.maintenance.check_summary_undo(scope, cid, batch["id"], core.normalized(json.loads(row["memory"])), prospective)
             if memory is None:
                 raise AlbumError(
                     "这次整理的内容之后被修改过："
                     + "、".join(conflicts[:5])
                     + "。确认仍要撤销请选择“仍然撤销”"
                 )
+            self.maintenance.record_write(scope, cid, core.normalized(json.loads(row["memory"])), memory, kind="manual")
             self.db.execute(
                 "UPDATE mem_turns SET status=?,batch=NULL,summarized_at=0 WHERE batch=?",
                 (PENDING, batch["id"]),
@@ -845,6 +859,7 @@ class MemoryStore:
                 (scope, cid),
             )
             memory = core.empty()
+            self.maintenance.replace_epoch(scope, cid)
             self.db.execute(
                 "UPDATE mem_chats SET memory=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
                 (_json(memory), _now(), scope, cid),
@@ -951,6 +966,9 @@ class MemoryStore:
                 "UPDATE mem_chats SET memory=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
                 (snap["memory"], _now(), scope, cid),
             )
+            self.maintenance.replace_epoch(scope, cid)
+            restored = core.normalized(json.loads(snap["memory"]))
+            self.maintenance.record_write(scope, cid, core.empty(), restored, kind="manual")
             self._log(scope, cid, "restored", "已恢复到“" + snap["reason"] + "”的记忆")
         return self.state(scope, cid)
 
@@ -967,6 +985,8 @@ class MemoryStore:
             if target_revision != target["revision"]:
                 raise AlbumError("目标聊天的记忆已变化，请刷新后重试")
             self._snapshot(target_scope, target_cid, "被覆盖前", target)
+            self.maintenance.replace_epoch(target_scope, target_cid)
+            self.maintenance.record_write(target_scope, target_cid, core.empty(), core.normalized(json.loads(source["memory"])), kind="manual")
             self.db.execute(
                 "UPDATE mem_chats SET memory=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
                 (source["memory"], _now(), target_scope, target_cid),
@@ -1020,6 +1040,7 @@ class MemoryStore:
                     "(SELECT 1 FROM mem_chats c WHERE c.scope=mem_images.scope AND c.cid=mem_images.cid)"
                 )
             self.prune_logs(stamp)
+            self.maintenance.cleanup(stamp)
         return pruned
 
     def prune_logs(self, stamp=None):

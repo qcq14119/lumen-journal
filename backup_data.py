@@ -24,10 +24,11 @@ from .backup_format import (
 )
 
 MODULES = ("reference", "life", "memory", "settings")
-MEMORY_TABLES = (
+MEMORY_TABLES_V1 = (
     "mem_chats", "mem_turns", "mem_turn_aliases", "mem_images",
     "mem_turn_images", "mem_batches", "mem_snapshots",
 )
+MEMORY_TABLES = (*MEMORY_TABLES_V1, "mem_item_guards", "mem_maintenance_runs")
 MAPPING_CONTRACT = {
     "version": 1,
     "identity": ["records.(kind,id)", "mem_chats.(scope,cid)",
@@ -45,9 +46,23 @@ MAPPING_CONTRACT = {
                    "life_adjustment.plan_id/plan_revision/character_id/scope/cid/anchor_ts/source_ids/evidence_revision",
                    "life_evidence_metadata.(id,revision,data.scope/cid/epoch/at/generation) (source evidence only;never resume scanner)",
                    "settings.providers[].id/api_keys[].id/active_key_id/provider_order/preferred_provider",
-                   "mem_chats.settings.model_bindings.*.preset_id"],
+                   "mem_chats.settings.model_bindings.*.preset_id",
+                   "settings.plan_recovery.assistant_binding.preset_id"],
     "policy": "preserve_source_values;stage_C_maps_only_known_fields;never_recursive_name_replacement",
 }
+MAPPING_CONTRACT_V1 = copy.deepcopy(MAPPING_CONTRACT)
+MAPPING_CONTRACT["version"] = 2
+MAPPING_CONTRACT["identity"] += ["mem_chats.maintenance_epoch", "mem_item_guards.(scope,cid,epoch,collection,item_id)",
+    "mem_maintenance_runs.(id,task_id,scope,cid,epoch)"]
+MAPPING_CONTRACT["references"] += [
+    "settings.memory_maintenance.binding.preset_id", "mem_batches.maintenance_claim",
+    "mem_item_guards.data.sources/dependencies/last_writer", "mem_item_guards.content_hash (verified structural item hash)",
+    "mem_maintenance_runs.task_id", "mem_maintenance_runs.payload.batches/dependencies",
+    "mem_maintenance_runs.payload.expected.epoch/source_upper/items[].sources/dependencies/last_writer/hash/value",
+    "mem_maintenance_runs.payload.changes[].before/after (same item schema)/hash/previous_writer/sources",
+    "mem_maintenance_runs.payload.evidence[].turn_id/batch (content hashes preserved)",
+    "mem_maintenance_runs.payload.undo_expected[].hash (versions preserved; verified structural item hash)",
+]
 SECRET_NAMES = frozenset({
     "api_key", "apikey", "api-key", "key", "token", "access_token", "refresh_token",
     "password", "passwd", "secret", "client_secret", "authorization", "proxy_authorization",
@@ -377,6 +392,10 @@ def capture(store, directory: Path, modules, include_keys, include_future, cance
                     metadata["omissions"].append("SOURCE_TABLE_ABSENT:" + table)
                     continue
                 rows = _bounded_rows(db, table)
+                if table == "mem_chats":
+                    rows = _MappedRows(rows, lambda row: {"maintenance_epoch": "", **dict(row)})
+                elif table == "mem_batches":
+                    rows = _MappedRows(rows, lambda row: {"maintenance_claim": "", **dict(row)})
                 writer.rows(table, config_rows(rows, "settings") if table == "mem_chats" else rows)
         if "memory" in modules or "settings" in modules:
             rows = _bounded_rows(db, "memory_model_settings") if _table(db, "memory_model_settings") else ()
@@ -459,6 +478,8 @@ _MEMORY_COLUMNS = {
     "mem_batches": ("scope cid state diff stats model", "created undone_at", "id first last", ""),
     "mem_snapshots": ("id scope cid reason memory turns", "created", "", ""),
     "memory_model_settings": ("data", "revision", "id", ""),
+    "mem_item_guards": ("scope cid epoch collection item_id content_hash data", "", "version", ""),
+    "mem_maintenance_runs": ("id task_id scope cid epoch trigger state payload", "created updated committed_at undone_at", "", ""),
 }
 
 
@@ -506,7 +527,7 @@ _CHAT_BOUNDS = {
 }
 _CONFIG_SWITCHES = {
     "settings": ("qzone_enabled", "generated_qzone_allowed", "parallel_backup", "retry_unknown", "primary_enabled"),
-    "chat": ("auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "enabled"),
+    "chat": ("auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "enabled", "maintenance_paused"),
     "provider": ("enabled",), "model": ("custom", "clear_key"), "search": ("is_builtin",),
 }
 
@@ -525,6 +546,20 @@ def _config_schema(value, *, context="settings"):
                      objects=("shared", "model_bindings"), boolean=_CONFIG_SWITCHES.get(context, ()))
     if context == "settings":
         _bounded_fields(value, _SETTING_BOUNDS)
+        if "plan_recovery" in value:
+            from .store import AlbumError, plan_recovery_settings
+            _object(value["plan_recovery"])
+            try:
+                plan_recovery_settings(value["plan_recovery"])
+            except AlbumError:
+                raise BackupError("DATA_SCHEMA_INVALID") from None
+        if "memory_maintenance" in value:
+            from .store import AlbumError, memory_maintenance_settings
+            _object(value["memory_maintenance"])
+            try:
+                memory_maintenance_settings(value["memory_maintenance"])
+            except AlbumError:
+                raise BackupError("DATA_SCHEMA_INVALID") from None
         _optional_fields(value, text=("primary_name",))
         if "qzone_visibility" in value:
             # The existing writer accepts numerically equal enum values (also
@@ -737,7 +772,72 @@ def _record_data_schema(name, value):
         _require(value.get("generation") is None or _integer(value["generation"]))
 
 
-def _validate_row(name, row):
+def _maintenance_identity(value):
+    _object(value)
+    _require(value.get("collection") in ("events", "people", "profiles", "plans", "overview", "keywords"))
+    _require(isinstance(value.get("id"), str) and bool(value["id"]))
+
+
+def _maintenance_writer(value):
+    _require(isinstance(value, dict) and set(value) == {"kind", "id"})
+    _require(value["kind"] in ("summary", "manual", "maintenance", "undo", "protect", "legacy"))
+    _require(_integer(value["id"], 1) if value["kind"] == "summary" else isinstance(value["id"], str))
+
+
+def _maintenance_schema(name, row):
+    columns = set(" ".join(_MEMORY_COLUMNS[name]).split())
+    _require(set(row) == columns and bool(row["epoch"]))
+    payload = _json_object(row["data" if name == "mem_item_guards" else "payload"])
+    if name == "mem_item_guards":
+        _maintenance_identity({"collection": row["collection"], "id": row["item_id"]})
+        _require(bool(re.fullmatch(r"[a-f0-9]{64}", row["content_hash"])))
+        _require(set(payload) == {"sources", "source_complete", "legacy_unverified", "protected", "last_writer", "dependencies"})
+        for key in ("source_complete", "legacy_unverified", "protected"):
+            _require(type(payload[key]) is bool)
+        _maintenance_writer(payload["last_writer"])
+    else:
+        _require(bool(row["id"]) and bool(row["task_id"]) and row["trigger"] in ("auto", "manual", "cleanup"))
+        _require(row["state"] in ("queued", "reading", "requesting", "validating", "committing", "completed", "findings_only",
+            "failed", "cancelled", "interrupted", "stale", "undone", "skipped", "expired", "partial", "unknown"))
+        _require(not set(payload) - {"keys", "batches", "apply", "allow_protected", "counts", "findings", "changes",
+            "dependencies", "expired", "resolved", "code", "parameters", "elapsed_ms", "expected", "evidence", "undo_expected", "affected"})
+        _optional_fields(payload, boolean=("apply", "allow_protected", "expired", "resolved"), integer=("elapsed_ms",),
+            text=("code",), objects=("counts", "parameters", "expected"), lists=("keys", "batches", "findings", "changes", "dependencies", "evidence", "undo_expected", "affected"))
+        for key in ("keys", "affected", "undo_expected"):
+            for item in payload.get(key, []):
+                _maintenance_identity(item)
+                if key == "undo_expected":
+                    _require(_integer(item.get("version"), 1) and isinstance(item.get("hash"), str))
+        expected = payload.get("expected", {})
+        _require(not set(expected) - {"epoch", "revision", "items", "source_upper"})
+        _optional_fields(expected, text=("epoch",), integer=("revision", "source_upper"), lists=("items",))
+        for item in expected.get("items", []):
+            _maintenance_identity(item)
+        for change in payload.get("changes", []):
+            _maintenance_identity(change)
+            _require(change["collection"] in ("events", "people", "profiles", "plans"))
+            _require(not set(change) - {"collection", "id", "version", "hash", "before", "after", "reason", "sources", "previous_writer", "after_version"})
+            _require(_integer(change.get("version"), 1) and _integer(change.get("after_version"), 1))
+            _require(isinstance(change.get("hash"), str) and isinstance(change.get("sources"), list))
+            for part in ("before", "after"):
+                _memory_item_schema(change.get(part), change["collection"])
+                _require(change[part].get("id") == change["id"])
+            _require(change["hash"] == hashlib.sha256(_json(change["before"]).encode()).hexdigest()
+                     and change["after_version"] == change["version"] + 1)
+            _maintenance_writer(change.get("previous_writer"))
+        for evidence in payload.get("evidence", []):
+            _object(evidence)
+            _require(not set(evidence) - {"turn_id", "key", "kind", "digest", "ordinal", "batch", "pruned", "status", "batch_state", "raw_hash", "projection_hash", "image_signature", "complete"})
+            _require(_integer(evidence.get("turn_id"), 1))
+            _require(evidence.get("batch") is None or _integer(evidence["batch"], 1))
+            _optional_fields(evidence, text=("key", "kind", "digest", "status", "batch_state", "raw_hash", "projection_hash", "image_signature"),
+                integer=("ordinal",), boolean=("complete",))
+    for field in ("sources", "dependencies", "batches"):
+        if field in payload:
+            _require(isinstance(payload[field], list) and all(_integer(v, 1) for v in payload[field]))
+
+
+def _validate_row(name, row, schema_version=2):
     """Portable v1 SQL columns; do not normalize JSON or construct business stores."""
     if name in _MEMORY_COLUMNS:
         text, nonnegative, positive, bit = _MEMORY_COLUMNS[name]
@@ -748,7 +848,12 @@ def _validate_row(name, row):
         for field in ("scope", "cid", "key", "ref"):
             if field in row and not (name == "mem_turn_images" and field == "ref"):
                 _require(bool(row[field]))
-        if name == "mem_chats":
+        if name in ("mem_item_guards", "mem_maintenance_runs"):
+            _require(schema_version >= 2)
+            _maintenance_schema(name, row)
+        elif name == "mem_chats":
+            if schema_version >= 2:
+                _require(isinstance(row.get("maintenance_epoch"), str))
             _config_schema(_json_object(row["settings"]), context="chat")
             _memory_schema(_json_object(row["memory"]))
         elif name == "mem_turns":
@@ -763,6 +868,8 @@ def _validate_row(name, row):
             # unknown. No new provenance is inferred from offsets or strings.
             _optional_fields(row, text=("source", "body_hash"))
         elif name == "mem_batches":
+            if schema_version >= 2:
+                _require(isinstance(row.get("maintenance_claim"), str))
             _require(row["state"] in ("applying", "applied", "undone", "superseded") and row["first"] <= row["last"])
             _json_object(row["stats"])
             _diff_schema(_json_object(row["diff"]), row["state"])
@@ -790,6 +897,8 @@ def _validate_row(name, row):
 
 
 def _record_key(name, row):
+    if name == "mem_item_guards":
+        return _json([row[key] for key in ("scope", "cid", "epoch", "collection", "item_id")])
     if name in ("mem_chats",):
         return _json([row["scope"], row["cid"]])
     if name == "mem_turn_aliases":
@@ -830,7 +939,7 @@ def validate_data(directory: Path, manifest, cancel, *, source=None):
                     if size > MAX_FILE_BYTES:
                         raise BackupError("DATA_SIZE_LIMIT")
                     try:
-                        _validate_row(name, row)
+                        _validate_row(name, row, manifest.get("schema_version", 2))
                         identity = row["data"] if name == "life_evidence_metadata" else row
                         db.execute("INSERT INTO rows VALUES(?,?,?,?,?,?)", (name, _record_key(name, row), identity.get("scope", ""), identity.get("cid", ""), row.get("ordinal"), _json(row)))
                     except (KeyError, TypeError, sqlite3.IntegrityError) as exc:
@@ -856,10 +965,13 @@ def _validate_metadata(manifest, inventory):
         if "reference" not in modules:
             required.add("life_characters")
     if "memory" in modules:
-        required.update((*MEMORY_TABLES, "memory_model_settings"))
+        required.update((*(MEMORY_TABLES_V1 if manifest.get("schema_version", 2) == 1 else MEMORY_TABLES), "memory_model_settings"))
     if "settings" in modules:
         required.update(("settings", "calendar" if "life" in modules else "calendar_connections", "memory_model_settings"))
-    if set(inventory) != required or manifest.get("mapping_contract") != MAPPING_CONTRACT:
+    prior_mapping = copy.deepcopy(MAPPING_CONTRACT_V1)
+    prior_mapping["references"].remove("settings.plan_recovery.assistant_binding.preset_id")
+    mappings = (MAPPING_CONTRACT_V1, prior_mapping) if manifest.get("schema_version", 2) == 1 else (MAPPING_CONTRACT,)
+    if set(inventory) != required or manifest.get("mapping_contract") not in mappings:
         raise BackupError("DATA_SCHEMA_INVALID")
     if manifest.get("counts") != {k: v.get("rows") for k, v in inventory.items()} or any(type(v.get("rows")) is not int or v["rows"] < 0 for v in inventory.values()):
         raise BackupError("DATA_SCHEMA_INVALID")
@@ -918,7 +1030,7 @@ def _validate_relations(db, directory, manifest, cancel, source=None):
             return found
         if source is not None:
             original = None
-            if target in ("mem_turns", "mem_batches") and _table(source, target):
+            if target in ("mem_turns", "mem_batches", "mem_maintenance_runs") and _table(source, target):
                 if isinstance(key, str) and key.startswith("ordinal:"):
                     original = source.execute("SELECT scope,cid FROM mem_turns WHERE scope=? AND cid=? AND ordinal=?", (scope, cid, key.split(":", 1)[1])).fetchone()
                 else:
@@ -984,6 +1096,14 @@ def _validate_relations(db, directory, manifest, cancel, source=None):
 
     config = get("memory_model_settings", "1")
     presets = {p.get("id") for p in _load(config["data"]).get("presets", [])} if config else set()
+    for key, row in items("settings"):
+        settings_value = _load(row["data"]) if isinstance(row["data"], str) else row["data"]
+        binding = settings_value.get("plan_recovery", {}).get("assistant_binding", {})
+        if binding.get("mode") == "preset" and binding.get("preset_id") not in presets:
+            unresolved(["settings", key], "plan_recovery.assistant_binding.preset_id", binding["preset_id"])
+        binding = settings_value.get("memory_maintenance", {}).get("binding", {})
+        if binding.get("mode") == "preset" and binding.get("preset_id") not in presets:
+            unresolved(["settings", key], "memory_maintenance.binding.preset_id", binding["preset_id"])
     for key, row in items("mem_chats"):
         memory(_load(row["memory"]), ["mem_chats", key], row["scope"], row["cid"])
         for role, binding in _load(row["settings"]).get("model_bindings", {}).items():
@@ -998,6 +1118,8 @@ def _validate_relations(db, directory, manifest, cancel, source=None):
                 if row.get("batch") is not None:
                     need("mem_batches", row["batch"], owner, "batch", scope, cid)
             elif table == "mem_batches":
+                if row.get("maintenance_claim"):
+                    need("mem_maintenance_runs", row["maintenance_claim"], owner, "maintenance_claim", scope, cid)
                 diff = _load(row["diff"])
                 for collection, changes in diff.get("items", {}).items():
                     if collection not in ("events", "people", "profiles", "plans"):
@@ -1025,6 +1147,48 @@ def _validate_relations(db, directory, manifest, cancel, source=None):
         turn = need("mem_turns", row["turn_id"], ["link", key], "turn_id")
         if turn:
             need("mem_images", _json([turn["scope"], turn["cid"], row["ref"]]), ["link", key], "ref")
+
+    def maintenance_refs(payload, owner, scope, cid):
+        for field, table in (("sources", "mem_turns"), ("dependencies", "mem_batches"), ("batches", "mem_batches")):
+            for identifier in payload.get(field, []):
+                if isinstance(identifier, int):
+                    need(table, identifier, owner, field, scope, cid)
+        writer = payload.get("last_writer", payload.get("previous_writer", {}))
+        if writer.get("kind") == "summary":
+            need("mem_batches", writer["id"], owner, "writer", scope, cid)
+        elif writer.get("kind") in ("maintenance", "undo") and writer.get("id"):
+            need("mem_maintenance_runs", writer["id"], owner, "writer", scope, cid)
+
+    for table in ("mem_item_guards", "mem_maintenance_runs"):
+        for key, row in items(table):
+            owner, scope, cid = [table, key], row["scope"], row["cid"]
+            need("mem_chats", _json([scope, cid]), owner, "chat")
+            payload = _load(row["data" if table == "mem_item_guards" else "payload"])
+            maintenance_refs(payload, owner, scope, cid)
+            if table == "mem_maintenance_runs" and row["task_id"] != row["id"]:
+                need("mem_maintenance_runs", row["task_id"], owner, "task_id", scope, cid)
+            expected = payload.get("expected", {})
+            if expected.get("source_upper"):
+                need("mem_turns", expected["source_upper"], owner, "expected.source_upper", scope, cid)
+            for item in expected.get("items", []):
+                maintenance_refs(item, owner, scope, cid)
+                if item["collection"] in ("events", "people", "profiles", "plans") and isinstance(item.get("value"), dict):
+                    memory_item(item["value"], item["collection"], owner, scope, cid)
+            evidence = list(payload.get("evidence", []))
+            for change in payload.get("changes", []):
+                maintenance_refs(change, owner, scope, cid)
+                for part in ("before", "after"):
+                    memory_item(change[part], change["collection"], owner, scope, cid)
+                evidence.extend(v for v in change.get("sources", []) if isinstance(v, dict))
+            for proof in evidence:
+                original = need("mem_turns", proof["turn_id"], owner, "evidence.turn_id", scope, cid)
+                if proof.get("batch") is not None:
+                    need("mem_batches", proof["batch"], owner, "evidence.batch", scope, cid)
+                if original and proof.get("complete"):
+                    content_hash = hashlib.sha256(_json([original["user"], original["assistant"]]).encode()).hexdigest()
+                    if proof.get("raw_hash") != content_hash or original["pruned"] or any(
+                        proof.get(field) != original.get(field) for field in ("key", "kind", "digest", "ordinal", "batch", "status")):
+                        unresolved(owner, "evidence.identity", proof["turn_id"])
     used_media = set()
     for key, row in items("reference_assets"):
         asset = _load(row["data"])

@@ -526,6 +526,24 @@ class DailySchedule:
             for r in rows
         ]
 
+    def once_expired(self, plan, timestamp):
+        """One expiry rule for scheduling, generation and final send checks."""
+        if not plan.get("run_once"):
+            return False
+        max_fire = int(plan.get("trigger_at") or 0) + int(plan.get("window_after") or 0) * 60
+        # Lifespan follows the plan's owner, not whichever chat is now open.
+        # UI plans without an origin belong to the scope; delivery separately
+        # checks the chat reserved by their adjustment.
+        origin_cid = plan.get("origin_cid", "")
+        adjusted_times = [a["effective_ts"] for a in self._adjustments(plan["id"], plan["scope"], origin_cid)
+            if a.get("plan_revision") == plan["revision"]
+            and a.get("character_id") == plan["character_id"]
+            and (not origin_cid or a.get("cid") == origin_cid)
+            and a.get("anchor_ts") == plan["trigger_at"]
+            and type(a.get("effective_ts")) is int]
+        max_fire = max(adjusted_times) if adjusted_times else max_fire
+        return max_fire > 0 and timestamp > max_fire + 3600
+
     def _base(self, plan, anchor, cid, calendar=None):
         from .plans import _daily_anchors_for_plan, day_profile, jitter_offset
 

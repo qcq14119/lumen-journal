@@ -189,6 +189,8 @@ class RestoreGuard:
             ("engine", "tasks"), ("plans", "workers"), ("notice_tasks",),
             ("memory_runtime", "active"), ("memory_service", "tasks"),
             ("memory_service", "busy"), ("memory_service", "_backup_tasks"),
+            ("memory_service", "maintenance", "tasks"), ("memory_service", "summary_intents"),
+            ("memory_service", "_summary_handoffs"), ("memory_service", "vectors", "pending"),
             ("memory_service", "_backup_handles"),
             ("memory_service", "images", "tasks"), ("memory_service", "vectors", "running"),
             ("proactive", "tasks"), ("proactive", "inflight"),

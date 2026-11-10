@@ -1,7 +1,7 @@
 // Backup credentials live only in this dialog. The host bridge owns downloads.
 let currentBackup = null;
 const moduleNames = {reference: "参考", life: "朝夕拾记", memory: "拾忆回响", settings: "设置"};
-const countNames = {characters: "角色", reference_assets: "参考图片", life_plans: "计划", life_adjustments: "临时调整", life_sources: "约定来源", life_evidence_metadata: "调整证据版本", life_characters: "角色与会话依赖", calendar: "日历", calendar_connections: "日历连接", mem_chats: "聊天", mem_turns: "轮次", mem_turn_aliases: "旧身份关联", mem_images: "图片说明", mem_turn_images: "轮次图片关联", mem_batches: "批次", mem_snapshots: "恢复点", memory_model_settings: "拾忆模型连接", files: "文件", settings: "设置"};
+const countNames = {characters: "角色", reference_assets: "参考图片", life_plans: "计划", life_adjustments: "临时调整", life_sources: "约定来源", life_evidence_metadata: "调整证据版本", life_characters: "角色与会话依赖", calendar: "日历", calendar_connections: "日历连接", mem_chats: "聊天", mem_turns: "轮次", mem_turn_aliases: "旧身份关联", mem_images: "图片说明", mem_turn_images: "轮次图片关联", mem_batches: "批次", mem_snapshots: "恢复点", mem_item_guards: "项目保护与来源", mem_maintenance_runs: "维护记录与撤销资料", memory_model_settings: "拾忆模型连接", files: "文件", settings: "设置"};
 const fixedMessages = {
   BUSY: "已有备份任务正在处理，请稍后再试。", BACKUP_BUSY: "已有备份任务正在处理，请稍后再试。",
   CANCELLED: "操作已取消。", BACKUP_CANCELLED: "操作已取消。",
@@ -310,7 +310,7 @@ export function openBackup({bridge, escape, settings, trigger, isCurrent = () =>
         const value = result.modules?.[el.dataset.estimate];
         el.textContent = value ? `${Number(value.count) || 0} 项 · 约 ${bytes(value.bytes)}` : "生成后显示实际数量";
       }
-      q("dependencies").textContent = "按模块附带必要连接与身份结构；不包含相册成图、宿主聊天原图和向量缓存。";
+      q("dependencies").textContent = "按模块附带必要连接与身份结构；拾忆备份包含私有修正及撤销资料。不包含相册成图、宿主聊天原图和向量缓存。";
       q("status").textContent = ""; optionsReady = true; setBusy(false);
     } catch (err) {
       if (valid()) { error(errorText(err?.message)); q("status").textContent = "数据概览读取失败，可校验已有备份；导出请关闭后重新打开。"; setBusy(false); }

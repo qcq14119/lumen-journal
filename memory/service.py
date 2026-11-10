@@ -164,6 +164,10 @@ class MemoryService:
         self._backup_tasks = set()
         self.vectors = VectorIndex(store)
         self.images = ImageIndex(store, context)
+        from .maintenance import MemoryMaintenance
+        self.maintenance = MemoryMaintenance(self)
+        self.summary_intents = {}
+        self._summary_handoffs = {}
 
     async def names(self, scope, settings=None):
         try:
@@ -178,6 +182,13 @@ class MemoryService:
 
     async def close(self):
         self._closed = True
+        self.summary_intents.clear()
+        await self.maintenance.close()
+        handoffs = list(self._summary_handoffs.values())
+        for task in handoffs:
+            task.cancel()
+        await asyncio.gather(*handoffs, return_exceptions=True)
+        self._summary_handoffs.clear()
         for handle in self._backup_handles:
             handle.cancel()
         self._backup_handles.clear()
@@ -255,7 +266,7 @@ class MemoryService:
                     f"向量{'重建' if rebuild else '更新'}：新增{result['added']}条，删除{result['removed']}条，共{result['total']}条记忆",
                 )
 
-        return self.vectors.start(scope, cid, model, rebuild=rebuild, on_done=done)
+        return self.vectors.start(scope, cid, model, rebuild=rebuild, on_done=done, coalesce=True)
 
     async def _cleanup_loop(self):
         while not self._closed:
@@ -483,14 +494,40 @@ class MemoryService:
             return False
         if not manual and key in self.failed:
             return False
+        # A normal chat save is not itself a summary intent. Only eligible
+        # work may interrupt maintenance; handoff calls request again so this
+        # plan is never reused after the cancelled worker releases ownership.
         if not self.plan(scope, cid, manual=manual)["turns"]:
             return False
+        if key in self.maintenance.tasks or key in self._summary_handoffs:
+            self.summary_intents[key] = self.summary_intents.get(key, False) or manual
+            self.maintenance.cancel(scope, cid)
+            if key not in self._summary_handoffs:
+                async def handoff():
+                    await self.maintenance.cancel_wait(scope, cid)
+                task = asyncio.create_task(handoff())
+                self._summary_handoffs[key] = task
+                def finished(done):
+                    # stop() may cancel before handoff() enters its finally.
+                    # A late callback must not release a newer handoff.
+                    if self._summary_handoffs.get(key) is not done:
+                        return
+                    self._summary_handoffs.pop(key, None)
+                    intent = self.summary_intents.pop(key, None)
+                    if intent is not None and not self._closed:
+                        self.request(scope, cid, manual=intent)
+                task.add_done_callback(finished)
+            return True
         task = asyncio.create_task(self._run(scope, cid, manual))
         self.tasks[key] = task
         task.add_done_callback(lambda _: self.tasks.pop(key, None))
         return True
 
     def stop(self, scope, cid):
+        self.summary_intents.pop((scope, cid), None)
+        handoff = self._summary_handoffs.get((scope, cid))
+        if handoff:
+            handoff.cancel()
         task = self.tasks.get((scope, cid))
         if task:
             task.cancel()
@@ -501,6 +538,7 @@ class MemoryService:
     async def _run(self, scope, cid, manual):
         key = (scope, cid)
         self.failed.pop(key, None)
+        batches = []
         try:
             # Freeze the range now: rounds arriving during the run wait for later.
             pending = self.store.pending_turns(scope, cid)
@@ -518,13 +556,25 @@ class MemoryService:
                     if plan.get("blocked"):
                         raise MemoryModelError(plan["reason"])
                     break
-                await self._summarize(scope, cid, plan)
+                batches.append(await self._summarize(scope, cid, plan))
+                del plan
         except asyncio.CancelledError:
             self.store.log(scope, cid, "stopped", "整理已停止，未保存的批次保留为待整理")
             raise
         except Exception as error:
             self.failed[key] = error_kind(error)[0]
             self.store.log(scope, cid, "summary_failed", diagnostic(error))
+        else:
+            # Only metadata crosses this boundary. A failed/cancelled summary
+            # never launches maintenance from its finally block.
+            if batches and not self._closed:
+                del pending, settings
+                try:
+                    self.maintenance.after_summary(scope, cid, batches)
+                except Exception as exc:
+                    from .maintenance_protocol import CODES, packed
+                    code = getattr(exc, "code", "")
+                    self.store.log(scope, cid, "maintenance_failed", packed({"code": code if code in CODES else "STORAGE"}))
         finally:
             self.busy.pop(key, None)
 

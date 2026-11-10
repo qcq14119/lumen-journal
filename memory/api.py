@@ -9,6 +9,7 @@ from astrbot.api.web import error_response, json_response, request
 
 from ..store import AlbumError
 from . import core
+from .maintenance_store import fingerprint
 from .models import MemoryModel, MemoryModelError
 from .service import error_kind
 
@@ -36,6 +37,7 @@ SETTINGS = (
     "recall_vector_min",
     "image_describe",
     "image_keep_turns",
+    "maintenance_paused",
 )
 
 
@@ -62,6 +64,7 @@ class MemoryAPI:
             ("settings", "GET", self.settings),
             ("settings", "POST", self.save_settings),
             ("model_preset", "POST", self.model_preset),
+            ("model_catalog", "GET", self.model_catalog),
             ("model_key", "POST", self.model_key),
             ("diagnostics", "GET", self.diagnostics),
             ("vectors", "GET", self.vector_status),
@@ -70,6 +73,9 @@ class MemoryAPI:
             ("images", "POST", self.image_action),
             ("export", "GET", self.export),
             ("import", "POST", self.import_memory),
+            ("maintenance", "GET", self.maintenance_state),
+            ("maintenance/detail", "GET", self.maintenance_detail),
+            ("maintenance", "POST", self.maintenance_action),
         ):
 
             async def safe(handler=handler):
@@ -108,6 +114,10 @@ class MemoryAPI:
     def idle(self, scope, cid):
         if (scope, cid) in self.service.tasks:
             raise AlbumError("该聊天正在整理中，请等待完成或先停止")
+
+    async def write_ready(self, scope, cid):
+        await self.service.maintenance.cancel_wait(scope, cid)
+        self.idle(scope, cid)
 
     def view(self, scope, cid):
         state = self.store.state(scope, cid)
@@ -266,7 +276,7 @@ class MemoryAPI:
         """User edits of one item: edit/delete an event, person, plan, overview, keywords."""
         data = await self.body()
         scope, cid = await self.target(data)
-        self.idle(scope, cid)
+        await self.write_ready(scope, cid)
         memory = self.store.memory(scope, cid)
         kind, item = data.get("kind"), data.get("item") or {}
         if kind == "overview":
@@ -396,6 +406,7 @@ class MemoryAPI:
         scope, cid = await self.target(data)
         revision = data.get("revision")
         if name == "enable":
+            await self.service.maintenance.cancel_wait(scope, cid)
             self.store.configure(scope, cid, {"enabled": bool(data.get("enabled"))}, revision)
         elif name == "summarize":
             state = self.store.state(scope, cid)
@@ -408,31 +419,31 @@ class MemoryAPI:
         elif name == "stop":
             self.service.stop(scope, cid)
         elif name == "undo":
-            self.idle(scope, cid)
+            await self.write_ready(scope, cid)
             self.store.undo_last(scope, cid, revision, force=data.get("force") is True)
         elif name == "resummarize":
-            self.idle(scope, cid)
+            await self.write_ready(scope, cid)
             if data.get("confirmed") is not True:
                 raise AlbumError("请确认要清空记忆并从备份重新整理")
             self.store.reset_for_resummary(scope, cid, revision)
             self.service.failed.pop((scope, cid), None)
             self.service.request(scope, cid, manual=True)
         elif name == "restore":
-            self.idle(scope, cid)
+            await self.write_ready(scope, cid)
             self.store.restore_snapshot(scope, cid, data.get("id"), revision)
         elif name == "copy_to":
-            self.idle(scope, cid)
+            await self.write_ready(scope, cid)
             target = data.get("target") or {}
             target_scope, target_cid = await self.target(target)
-            self.idle(target_scope, target_cid)
+            await self.write_ready(target_scope, target_cid)
             self.store.copy_to(scope, cid, target_scope, target_cid, target.get("revision"))
         elif name == "clear":
-            self.idle(scope, cid)
+            await self.write_ready(scope, cid)
             if data.get("confirmed") is not True:
                 raise AlbumError("请确认清空记忆")
             with self.store.transaction():
                 self.store._snapshot(scope, cid, "清空前")
-            self.store.save_memory(scope, cid, core.empty(), revision)
+            self.store.save_memory(scope, cid, core.empty(), revision, replace=True)
         else:
             raise AlbumError("不支持的操作")
         if name in ("undo", "restore", "clear", "resummarize"):
@@ -464,6 +475,12 @@ class MemoryAPI:
     async def settings(self):
         scope, cid = await self.target(request.query)
         return json_response(self._settings_view(scope, cid), headers=PRIVATE)
+
+    async def model_catalog(self):
+        """Shared text connections, without selecting or creating a chat."""
+        catalog = self.service.models.workspace({})
+        return json_response({"models_revision": catalog["models_revision"],
+            "presets": [p for p in catalog["presets"] if p["type"] == "chat"]}, headers=PRIVATE)
 
     async def save_settings(self):
         data = await self.body()
@@ -650,13 +667,130 @@ class MemoryAPI:
     async def import_memory(self):
         data = await self.body()
         scope, cid = await self.target(data)
-        self.idle(scope, cid)
+        await self.write_ready(scope, cid)
         payload = data.get("payload")
         if not isinstance(payload, dict) or payload.get("format") != "lumen-memory" or not isinstance(payload.get("memory"), dict):
             raise AlbumError("请选择拾忆回响导出的记忆文件")
         memory = core.normalized(payload["memory"])
         with self.store.transaction():
             self.store._snapshot(scope, cid, "导入前")
-        self.store.save_memory(scope, cid, memory, data.get("revision"))
+        self.store.save_memory(scope, cid, memory, data.get("revision"), replace=True)
         self.service.refresh_vectors(scope, cid)
         return json_response(self.view(scope, cid), headers=PRIVATE)
+
+    @staticmethod
+    def _maintenance_selected(data, *, query=False):
+        selected = data.get("selected_batches", "[]" if query else [])
+        if query:
+            if not isinstance(selected, str) or len(selected) > 4096:
+                raise AlbumError("PROTOCOL")
+            try:
+                selected = json.loads(selected)
+            except json.JSONDecodeError:
+                raise AlbumError("PROTOCOL") from None
+        if (not isinstance(selected, list) or len(selected) > 120
+                or any(type(i) is not int or not 0 < i <= 2**63 - 1 for i in selected)):
+            raise AlbumError("PROTOCOL")
+        return sorted(set(selected))
+
+    def _maintenance_view(self, scope, cid, selected_batches=()):
+        engine, data = self.service.maintenance, self.store.maintenance
+        policy = engine.policy()
+        configured, error_code, connection_signature = True, "", ""
+        if policy.get("enabled"):
+            try:
+                _, connection_signature = engine.configured(scope, cid)
+            except AlbumError:
+                configured, error_code = False, "CONNECTION_MISSING"
+        with self.store.lock:
+            snapshot = data.items(scope, cid, readonly=True)
+            batches = self.store.batches(scope, cid)
+            unavailable = []
+            if selected_batches:
+                marks = ",".join("?" for _ in selected_batches)
+                selected = {row["id"]: dict(row) for row in self.store.db.execute(
+                    f"SELECT id,first,last,state FROM mem_batches WHERE scope=? AND cid=? AND id IN ({marks})",
+                    (scope, cid, *selected_batches)).fetchall()}
+                known = {batch["id"] for batch in batches}
+                for batch_id in selected_batches:
+                    batch = selected.get(batch_id)
+                    if not batch or batch["state"] != "applied":
+                        unavailable.append({"id": batch_id, "state": batch["state"] if batch else "missing"})
+                    elif batch_id not in known:
+                        batches.append(batch)
+            latest = self.store.db.execute("SELECT id,first,last,state FROM mem_batches "
+                "WHERE scope=? AND cid=? AND state='applied' ORDER BY id DESC LIMIT 1", (scope, cid)).fetchone()
+            current = {(item["collection"], item["id"]) for item in snapshot["items"]}
+            def batch_keys(batch):
+                return [item for item in data.changed(scope, cid, [batch]) if (item["collection"], item["id"]) in current]
+            for batch in batches:
+                batch["keys"] = batch_keys(batch["id"])
+            latest = dict(latest) | {"keys": batch_keys(latest["id"])} if latest else None
+        items = []
+        for item in snapshot["items"]:
+            value = item["value"]
+            label = (value.get("title") or value.get("name") or value.get("summary") or value.get("text") or item["id"]) if isinstance(value, dict) else item["collection"]
+            items.append({k: item[k] for k in ("collection", "id", "version", "hash", "protected", "legacy_unverified", "source_complete")} | {"label": str(label)[:100]})
+        runs = data.list_runs(scope, cid)
+        return {"enabled": bool(policy.get("enabled")), "auto_after_summary": bool(policy.get("auto_after_summary")),
+                "revision": snapshot["revision"], "epoch": snapshot["epoch"], "paused": snapshot["paused"],
+                "policy_signature": fingerprint([policy, connection_signature]),
+                "configured": configured, "error_code": error_code,
+                "running": (scope, cid) in engine.tasks, "task": engine.active.get((scope, cid)),
+                "items": items, "batches": batches, "latest_batch": latest, "unavailable_batches": unavailable, "runs": runs}
+
+    async def maintenance_state(self):
+        scope, cid = self.maintenance_target(request.query)
+        selected = self._maintenance_selected(request.query, query=True)
+        return json_response(self._maintenance_view(scope, cid, selected), headers=PRIVATE)
+
+    async def maintenance_detail(self):
+        data = request.query
+        scope, cid = self.maintenance_target(data)
+        version = data.get("version")
+        if not isinstance(version, str) or not re.fullmatch(r"[1-9][0-9]{0,15}", version):
+            raise AlbumError("PROTOCOL")
+        result = self.store.maintenance.detail(scope, cid, data.get("collection"), data.get("id"),
+            epoch=data.get("epoch"), version=int(version), content_hash=data.get("hash"))
+        return json_response(result, headers=PRIVATE)
+
+    def maintenance_target(self, data):
+        scope, cid = data.get("scope"), data.get("cid")
+        if not isinstance(scope, str) or not isinstance(cid, str) or not scope or not cid:
+            raise AlbumError("请选择一份聊天")
+        self.service.maintenance.host_check(scope, cid)
+        return scope, cid
+
+    async def maintenance_action(self):
+        data = await self.body()
+        scope, cid = self.maintenance_target(data)
+        selected = self._maintenance_selected(data)
+        engine, store = self.service.maintenance, self.store.maintenance
+        op = data.get("op")
+        if op == "preview":
+            result = engine.preview(scope, cid, data.get("keys", []), data.get("batches", []),
+                apply=data.get("apply", False), allow_protected=data.get("allow_protected", False))
+            return json_response(result, headers=PRIVATE)
+        if op == "start":
+            self.idle(scope, cid)
+            engine.start(scope, cid, data.get("token"), data.get("request_id"))
+        elif op == "stop":
+            engine.cancel(scope, cid, data.get("task_id"))
+        elif op == "undo":
+            await self.write_ready(scope, cid)
+            store.undo(scope, cid, data.get("id"))
+            self.service.refresh_vectors(scope, cid)
+        elif op == "protect":
+            await self.write_ready(scope, cid)
+            store.protect(scope, cid, data.get("collection"), data.get("id"), data.get("version"), data.get("protected"), epoch=data.get("epoch"))
+        elif op == "resolve":
+            store.resolve(scope, cid, data.get("id"))
+        elif op == "pause":
+            if type(data.get("paused")) is not bool:
+                raise AlbumError("暂停状态格式不正确")
+            if engine.active.get((scope, cid), {}).get("trigger") == "auto":
+                await engine.cancel_wait(scope, cid)
+            self.store.configure(scope, cid, {"maintenance_paused": data["paused"]}, data.get("revision"))
+        else:
+            raise AlbumError("不支持的记忆维护操作")
+        return json_response(self._maintenance_view(scope, cid, selected), headers=PRIVATE)

@@ -54,9 +54,10 @@ const selectedPlans = new Map();
 let planSortMenuEvents;
 let albumPanelEvents;
 let settingsSession;
+let assistantSettingsSession;
 let settingsWriteBusy = false;
 window.addEventListener("beforeunload", event => {
-  if (settingsWriteBusy || settingsSession && (settingsSession.saving || settingsSession.dirty())) { event.preventDefault(); event.returnValue = ""; }
+  if (settingsWriteBusy || [settingsSession, assistantSettingsSession].some(session => session && (session.saving || session.dirty()))) { event.preventDefault(); event.returnValue = ""; }
 });
 const selectedHistory = new Map();
 const historyState = {kind: "jobs", status: "", character: "", query: "", offset: 0, manage: false, page: null};
@@ -230,6 +231,7 @@ async function render() {
     dialog.close();
   }
   settingsSession?.dispose(); settingsSession = null;
+  assistantSettingsSession?.dispose();
   disposeBackup();
   const serial = ++state.serial;
   planSortMenuEvents?.abort();
@@ -248,7 +250,7 @@ async function render() {
     if (state.tab === "jobs") await renderJobs(serial);
     if (state.tab === "plans") await renderPlans();
     if (state.tab === "settings") renderSettings();
-    if (state.tab === "memory") await mountMemory({main, bridge, showDialog, footer, busy, toast, escape, helpTip, serial, openDiagnostics: target => {historyState.kind="memory"; historyState.scope=target.scope; historyState.cid=target.cid; historyState.status="failed"; historyState.query=""; historyState.offset=0; state.tab="jobs"; return render();}, isCurrent: () => state.tab === "memory" && serial === state.serial});
+    if (state.tab === "memory") await mountMemory({main, bridge, showDialog, footer, busy, toast, escape, helpTip, serial, openAssistantSettings: openMemoryAssistantSettings, openDiagnostics: target => {historyState.kind="memory"; historyState.scope=target.scope; historyState.cid=target.cid; historyState.status="failed"; historyState.query=""; historyState.offset=0; state.tab="jobs"; return render();}, isCurrent: () => state.tab === "memory" && serial === state.serial});
   } catch (e) {
     if (serial === state.serial) {
       main.innerHTML = `<div class="empty"><h2>暂时无法打开</h2><p>${escape(e.message)}</p><button id="retry">重新加载</button></div>`;
@@ -267,16 +269,17 @@ async function reload() {
 }
 function nav(tab) {
   document.getElementById("mobile-app-select").value = state.tab;
-  if (state.tab === tab) return;
-  if (settingsWriteBusy || settingsSession?.saving || settingsSession?.dirty() && !window.confirm("有未保存的设置，离开后将放弃这些修改。继续离开？")) {
-    return;
+  if (state.tab === tab) return Promise.resolve(true);
+  if (settingsWriteBusy || settingsSession?.saving || assistantSettingsSession?.saving || (settingsSession?.dirty() || assistantSettingsSession?.dirty()) && !window.confirm("有未保存的设置，离开后将放弃这些修改。继续离开？")) {
+    return false;
   }
   selectedPhotos.clear(); state.albumManage = false;
   selectedPlans.clear(); state.planManage = false;
   selectedHistory.clear(); historyState.manage = false;
   state.tab = tab;
-  render();
+  const rendered = render();
   window.scrollTo(0, 0);
+  return rendered.then(() => true);
 }
 document
   .querySelectorAll("[data-tab]")
@@ -844,16 +847,28 @@ function bindProactiveRetry(root, refresh) {
 
 function renderActionStages(stages = [], photoMode = "", isLifeRun = false) {
   if (!stages.length && !isLifeRun) return "";
-  const labels = {generation:"生成接话",validation:"发送前校验",sending:"消息投递",history:"历史补存",photo:"附带照片",follow_up:"后续约定"};
-  const states = {ok:"完成",failed:"失败",held:"已阻止",pending:"待处理",skipped:"未执行",unknown:"待核对",fallback:"使用最小退路"};
+  const labels = {generation:"生成接话",validation:"发送前校验",sending:"消息投递",history:"历史补存",photo:"附带照片",follow_up:"后续约定",recovery:"生成恢复",assistant:"助手修正"};
+  const states = {ok:"完成",failed:"失败",held:"已阻止",pending:"待处理",skipped:"未执行",unknown:"待核对",fallback:"使用最小退路",retrying:"等待重试",recovered:"已恢复",exhausted:"预算已用完",cancelled:"已停止"};
   const modes = {auto:"按内容自动决定",always:"每次附带拍照",never:"关闭拍照"};
   const photoReasons = {PHOTO_DISABLED:"关闭拍照",PHOTO_NO_SCENE:photoMode === "always" ? "要求拍照，但未返回有效画面" : "未返回有效画面",PHOTO_ENGINE_UNAVAILABLE:"图片引擎不可用",TIMER_ONLY:"提醒仅文字退路",PHOTO_SUBMIT_FAILED:"照片任务建立失败",PHOTO_TASK_CREATED:"照片任务已建立"};
+  const failureReasons = {
+    PROTOCOL_THOUGHT:"思考包装不完整",PROTOCOL_STRUCTURE:"控制结构或位置不正确",PROTOCOL_JSON:"控制字段JSON无效",PROTOCOL_FIELDS:"控制字段不正确（旧记录）",
+    PROTOCOL_DECISION_TYPE:"决策须为对象",PROTOCOL_DECISION_FIELDS:"决策含不支持的字段",PROTOCOL_DECISION_CONTACT:"联系决策字段不正确",PROTOCOL_DECISION_PROGRESS:"生活进度字段不正确",
+    PROTOCOL_SOURCE_TYPE:"来源编号须为字符串数组",PROTOCOL_SOURCE_COUNT:"来源数量超限",PROTOCOL_SOURCE_UNKNOWN:"来源编号无效",PROTOCOL_SOURCE_REQUIRED:"缺少必要来源编号",PROTOCOL_REMINDER_CONTACT:"明确提醒不能自主取消或改点",PROTOCOL_EFFECTIVE_TS:"延后时间字段不正确",
+    PROTOCOL_REASON_TYPE:"决策原因须为文字",PROTOCOL_REASON_LENGTH:"决策原因过长",PROTOCOL_PHOTO_EMPTY:"图片描述为空",PROTOCOL_PHOTO_LENGTH:"图片描述过长",
+    PROTOCOL_FOLLOW_TYPE:"心念参数须为对象",PROTOCOL_FOLLOW_FIELDS:"心念含不支持的字段",PROTOCOL_FOLLOW_DELAY_TYPE:"心念分钟数须为整数",PROTOCOL_FOLLOW_DELAY_RANGE:"心念分钟数超出范围",PROTOCOL_FOLLOW_WINDOW_TYPE:"心念浮动须为整数",PROTOCOL_FOLLOW_WINDOW_RANGE:"心念浮动超出范围",
+    PROTOCOL_FOLLOW_NAME_TYPE:"心念名称须为文字",PROTOCOL_FOLLOW_NAME_LENGTH:"心念名称过长",PROTOCOL_FOLLOW_INSTRUCTION_TYPE:"心念内容须为文字",PROTOCOL_FOLLOW_INSTRUCTION_EMPTY:"心念内容为空",PROTOCOL_FOLLOW_INSTRUCTION_LENGTH:"心念内容过长",PROTOCOL_FOLLOW_PHOTO_TYPE:"心念拍照字段须为布尔值",
+    GENERATION_BUDGET:"本次生成次数已用完",GENERATION_DEADLINE:"本次生成总时限已到",GENERATION_CANCELLED:"本次生成已停止",GENERATION_STALE:"任务或聊天已变化",CHAT_ACTIVE:"聊天已更新，本次不打扰",
+    MODEL_AUTH:"模型密钥或权限异常",MODEL_CONFIG:"模型配置不正确",MODEL_RATE_LIMIT:"模型服务限流",MODEL_SERVER:"模型服务暂时失败",ASSISTANT_UNAVAILABLE:"助手连接不可用",ASSISTANT_CHANGED:"助手用途或连接已变化",ASSISTANT_RETRY:"助手建议重新生成",ASSISTANT_UNREPAIRABLE:"助手无法修复",ASSISTANT_RESPONSE:"助手返回格式不正确",ASSISTANT_UNSAFE_EDIT:"助手修改超出允许范围",RESPONSE_LIMIT:"模型返回超过限制"
+  };
   const hasPhoto = stages.some(s=>s.stage === "photo");
   return `<details class="help-details"><summary>处理诊断</summary>${hasPhoto || isLifeRun ? `<p>执行时拍照模式：${escape(modes[photoMode] || "未记录")}</p>` : ""}${isLifeRun && !hasPhoto ? "<p>拍照原因未记录</p>" : ""}${stages.map(s=>{
     const photo = s.stage === "photo";
     const status = photo && s.status === "ok" ? "照片任务已建立" : states[s.status] || s.status;
-    const reason = photo ? photoReasons[s.code] || "原因未记录" : s.code;
-    return `<p>${s.at ? escape(date(s.at)) + " · " : ""}${escape(labels[s.stage] || s.stage)} · ${escape(photo && photoReasons[s.code] ? photoReasons[s.code] : status)}${reason && (!photo || !photoReasons[s.code]) ? ` · ${escape(reason)}` : ""}</p>`;
+    const reason = photo ? photoReasons[s.code] || "原因未记录" : failureReasons[s.code] || s.code;
+    const count = (key, max) => Number.isSafeInteger(s[key]) && s[key] >= 0 && s[key] <= max;
+    const counts = [count("attempt",6)?`第${s.attempt}次尝试`:"",count("calls",6)?`插件调用${s.calls}次`:"",count("elapsed_ms",1200000)?`耗时${(s.elapsed_ms/1000).toFixed(1)}秒`:""].filter(Boolean).join(" · ");
+    return `<p>${s.at ? escape(date(s.at)) + " · " : ""}${escape(labels[s.stage] || s.stage)} · ${escape(photo && photoReasons[s.code] ? photoReasons[s.code] : status)}${reason && (!photo || !photoReasons[s.code]) ? ` · ${escape(reason)}` : ""}${counts ? ` · ${escape(counts)}` : ""}</p>`;
   }).join("")}</details>`;
 }
 
@@ -1668,11 +1683,11 @@ function editPlan(p = {}, bots = []) {
   targetVisibility();scheduleVisibility();preview();
 }
 
-function providerFields(s) {
+function providerFields(s, recovery, maintenance) {
   const panel = main.querySelector("#site-panel"), form = main.querySelector("#settings-form");
   const fields = ["name", "base_url", "api_keys", "active_key_id", "model", "size", "reference_field", "enabled", "id"];
   const globalFields = [...form.querySelectorAll("[name]")];
-  const globals = () => Object.fromEntries(globalFields.map(el => [el.name, el.type === "checkbox" ? el.checked : Number(el.value)]));
+  const globals = () => ({...Object.fromEntries(globalFields.map(el => [el.name, el.type === "checkbox" ? el.checked : Number(el.value)])), ...(recovery ? {plan_recovery: recovery.value()} : {}), ...(maintenance ? {memory_maintenance: maintenance.value()} : {})});
   const title = (p) => {
     if (p.name?.trim()) return p.name.trim();
     try { return new URL(p.base_url).hostname; } catch { return "未命名站点"; }
@@ -1703,7 +1718,7 @@ function providerFields(s) {
   const dirty = (site = editing) => !!site && signature(site) !== (baseline.find(p => p.id === site.id) ? signature(baseline.find(p => p.id === site.id)) : "");
   const anyDirty = () => {
     return drafts.some(p => dirty(p)) || JSON.stringify(drafts.map(p => p.id)) !== JSON.stringify(baseline.map(p => p.id))
-      || preferred !== saved.preferred_provider || globalFields.some(el => globals()[el.name] !== saved[el.name]);
+      || preferred !== saved.preferred_provider || globalFields.some(el => globals()[el.name] !== saved[el.name]) || !!recovery?.dirty() || !!maintenance?.dirty();
   };
   const valid = () => !disposed && panel.isConnected;
   const updateSelectors = () => {
@@ -2015,16 +2030,16 @@ function providerFields(s) {
       providers: drafts.filter(p => p.id !== "primary").map(payload), provider_order: drafts.map(p => p.id), preferred_provider: preferred, ...globals()};
   };
   const save = async (siteOnly = false) => {
-    if (saving || disposed || dialog.open) return;
+    if (saving || disposed || dialog.open || settingsWriteBusy || assistantSettingsSession?.saving || recovery?.saving || maintenance?.saving) return;
     read();
     const target = siteOnly ? editing : null;
     try {
       for (const site of target ? [target] : drafts) validateSite(site);
-      if (!siteOnly) for (const el of globalFields) if (!el.reportValidity()) { el.focus(); return; }
+      if (!siteOnly) { for (const el of globalFields) if (!el.reportValidity()) { el.focus(); return; } recovery?.validate(); maintenance?.validate(); }
     } catch (error) { updateStatus(error.message); toast(error.message, true); return; }
     const data = siteOnly ? {site: payload(target)} : fullPayload();
     const oldPreferred = saved.preferred_provider;
-    saving = true; hideKeys(); viewVersion++;
+    saving = true; hideKeys(); recovery?.hide(); maintenance?.hide(); viewVersion++;
     const controls = [...form.querySelectorAll("input, select, button"), main.querySelector("#save-settings")];
     const disabled = controls.map(el => [el, el.disabled]); controls.forEach(el => el.disabled = true);
     const writeButton = main.querySelector(siteOnly ? "#save-site" : "#save-settings"); writeButton.setAttribute("aria-busy", "true");
@@ -2042,6 +2057,7 @@ function providerFields(s) {
         for (const site of drafts) Object.assign(site, normalized.find(p => p.id === site.id));
         preferred = result.preferred_provider;
         for (const el of globalFields) { if (el.type === "checkbox") el.checked = result[el.name]; else el.value = result[el.name]; }
+        recovery?.accept(result.plan_recovery); maintenance?.accept(result.memory_maintenance);
       }
       baseline = normalized; saved = structuredClone(result); state.data.settings = structuredClone(result);
       // Keep this editor, scroll position, details and focus. Only normalized fields change.
@@ -2096,11 +2112,249 @@ function providerFields(s) {
   form.addEventListener("input", event => { if (event.target.name && !saving) updateStatus(); });
   document.addEventListener("pointerdown", event => { if (!panel.querySelector("#site-keys")?.contains(event.target)) closeKeys(); }, {signal: events.signal});
   const controller = {
-    get saving() { return saving; }, dirty: anyDirty, saveAll: () => save(),
-    dispose() { disposed = true; hideKeys(); events.abort(); drafts = []; },
+    get saving() { return saving || !!recovery?.saving || !!maintenance?.saving; }, dirty: anyDirty, saveAll: () => save(),
+    acceptAssistantSave(result, expectedRevision) {
+      if (!valid() || saving || !Number.isSafeInteger(expectedRevision) || saved.settings_revision !== expectedRevision || result.settings_revision !== expectedRevision + 1) return;
+      saved.settings_revision = result.settings_revision;
+      saved.memory_maintenance = structuredClone(result.memory_maintenance);
+    },
+    dispose() { disposed = true; hideKeys(); events.abort(); recovery?.dispose(); maintenance?.dispose(); drafts = []; },
   };
   draw();
+  if (recovery) recovery.changed = () => updateStatus();
+  if (maintenance) maintenance.changed = () => updateStatus();
   return controller;
+}
+
+function planRecoverySettings(initial, maintenance = false, directory = {}, root = main.querySelector(maintenance ? "#memory-maintenance-panel" : "#plan-recovery-panel")) {
+  const prefix = maintenance ? "maintenance-" : "plan-";
+  const normalize = v => maintenance ? {enabled:v?.enabled ?? false,auto_after_summary:v?.auto_after_summary ?? false,binding:structuredClone(v?.binding || {mode:"summary"}),max_calls:v?.max_calls ?? 3,unit_timeout:v?.unit_timeout ?? 300,manual_timeout:v?.manual_timeout ?? 1800} : ({extra_attempts: v?.extra_attempts ?? 2, total_timeout: v?.total_timeout ?? 300,
+    assistant_enabled: v?.assistant_enabled ?? false, assistant_binding: structuredClone(v?.assistant_binding || {mode: "summary"})});
+  let saved = normalize(initial), disposed = false, generation = 0, readNumber = 0, saving = false, editing = null;
+  let catalogue = [], revision = null, editorRevision = null, baseline = "";
+  const q = id => root.querySelector("#" + prefix + id);
+  const scoped = html => maintenance ? html.replaceAll("plan-", "maintenance-") : html;
+  const valid = () => !disposed && root.isConnected;
+  root.innerHTML = scoped(`<h3>朝夕生成恢复</h3><div class="form-row"><div><label for="plan-extra-attempts">额外生成次数</label><input id="plan-extra-attempts" type="number" min="0" max="5" step="1" value="${saved.extra_attempts}"></div><div><label for="plan-total-timeout">本次生成总时限（秒）</label><input id="plan-total-timeout" type="number" min="30" max="1200" step="1" value="${saved.total_timeout}"></div></div>
+  <label class="check"><input id="plan-assistant-enabled" type="checkbox" ${saved.assistant_enabled ? "checked" : ""}>启用助手修正朝夕失败输出</label>
+  <label for="plan-assistant-connection">助手连接</label><select id="plan-assistant-connection"></select><p id="plan-connection-status" class="help" role="status"></p>
+  <div class="actions"><button type="button" id="plan-new-connection">新建助手连接</button><button type="button" id="plan-edit-connection">查看/编辑连接</button><button type="button" id="plan-refresh-connections">刷新连接</button></div><div id="plan-connection-editor"></div>
+  <p class="help">失败恢复可能增加模型费用；助手调用也占用额外次数。</p><details id="plan-recovery-help"><summary>调用与时效说明</summary><p class="help">首次生成、纠正、助手和聊天变化重评共用预算。设为0仅调用首次生成，不重发已发送或结果未知的消息。总时限包含请求与退避。</p><p class="help">跟随总结使用任务所属聊天的连接；缺少连接时只使用原模型的基础恢复。这里限制插件调用次数，宿主内部HTTP尝试及服务端计费次数可能不同。</p><p class="help">文本连接与拾忆回响共享；保存连接立即更新共享目录，保存设置才应用本页用途选择。</p></details>`);
+  if (maintenance) {
+    root.innerHTML = `<h3>记忆维护助手</h3><label class="check"><input id="maintenance-assistant-enabled" type="checkbox" ${saved.enabled ? "checked" : ""}>启用记忆维护助手</label><label class="check"><input id="maintenance-auto-after-summary" type="checkbox" ${saved.auto_after_summary ? "checked" : ""}>总结完成后自动检查实际变化</label>
+    <label for="maintenance-assistant-connection">助手连接</label><select id="maintenance-assistant-connection"></select><p id="maintenance-connection-status" class="help" role="status"></p><div class="actions"><button type="button" id="maintenance-new-connection">新建助手连接</button><button type="button" id="maintenance-edit-connection">查看/编辑连接</button><button type="button" id="maintenance-refresh-connections">刷新连接</button></div><div id="maintenance-connection-editor"></div><p class="help">检查会增加模型费用。开启不会扫描旧记忆；手动范围在拾忆回响中选择。</p><details id="maintenance-recovery-help"><summary>调用与保护</summary><div class="form-row"><div><label for="maintenance-max-calls">每单元最多模型调用</label><input id="maintenance-max-calls" type="number" min="1" max="6" step="1" value="${saved.max_calls}"></div><div><label for="maintenance-unit-timeout">单元总时限（秒）</label><input id="maintenance-unit-timeout" type="number" min="30" max="1200" step="1" value="${saved.unit_timeout}"></div></div><label for="maintenance-manual-timeout">手动任务总时限（秒）</label><input id="maintenance-manual-timeout" type="number" min="30" max="7200" step="1" value="${saved.manual_timeout}"><p class="help">每单元最多6项；有完整有效原文支持时才允许最小修正。人工保护仅限制助手自动修改，不改变普通总结策略。跟随总结按任务所属聊天解析；缺少连接不会改用其他模型。保存连接立即更新共享目录，用途选择仍需保存设置。</p></details>`;
+  }
+  const select = q("assistant-connection");
+  const notice = (text, error = false) => { q("connection-status").textContent = text; q("connection-status").classList.toggle("error", error); };
+  const binding = () => select.value === "__summary__" ? {mode:"summary"} : {mode:"preset", preset_id:select.value};
+  const value = () => maintenance ? {enabled:q("assistant-enabled").checked,auto_after_summary:q("auto-after-summary").checked,binding:binding(),max_calls:Number(q("max-calls").value),unit_timeout:Number(q("unit-timeout").value),manual_timeout:Number(q("manual-timeout").value)} : ({extra_attempts:Number(q("extra-attempts").value),total_timeout:Number(q("total-timeout").value),assistant_enabled:q("assistant-enabled").checked,assistant_binding:binding()});
+  const editorValue = () => JSON.stringify([...q("connection-editor").querySelectorAll("input")].map(el => el === q("connection-key") ? el.dataset.revealed || !el.value ? "" : "changed" : el.value));
+  const editorDirty = () => editing && editorValue() !== baseline;
+  const updateEditorActions = () => { for(const id of ["connection-save","connection-cancel"]){const button=q(id);if(button)button.hidden=!editorDirty();} };
+  const clearSecret = () => { const field=q("connection-key");if(field){field.value="";field.type="password";delete field.dataset.revealed;}const button=q("connection-key-toggle");if(button){button.textContent="显示";button.setAttribute("aria-pressed","false");} };
+  const closeEditor = () => { generation++;clearSecret();editing=null;q("connection-editor").innerHTML="";baseline=""; };
+  const dismissEditor = () => {
+    if(saving||settingsWriteBusy||!editing)return;
+    if(editorDirty()&&!window.confirm("连接有未保存的修改，关闭后将放弃。继续关闭？"))return;
+    const trigger=q(editing.id?"edit-connection":"new-connection");closeEditor();refreshSummary();controller.changed();trigger.focus();
+  };
+  const refreshSummary = () => {
+    q("new-connection").disabled=saving || revision===null;
+    q("edit-connection").disabled=saving || !catalogue.some(p=>p.id===select.value);
+    if(select.value==="__summary__")notice("按本次任务所属聊天解析总结连接。");
+    else {const item=catalogue.find(p=>p.id===select.value);notice(item ? `${item.name} · ${item.model} · ${item.key_configured ? "Key 已保存" : "Key 未配置"}` : revision===null ? "正在读取共享连接…" : "所选连接已不存在，请重新选择。",revision!==null&&!item);}
+  };
+  const drawCatalogue = (chosen = select.value) => {
+    const missing=chosen&&chosen!=="__summary__"&&!catalogue.some(p=>p.id===chosen);
+    select.innerHTML='<option value="__summary__">跟随任务所属聊天的总结连接</option>' + catalogue.map(p=>`<option value="${escape(p.id)}">${escape(p.name)} · ${escape(p.model)}</option>`).join("") + (missing?`<option value="${escape(chosen)}">所选连接不可用</option>`:"");
+    select.value=chosen||"__summary__";refreshSummary();
+  };
+  drawCatalogue((maintenance?saved.binding:saved.assistant_binding).mode==="preset"?(maintenance?saved.binding:saved.assistant_binding).preset_id:"__summary__");
+  const load = async () => {
+    if(saving||typeof bridge==="undefined")return;
+    const request=++readNumber, epoch=directory.epoch||0;
+    try {const result=await (directory.pending ||= bridge.apiGet("memory/model_catalog").finally(()=>{directory.pending=null;}));if(!valid()||request!==readNumber||epoch!==(directory.epoch||0))return;
+      catalogue=result.presets.filter(p=>p.type==="chat");revision=result.models_revision;drawCatalogue();}
+    catch {if(valid()&&request===readNumber)notice("共享连接读取失败，请点击刷新连接重试。",true);}
+  };
+  const openEditor = item => {
+    if(saving||settingsWriteBusy)return;
+    if(editorDirty()){notice("请先保存或取消当前连接编辑。",true);return;}
+    closeEditor();editing=item||{};editorRevision=revision;
+    const used=item ? `此连接被 ${Number.isSafeInteger(item.usage_count)?item.usage_count:0} 份聊天使用${item.global_roles?.includes("plan_recovery")?"，用于朝夕失败修正":item.global_roles?.includes("memory_maintenance")?"，用于记忆维护":""}。` : "保存到共享文本连接目录。";
+    q("connection-editor").innerHTML=scoped(`<div class="plan-connection-editor"><div class="subhead"><h4>${item?"查看/编辑连接":"新建助手连接"}</h4><button type="button" class="close" id="plan-connection-close" aria-label="关闭连接详情">×</button></div><p class="help">${escape(used)}</p><label for="plan-connection-name">名称</label><input id="plan-connection-name" maxlength="60" value="${escape(item?.name||"")}"><label for="plan-connection-url">接口地址</label><input id="plan-connection-url" type="url" value="${escape(item?.base_url||"")}" placeholder="https://example.com/v1"><label for="plan-connection-key">API Key</label><div class="key-summary"><input id="plan-connection-key" type="password" autocomplete="off" spellcheck="false" placeholder="${item?.key_configured?"已保存，留空保留":""}"><button type="button" id="plan-connection-key-toggle" aria-pressed="false">显示</button></div><label for="plan-connection-model">模型名称</label><input id="plan-connection-model" value="${escape(item?.model||"")}"><label for="plan-connection-window">模型窗口（token）</label><input id="plan-connection-window" type="number" min="1024" max="2000000" step="1" value="${item?.max_context_tokens||32000}"><p class="help">按服务商公布的模型窗口填写。修改地址后须填写新 Key。</p><div class="actions"><button type="button" id="plan-connection-save" hidden>保存连接</button><button type="button" id="plan-connection-cancel" hidden>取消</button></div></div>`);
+    baseline=editorValue();q("connection-name").focus();
+    q("connection-url").oninput=()=>{generation++;clearSecret();};
+    q("connection-close").onclick=dismissEditor;
+    q("connection-cancel").onclick=()=>{
+      if(saving||settingsWriteBusy)return;
+      generation++;const values=JSON.parse(baseline);[...q("connection-editor").querySelectorAll("input")].forEach((input,i)=>input.value=values[i]);
+      clearSecret();updateEditorActions();refreshSummary();controller.changed();q("connection-name").focus();
+    };
+    q("connection-key-toggle").onclick=async()=>{
+      if(saving)return;
+      const input=q("connection-key"),button=q("connection-key-toggle"),token=++generation;
+      if(input.type==="text"){if(input.dataset.revealed){input.value="";delete input.dataset.revealed;}input.type="password";button.textContent="显示";button.setAttribute("aria-pressed","false");return;}
+      const before=editorValue();
+      if(!input.value&&editing.id&&editing.key_configured){
+        if(q("connection-url").value.trim().replace(/\/+$/,"")!==editing.base_url.replace(/\/+$/,"")){notice("接口地址已改动，请填写新 Key。",true);return;}
+        button.disabled=true;
+        try{const result=await bridge.apiPost("memory/model_key",{id:editing.id,base_url:editing.base_url,revision:editorRevision});
+          if(!valid()||token!==generation||!input.isConnected||before!==editorValue())return;
+          input.value=result.value||"";
+          // A read-only reveal must never become a key update or dirty draft.
+          input.dataset.revealed="true";
+        }catch{if(valid()&&token===generation)notice("密钥读取失败，请重试。",true);return;}
+        finally{if(button.isConnected)button.disabled=false;}
+      }
+      if(valid()&&token===generation&&input.isConnected){input.type="text";button.textContent="隐藏";button.setAttribute("aria-pressed","true");}
+    };
+    q("connection-key").oninput=()=>{delete q("connection-key").dataset.revealed;};
+    q("connection-save").onclick=async()=>{
+      if(saving||settingsWriteBusy||!editorDirty())return;
+      const input=q("connection-key"),config={type:"chat",name:q("connection-name").value.trim(),base_url:q("connection-url").value.trim(),model:q("connection-model").value.trim(),max_context_tokens:Number(q("connection-window").value)};
+      if(!config.name||!config.model||!/^\d+$/.test(q("connection-window").value)||!Number.isSafeInteger(config.max_context_tokens)||config.max_context_tokens<1024||config.max_context_tokens>2000000){notice("请填写名称、模型和有效的整数窗口。",true);return;}
+      try{const u=new URL(config.base_url);if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash)throw Error();}catch{notice("请填写不含凭据或查询参数的公开 HTTPS 地址。",true);return;}
+      if(input.value&&!input.dataset.revealed)config.api_key=input.value;
+      if(!config.api_key&&(!editing.key_configured||config.base_url.replace(/\/+$/,"")!==(editing.base_url||"").replace(/\/+$/,""))){notice("请填写此地址的 API Key。",true);return;}
+      const token=++generation,ids=new Set(catalogue.map(p=>p.id)),identifier=editing.id;
+      // A read started before this write cannot replace its catalogue or error.
+      readNumber++;directory.epoch=(directory.epoch||0)+1;directory.pending=null;
+      const controls=[...new Set([...main.querySelectorAll("input, select, button"),...root.querySelectorAll("input, select, button")])],disabled=controls.map(el=>[el,el.disabled]);
+      saving=true;settingsWriteBusy=true;controls.forEach(el=>el.disabled=true);q("connection-save").setAttribute("aria-busy","true");
+      controller.changed();
+      try{const result=await bridge.apiPost("memory/model_preset",{operation:"save",id:identifier,revision:editorRevision,config});
+        if(!valid()||token!==generation)return;
+        catalogue=result.presets.filter(p=>p.type==="chat");revision=result.models_revision;
+        for(const receive of directory.receivers||[])receive(result);
+        const added=catalogue.find(p=>!ids.has(p.id));closeEditor();drawCatalogue(added?.id||select.value);notice("连接已保存；保存设置后应用助手选择。");controller.changed();directory.onSaved?.();
+      }catch{if(valid()&&token===generation)notice("连接保存失败，请核对字段或刷新连接版本后重试；输入已保留。",true);}
+      finally{saving=false;settingsWriteBusy=false;for(const [el,old]of disabled)if(el.isConnected)el.disabled=old;if(valid()){q("connection-save")?.removeAttribute("aria-busy");q("edit-connection").disabled=!catalogue.some(p=>p.id===select.value);controller.changed();}}
+    };
+  };
+  const controller={changed:()=>{},get saving(){return saving;},value,
+    dirty:()=>JSON.stringify(value())!==JSON.stringify(saved)||!!editorDirty(),
+    reset(){closeEditor();controller.accept(saved);controller.changed();},
+    hide(){generation++;const input=q("connection-key");if(input?.dataset.revealed)clearSecret();else if(input){input.type="password";q("connection-key-toggle").textContent="显示";q("connection-key-toggle").setAttribute("aria-pressed","false");}},
+    validate(){
+      for(const [id,min,max]of(maintenance?[["max-calls",1,6],["unit-timeout",30,1200],["manual-timeout",30,7200]]:[["extra-attempts",0,5],["total-timeout",30,1200]])){const input=q(id),n=Number(input.value);if(!/^\d+$/.test(input.value)||!Number.isSafeInteger(n)||n<min||n>max){input.focus();throw Error(maintenance?`请填写${min}—${max}范围内的整数`:id==="extra-attempts"?"额外生成次数须为0—5的整数":"本次生成总时限须为30—1200的整数秒");}}
+      if(editorDirty()){q("connection-name").focus();throw Error("请先保存或取消连接编辑");}
+      if((maintenance?value().enabled:value().assistant_enabled)&&binding().mode==="preset"&&!catalogue.some(p=>p.id===select.value)){select.focus();throw Error("所选助手连接不可用，请刷新或重新选择");}
+    },
+    accept(v){saved=normalize(v);if(maintenance){for(const key of ["max_calls","unit_timeout","manual_timeout"])q(key.replaceAll("_","-")).value=saved[key];q("auto-after-summary").checked=saved.auto_after_summary;q("assistant-enabled").checked=saved.enabled;}else{q("extra-attempts").value=saved.extra_attempts;q("total-timeout").value=saved.total_timeout;q("assistant-enabled").checked=saved.assistant_enabled;}drawCatalogue((maintenance?saved.binding:saved.assistant_binding).mode==="preset"?(maintenance?saved.binding:saved.assistant_binding).preset_id:"__summary__");},
+    dispose(){disposed=true;readNumber++;closeEditor();catalogue=[];directory.receivers=(directory.receivers||[]).filter(fn=>fn!==receive);},
+  };
+  root.addEventListener("input",()=>{if(!saving){generation++;updateEditorActions();controller.changed();}});
+  q("connection-editor").addEventListener("keydown",event=>{if(event.key==="Escape"&&editing){event.preventDefault();event.stopPropagation();dismissEditor();}});
+  select.onchange=()=>{if(!saving){generation++;clearSecret();updateEditorActions();refreshSummary();controller.changed();}};
+  q("new-connection").onclick=()=>openEditor(null);
+  q("edit-connection").onclick=()=>openEditor(catalogue.find(p=>p.id===select.value));
+  q("refresh-connections").onclick=load;
+  const receive=result=>{if(valid()){readNumber++;catalogue=result.presets.filter(p=>p.type==="chat");revision=result.models_revision;drawCatalogue();}};
+  (directory.receivers ||= []).push(receive);
+  load();return controller;
+}
+
+async function openMemoryAssistantSettings(options = {}) {
+  if (settingsWriteBusy || settingsSession?.saving) return;
+  if (assistantSettingsSession) { assistantSettingsSession.focus(); return; }
+  const inline = !!options.container;
+  if (inline && !options.container.isConnected) return;
+  const trigger = document.activeElement, serial = state.serial;
+  const parentScroll = trigger?.closest?.(".memory-dialog");
+  const position = parentScroll && {top: parentScroll.scrollTop, left: parentScroll.scrollLeft};
+  const panel = document.createElement(inline ? "section" : "dialog"), events = new AbortController();
+  panel.id = inline ? "memory-assistant-settings-inline" : "memory-assistant-settings-dialog";
+  panel.className = inline ? "assistant-settings-inline" : "assistant-settings-dialog";
+  panel.setAttribute("aria-labelledby", "assistant-settings-title");
+  panel.innerHTML = `<div class="assistant-settings-shell"><div class="dialog-head">${inline ? '<span id="assistant-settings-title" class="help">适用于全部聊天</span>' : '<h2 id="assistant-settings-title">助手设置</h2>'}<div class="actions"><button type="button" id="assistant-settings-save" class="primary" hidden>保存设置</button><button type="button" id="assistant-settings-cancel" hidden>取消修改</button>${inline ? "" : '<button type="button" id="assistant-settings-close" class="close" aria-label="关闭助手设置">×</button>'}</div></div><div class="dialog-body">${inline ? "" : '<p class="help">适用于全部聊天</p>'}<p id="assistant-settings-error" role="alert" hidden></p><p id="assistant-settings-loading" role="status">正在读取设置…</p><section id="memory-maintenance-panel"></section></div></div>`;
+  (inline ? options.container : document.body).appendChild(panel);
+  const q = id => panel.querySelector("#assistant-settings-" + id);
+  let controller, baseline, revision, saving = false, disposed = false;
+  const valid = () => !disposed && panel.isConnected && state.serial === serial && (options.isCurrent?.() ?? true);
+  const message = text => { q("error").textContent = text; q("error").hidden = !text; };
+  const update = () => {
+    for (const id of ["save", "cancel"]) { q(id).hidden = !controller?.dirty(); q(id).disabled = saving || !!controller?.saving; }
+    if (q("close")) q("close").disabled = saving || !!controller?.saving;
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true; events.abort(); controller?.dispose();
+    if (assistantSettingsSession === session) assistantSettingsSession = null;
+    if (!inline && panel.open) panel.close();
+    panel.remove();
+    if (trigger?.isConnected) trigger.focus({preventScroll: true});
+    else main.querySelector("#lj-maintenance, #memory-assistant-link, button")?.focus({preventScroll: true});
+    if (parentScroll?.isConnected) { parentScroll.scrollTop = position.top; parentScroll.scrollLeft = position.left; }
+  };
+  const canClose = () => !(saving || controller?.saving || settingsWriteBusy) && (!controller?.dirty() || window.confirm("助手设置有未保存的修改，关闭后将放弃。继续关闭？"));
+  const close = () => { if (canClose()) dispose(); };
+  const focusPanel = () => {
+    if (inline) {
+      const group = options.container.closest("details"); if (group) group.open = true;
+      panel.querySelector("input, select")?.focus({preventScroll: true});
+    } else q("close").focus();
+  };
+  const session = {dirty: () => !!controller?.dirty(), get saving() { return saving || !!controller?.saving; }, dispose, focus: focusPanel};
+  assistantSettingsSession = session;
+  if (!inline) {
+    panel.addEventListener("cancel", event => { event.preventDefault(); event.stopPropagation(); close(); }, {signal: events.signal});
+    panel.addEventListener("close", dispose, {signal: events.signal});
+  } else {
+    const guardClose = event => {
+      if (event.type === "cancel" ? event.target !== dialog : !event.target.closest?.("[data-close]")) return;
+      if (!canClose()) { event.preventDefault(); event.stopImmediatePropagation(); }
+    };
+    dialog.addEventListener("cancel", guardClose, {capture: true, signal: events.signal});
+    dialog.addEventListener("click", guardClose, {capture: true, signal: events.signal});
+  }
+  if (dialog.open) dialog.addEventListener("close", dispose, {signal: events.signal});
+  panel.addEventListener("keydown", event => {
+    if (inline || event.key !== "Tab") return;
+    const nodes = [...panel.querySelectorAll('button, input, select, summary, [tabindex]')].filter(el => !el.disabled && el.tabIndex >= 0 && el.getClientRects().length);
+    if (!nodes.length) return;
+    const index = nodes.indexOf(document.activeElement);
+    if (event.shiftKey && index <= 0) { event.preventDefault(); nodes.at(-1).focus(); }
+    else if (!event.shiftKey && (index < 0 || index === nodes.length - 1)) { event.preventDefault(); nodes[0].focus(); }
+  }, {signal: events.signal});
+  if (q("close")) q("close").onclick = close;
+  q("cancel").onclick = () => {
+    if (!valid() || saving || controller?.saving || settingsWriteBusy) return;
+    controller.reset(); message(""); update();
+  };
+  q("save").onclick = async () => {
+    if (!valid() || !controller?.dirty() || saving || controller.saving || settingsSession?.saving || settingsWriteBusy) return;
+    try { controller.validate(); } catch (error) { message(error.message); return; }
+    const payload = {settings_revision: revision, memory_maintenance: controller.value()};
+    saving = true; controller.hide(); update(); message("");
+    const controls = [...panel.querySelectorAll("input, select, button")], disabled = controls.map(el => [el, el.disabled]);
+    const focus = document.activeElement;
+    controls.forEach(el => el.disabled = true);
+    try {
+      const result = await act("settings", payload);
+      if (!valid()) return;
+      settingsSession?.acceptAssistantSave?.(result, payload.settings_revision);
+      revision = result.settings_revision; baseline = structuredClone(result.memory_maintenance);
+      controller.accept(baseline);
+      // Only this policy belongs to this panel. Other settings drafts stay with their owner.
+      if (state.data?.settings) { state.data.settings.memory_maintenance = structuredClone(baseline); state.data.settings.settings_revision = revision; }
+      options.onChange?.(); toast("助手设置已保存");
+    } catch (error) { if (valid()) message(error.message || "保存失败，修改已保留"); }
+    finally {
+      saving = false;
+      for (const [el, previous] of disabled) if (el.isConnected) el.disabled = previous;
+      if (valid()) { update(); if (focus?.isConnected && !focus.hidden) focus.focus(); else focusPanel(); }
+    }
+  };
+  if (!inline) panel.showModal(); focusPanel();
+  try {
+    const result = await bridge.apiGet("state");
+    if (!valid()) { dispose(); return; }
+    baseline = structuredClone(result.settings.memory_maintenance); revision = result.settings.settings_revision;
+    controller = planRecoverySettings(baseline, true, {onSaved: () => { if (valid()) options.onChange?.(); }}, panel.querySelector("#memory-maintenance-panel"));
+    controller.changed = update; q("loading").hidden = true; update();
+  } catch { if (valid()) { q("loading").hidden = true; message(inline ? "设置读取失败，请关闭记忆助手后重试。" : "设置读取失败，请关闭后重试。"); } }
+  return session;
 }
 
 function renderSettings() {
@@ -2116,6 +2370,8 @@ function renderSettings() {
   <details><summary>重试与站点顺序</summary><p class="help">从首选站点开始，失败后按以下顺序切换。选择查看站点不会改变首选。</p><p class="help" id="site-order"></p>
   <p class="help">重试等待逐步增加，限流时遵守服务端等待时间；已成图只重取原图。并行请求仅采用先取得可读图片的结果，之后优先使用该站点。</p>
   <p class="help">HTTP 524、断线等可能已经提交成功；有任务编号时继续查询，重启和历史任务不自动重投。</p></details></section>
+  <section class="panel" id="plan-recovery-panel"></section>
+  <section class="panel"><h3>记忆助手</h3><button type="button" id="memory-assistant-link">记忆助手设置</button></section>
   <section class="panel"><h3>QQ 空间与相册保留</h3>
   <label class="check"><input name="qzone_enabled" type="checkbox" ${s.qzone_enabled ? "checked" : ""}>允许所属角色发布相册照片</label><p class="help">开启不会立即发布。</p>
   <label for="visibility">默认可见范围</label><select id="visibility" name="qzone_visibility"><option value="4" ${s.qzone_visibility === 4 ? "selected" : ""}>好友可见</option><option value="64" ${s.qzone_visibility === 64 ? "selected" : ""}>仅自己可见</option><option value="1" ${s.qzone_visibility === 1 ? "selected" : ""}>所有人可见</option></select>
@@ -2126,7 +2382,9 @@ function renderSettings() {
   <p class="help">每分钟检查保留规则；没有可删图片时暂停新生图。回收站可在自动清理前恢复，清理后只保留任务元数据，用户源文件不受影响。</p>
   <p class="help">场景参考保留24小时，角色参考不自动清理，两者仅用于生图。</p>
   <p class="help">超时有任务编号时保留查询；无编号按“结果未知时允许重试”设置处理。</p></details></section></div></form><section class="panel backup-entry"><h3>备份与恢复</h3><button type="button" id="open-backup">备份与恢复</button></section>`;
-  settingsSession = providerFields(s);
+  const directory = {};
+  settingsSession = providerFields(s, planRecoverySettings(s.plan_recovery, false, directory));
+  main.querySelector("#memory-assistant-link").onclick = () => openMemoryAssistantSettings();
   main.querySelector("#open-backup").onclick = event => {
     const session = settingsSession;
     if (!session || session.saving || settingsWriteBusy) return;

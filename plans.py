@@ -2396,23 +2396,10 @@ class LifePlans:
                 or plan.get("activated_at", 0) > timestamp
             ):
                 continue
-            # Clean up expired one-shot plans whose latest possible window has passed
-            if plan.get("run_once"):
-                max_fire = (
-                    int(plan.get("trigger_at") or 0)
-                    + int(plan.get("window_after") or 0) * 60
-                )
-                adjusted_times = [
-                        a["effective_ts"]
-                        for a in self.daily._adjustments(plan["id"])
-                        if a["plan_revision"] == plan["revision"]
-                        and a["character_id"] == plan["character_id"]
-                        and (not plan.get("origin_cid") or a["cid"] == plan["origin_cid"])
-                    ]
-                max_fire = max(adjusted_times) if adjusted_times else max_fire
-                if max_fire > 0 and timestamp > max_fire + 3600:
-                    self.destroy_plan(plan["id"], waiting_state="expired", reason="已过期，未送达", at=timestamp)
-                    continue
+            # Use the same identity-checked effective time as generation/send.
+            if self.daily.once_expired(plan, timestamp):
+                self.destroy_plan(plan["id"], waiting_state="expired", reason="已过期，未送达", at=timestamp)
+                continue
             sc = plan.get("scope", "")
             cid = current_cids.get(sc, "")
             if sc not in override_cache:
@@ -2604,6 +2591,8 @@ class LifePlans:
             status, receipt = await self.execute(
                 plan, run["id"], instruction, local_time
             )
+            if receipt.pop("_preserve_plan", False) and status == "held":
+                destroy = False
             if status == "deferred":
                 destroy = False
             self.store.save(

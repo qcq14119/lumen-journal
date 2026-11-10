@@ -304,6 +304,13 @@ class MemoryModels:
         for identifier, count in self.store.chats_using_preset().items():
             if identifier in result:
                 result[identifier]["usage_count"] += count
+        album = self.store.restore_guard.store
+        binding = album.settings.get("plan_recovery", {}).get("assistant_binding", {})
+        if binding.get("mode") == "preset" and binding.get("preset_id") in result:
+            result[binding["preset_id"]]["global_roles"].append("plan_recovery")
+        binding = album.settings.get("memory_maintenance", {}).get("binding", {})
+        if binding.get("mode") == "preset" and binding.get("preset_id") in result:
+            result[binding["preset_id"]]["global_roles"].append("memory_maintenance")
         return result
 
     def workspace(self, settings):
@@ -403,6 +410,8 @@ class MemoryModels:
                 raise MemoryModelError("此连接仍被使用，请先更换用途绑定")
             if item:
                 for role in active["global_roles"]:
+                    if role == "plan_recovery":
+                        continue
                     data[role].update(
                         {
                             k: v
@@ -531,7 +540,7 @@ class MemoryModels:
                 if (
                     old
                     and old.get("type") != item["type"]
-                    and self.usage(data).get(item["id"], {}).get("usage_count")
+                    and any(self.usage(data).get(item["id"], {}).get(key) for key in ("usage_count", "global_roles"))
                 ):
                     raise MemoryModelError("此连接正在使用，不能更改模型类型")
                 for target in MODELS:
@@ -574,7 +583,7 @@ class MemoryModels:
                     raise MemoryModelError("连接不存在")
                 if (
                     any(data[r].get("preset_id") == item["id"] for r in MODELS)
-                    or self.usage(data)[item["id"]]["usage_count"]
+                    or any(self.usage(data)[item["id"]][key] for key in ("usage_count", "global_roles"))
                 ):
                     raise MemoryModelError("此连接仍被使用，请先更换用途绑定")
                 presets.remove(item)
@@ -726,6 +735,77 @@ class MemoryModels:
                 raise MemoryModelError("此模型使用当前聊天连接")
             return self._legacy_config(role, data)
         raise MemoryModelError("此用途未选择插件内的独立连接")
+
+    def resolve_plan_assistant(self, scope, cid, config=None):
+        """Resolve only this task's saved binding; no ensure, history or I/O."""
+        album = self.store.restore_guard.store
+        with self.store.lock:
+            policy = copy.deepcopy(config if config is not None else album.settings.get("plan_recovery", {}))
+            if policy.get("assistant_enabled") is not True:
+                raise MemoryModelError("ASSISTANT_DISABLED")
+            binding = policy.get("assistant_binding", {"mode": "summary"})
+            settings = {"model_bindings": {"summary": binding}}
+            if binding == {"mode": "summary"}:
+                row = self.store.db.execute("SELECT settings FROM mem_chats WHERE scope=? AND cid=?", (scope, cid)).fetchone()
+                if row is None:
+                    raise MemoryModelError("ASSISTANT_UNAVAILABLE")
+                settings = json.loads(row[0])
+            try:
+                effective = settings.get("model_bindings", {}).get("summary", {})
+                if effective.get("mode") != "preset" or not effective.get("preset_id"):
+                    raise MemoryModelError("ASSISTANT_UNAVAILABLE")
+                selected = self._selected_config("summary", settings, self.private())
+                if not all(selected.get(key) for key in ("base_url", "model", "api_key")):
+                    raise MemoryModelError("ASSISTANT_UNAVAILABLE")
+                endpoint(selected["base_url"])
+            except (MemoryModelError, KeyError, TypeError, ValueError):
+                raise MemoryModelError("ASSISTANT_UNAVAILABLE") from None
+            identity = [scope, cid, binding, effective,
+                        {key: selected.get(key) for key in ("base_url", "model", "api_key", "max_context_tokens")}]
+            signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            return MemoryModel("assistant", selected), signature
+
+    def plan_assistant_signature(self, scope, cid):
+        return self.resolve_plan_assistant(scope, cid)[1]
+
+    def resolve_maintenance(self, scope, cid, config=None, *, manual=False):
+        """Freeze a shared text connection for one exact existing chat, read-only."""
+        from ..store import memory_maintenance_settings
+
+        album = self.store.restore_guard.store
+        with self.store.lock:
+            policy = memory_maintenance_settings(config if config is not None else album.settings.get("memory_maintenance"))
+            if not policy["enabled"]:
+                raise MemoryModelError("MAINTENANCE_DISABLED")
+            row = self.store.db.execute("SELECT enabled,settings FROM mem_chats WHERE scope=? AND cid=?", (scope, cid)).fetchone()
+            if row is None or not row["enabled"]:
+                raise MemoryModelError("MAINTENANCE_DISABLED")
+            chat = json.loads(row["settings"])
+            if not manual and (not policy["auto_after_summary"] or chat.get("maintenance_paused", False)):
+                raise MemoryModelError("MAINTENANCE_PAUSED")
+            binding = policy["binding"]
+            effective = chat.get("model_bindings", {}).get("summary", {}) if binding == {"mode": "summary"} else binding
+            try:
+                if effective.get("mode") != "preset" or not effective.get("preset_id"):
+                    raise MemoryModelError("MAINTENANCE_UNAVAILABLE")
+                selected = self._selected_config("summary", {"model_bindings": {"summary": effective}}, self.private())
+                window = selected.get("max_context_tokens", 32000)
+                if not all(selected.get(key) for key in ("base_url", "model", "api_key")) or type(window) is not int or not 1024 <= window <= 2_000_000:
+                    raise MemoryModelError("MAINTENANCE_UNAVAILABLE")
+                endpoint(selected["base_url"])
+                character = album.character_for(scope)["id"]
+            except (AlbumError, KeyError, TypeError, ValueError):
+                raise MemoryModelError("MAINTENANCE_UNAVAILABLE") from None
+            signature_policy = {key: policy[key] for key in ("enabled", "binding", "max_calls", "unit_timeout", "manual_timeout")}
+            if not manual:
+                signature_policy.update(auto_after_summary=policy["auto_after_summary"], maintenance_paused=chat.get("maintenance_paused", False))
+            identity = [scope, cid, character, effective, signature_policy, chat.get("summary_timeout", 180),
+                {key: selected.get(key) for key in ("id", "base_url", "api_key", "model", "max_context_tokens")}]
+            signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            return MemoryModel("assistant", copy.deepcopy(selected)), signature
+
+    def maintenance_signature(self, scope, cid, *, manual=False):
+        return self.resolve_maintenance(scope, cid, manual=manual)[1]
 
     def get(self, role, *, draft=None, settings=None):
         data = draft or self.private()

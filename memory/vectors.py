@@ -19,8 +19,11 @@ import array
 import asyncio
 import hashlib
 import math
+import json
+from dataclasses import dataclass
 
 from . import core
+from .models import MemoryModels
 
 BATCH = 32  # texts per embedding request
 # People are always given to the chat model in full, so they are not searched.
@@ -72,10 +75,23 @@ def cosine(a, b) -> float:
     return dot / norm if norm else 0.0
 
 
+@dataclass
+class PendingRefresh:
+    model: object
+    rebuild: bool
+    on_done: object
+    signature: str
+    guard: tuple
+
+
 class VectorIndex:
     def __init__(self, store):
         self.store = store
+        self.models = MemoryModels(store)
         self.running: dict[tuple[str, str], asyncio.Task] = {}
+        self.pending: dict[tuple[str, str], PendingRefresh] = {}
+        self._versions: dict[tuple[str, str], str] = {}
+        self._closed = False
         with store.transaction():
             store.db.execute(
                 "CREATE TABLE IF NOT EXISTS mem_vectors("
@@ -167,37 +183,94 @@ class VectorIndex:
         with self.store.transaction():
             self.store.db.execute("DELETE FROM mem_vectors WHERE scope=? AND cid=?", (scope, cid))
 
+    def _refresh_marker(self, scope, cid, model):
+        """Keep only digests and identity guards while an older worker finishes."""
+        with self.store.lock:
+            state = self.store.state(scope, cid)
+            settings = state["settings"]
+            items = item_texts(self.store.memory(scope, cid))
+            signature = hashlib.sha256(json.dumps([model.identity, sorted(
+                (item, digest(text)) for item, (_, text) in items.items()
+            )], separators=(",", ":")).encode()).hexdigest()
+            # A stable preset ID does not freeze its endpoint, credentials or
+            # model. Re-resolve these at completion before using a queued client.
+            guard = (self.store.restore_guard.epoch, state["maintenance_epoch"],
+                     settings["vector_enabled"], json.dumps(
+                         (settings.get("model_bindings") or {}).get("embedding"), sort_keys=True),
+                     self.models.signature("embedding", settings=settings))
+        return signature, guard
+
     @managed
-    def start(self, scope, cid, model, *, rebuild=False, on_done=None):
+    def start(self, scope, cid, model, *, rebuild=False, on_done=None, coalesce=False):
+        """Run once per chat; coalesce actual later changes into one successor.
+
+        A failure does not create a refresh intent. Only a newer requested text
+        version (or explicit rebuild) may cause a successor, which reads current
+        memory when it starts. Pending data contains no memory/source bodies.
+        """
+        if self._closed:
+            return False
         self.store.restore_guard.check_chat(scope, cid)
         self.store.restore_guard.external_allowed()
-        """Run sync in the background once per chat. Returns False if one is running."""
         key = (scope, cid)
+        signature, guard = self._refresh_marker(scope, cid, model)
         if key in self.running:
+            if coalesce:
+                if signature != self._versions[key] or rebuild:
+                    self.pending[key] = PendingRefresh(model, rebuild, on_done, signature, guard)
+                else:
+                    # Reverting the content while the original worker runs needs
+                    # no second request; preserve only a requested full rebuild.
+                    previous = self.pending.get(key)
+                    if not previous or not previous.rebuild:
+                        self.pending.pop(key, None)
             return False
 
         async def run():
             try:
                 result = await self.sync(scope, cid, model, rebuild=rebuild)
-                if on_done:
-                    on_done(result, None)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 if on_done:
                     on_done(None, error)
+            else:
+                if on_done:
+                    on_done(result, None)
 
         task = asyncio.create_task(run())
         self.running[key] = task
-        task.add_done_callback(lambda _: self.running.pop(key, None))
+        self._versions[key] = signature
+
+        def finished(done):
+            if self.running.get(key) is not done:
+                return
+            self.running.pop(key)
+            previous = self._versions.pop(key)
+            pending = self.pending.pop(key, None)
+            if not pending or self._closed or done.cancelled():
+                return
+            try:
+                current, guard = self._refresh_marker(scope, cid, pending.model)
+                if guard != pending.guard or not guard[2] or (current == previous and not pending.rebuild):
+                    return
+                self.start(scope, cid, pending.model, rebuild=pending.rebuild, on_done=pending.on_done)
+            except Exception as error:
+                if pending.on_done:
+                    pending.on_done(None, error)
+
+        task.add_done_callback(finished)
         return True
 
     async def close(self):
+        self._closed = True
+        self.pending.clear()
         tasks = list(self.running.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self.running.clear()
+        self._versions.clear()
 
     # ------------------------------------------------------------ search --
 

@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PIL import Image, UnidentifiedImageError
 
 FORMAT = "companion-plugin-backup"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAGIC = b"CJBACKUP"
 ENVELOPE_VERSION = 1
 KDF_ITERATIONS = 600_000
@@ -238,7 +238,7 @@ def _check_manifest(value: dict, encrypted: bool) -> None:
     if (
         not isinstance(value, dict) or set(value) != MANIFEST_KEYS
         or value.get("format") != FORMAT or type(value.get("schema_version")) is not int
-        or value["schema_version"] != SCHEMA_VERSION
+        or value["schema_version"] not in (1, SCHEMA_VERSION)
     ):
         raise BackupError("FORMAT_UNSUPPORTED")
     if (

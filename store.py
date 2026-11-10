@@ -5,6 +5,7 @@ from __future__ import annotations
 from .restore_guard import RestoreGuard, managed
 
 import hashlib
+import copy
 import io
 import json
 import os
@@ -25,7 +26,13 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 MAX_BYTES = 20 * 1024 * 1024
 MAX_PIXELS = 32_000_000
 SCENE_TTL = 24 * 60 * 60
+PLAN_RECOVERY_DEFAULTS = {"extra_attempts": 2, "total_timeout": 300,
+                          "assistant_enabled": False, "assistant_binding": {"mode": "summary"}}
+MEMORY_MAINTENANCE_DEFAULTS = {"enabled": False, "auto_after_summary": False,
+    "binding": {"mode": "summary"}, "max_calls": 3, "unit_timeout": 300, "manual_timeout": 1800}
 DEFAULT_SETTINGS = {
+    "plan_recovery": PLAN_RECOVERY_DEFAULTS,
+    "memory_maintenance": MEMORY_MAINTENANCE_DEFAULTS,
     "base_url": "",
     "api_key": "",
     "model": "",
@@ -55,6 +62,49 @@ DEFAULT_SETTINGS = {
 
 class AlbumError(Exception):
     """An error safe to display without provider payloads or secrets."""
+
+
+def plan_recovery_settings(value=None):
+    """One strict policy contract for saved settings and portable backups."""
+    if value is None:
+        return copy.deepcopy(PLAN_RECOVERY_DEFAULTS)
+    if not isinstance(value, dict) or set(value) - set(PLAN_RECOVERY_DEFAULTS):
+        raise AlbumError("朝夕生成恢复设置格式不正确")
+    result = {**copy.deepcopy(PLAN_RECOVERY_DEFAULTS), **copy.deepcopy(value)}
+    for field, low, high in (("extra_attempts", 0, 5), ("total_timeout", 30, 1200)):
+        if type(result[field]) is not int or not low <= result[field] <= high:
+            raise AlbumError("朝夕额外生成次数须为0至5的整数，总时限须为30至1200秒的整数")
+    binding = result["assistant_binding"]
+    if type(result["assistant_enabled"]) is not bool or not isinstance(binding, dict):
+        raise AlbumError("朝夕助手开关或连接格式不正确")
+    if binding == {"mode": "summary"}:
+        return result
+    if (set(binding) != {"mode", "preset_id"} or binding.get("mode") != "preset"
+        or not isinstance(binding.get("preset_id"), str) or not 1 <= len(binding["preset_id"]) <= 128):
+        raise AlbumError("请选择跟随任务聊天总结或已有文本连接")
+    return result
+
+
+def memory_maintenance_settings(value=None):
+    """Strict shared maintenance policy; legacy assistant options are ignored."""
+    if value is None:
+        return copy.deepcopy(MEMORY_MAINTENANCE_DEFAULTS)
+    if not isinstance(value, dict) or set(value) - set(MEMORY_MAINTENANCE_DEFAULTS):
+        raise AlbumError("记忆维护助手设置格式不正确")
+    result = {**copy.deepcopy(MEMORY_MAINTENANCE_DEFAULTS), **copy.deepcopy(value)}
+    if any(type(result[key]) is not bool for key in ("enabled", "auto_after_summary")):
+        raise AlbumError("记忆维护助手开关格式不正确")
+    for key, low, high in (("max_calls", 1, 6), ("unit_timeout", 30, 1200), ("manual_timeout", 30, 7200)):
+        if type(result[key]) is not int or not low <= result[key] <= high:
+            raise AlbumError("记忆维护助手次数或时限超出范围")
+    binding = result["binding"]
+    if binding != {"mode": "summary"} and (
+        not isinstance(binding, dict) or set(binding) != {"mode", "preset_id"}
+        or binding.get("mode") != "preset" or not isinstance(binding.get("preset_id"), str)
+        or not 1 <= len(binding["preset_id"]) <= 128
+    ):
+        raise AlbumError("请选择跟随本聊天总结或已有文本连接")
+    return result
 
 
 def now() -> int:
@@ -204,11 +254,13 @@ class Store:
             CREATE INDEX IF NOT EXISTS records_plan_run ON records(kind,json_extract(data,'$.plan_id'),json_extract(data,'$.at'));
         """)
         self.settings_path = self.root / "settings.json"
-        self.settings = dict(DEFAULT_SETTINGS)
+        self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         if self.settings_path.exists():
             self.settings.update(
                 json.loads(self.settings_path.read_text(encoding="utf-8"))
             )
+        self.settings["plan_recovery"] = plan_recovery_settings(self.settings.get("plan_recovery"))
+        self.settings["memory_maintenance"] = memory_maintenance_settings(self.settings.get("memory_maintenance"))
 
     def close(self):
         with self.lock:
@@ -845,6 +897,29 @@ class Store:
                 and patch["settings_revision"] != settings["settings_revision"]
             ):
                 raise AlbumError("设置已在其他页面或切站后改变，请刷新再保存")
+            if "plan_recovery" in patch:
+                if not isinstance(patch["plan_recovery"], dict):
+                    raise AlbumError("朝夕生成恢复设置格式不正确")
+                settings["plan_recovery"] = plan_recovery_settings(patch["plan_recovery"])
+                binding = settings["plan_recovery"]["assistant_binding"]
+                if binding["mode"] == "preset":
+                    present = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_model_settings'").fetchone()
+                    row = self.db.execute("SELECT data FROM memory_model_settings WHERE id=1").fetchone() if present else None
+                    presets = json.loads(row[0]).get("presets", []) if row else []
+                    if not any(p.get("id") == binding["preset_id"] and p.get("type") == "chat" for p in presets):
+                        raise AlbumError("朝夕助手引用的文本连接不存在，请重新选择")
+            if "memory_maintenance" in patch:
+                if not isinstance(patch["memory_maintenance"], dict):
+                    raise AlbumError("记忆维护助手设置格式不正确")
+                settings["memory_maintenance"] = memory_maintenance_settings(patch["memory_maintenance"])
+                policy = settings["memory_maintenance"]
+                if policy["enabled"] and policy["binding"]["mode"] == "preset":
+                    present = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_model_settings'").fetchone()
+                    row = self.db.execute("SELECT data FROM memory_model_settings WHERE id=1").fetchone() if present else None
+                    presets = json.loads(row[0]).get("presets", []) if row else []
+                    selected = next((p for p in presets if p.get("id") == policy["binding"]["preset_id"] and p.get("type") == "chat"), {})
+                    if not all(selected.get(key) for key in ("base_url", "model", "api_key")):
+                        raise AlbumError("记忆维护助手引用的文本连接不可用，请补齐连接")
             for key in (
                 "base_url",
                 "model",

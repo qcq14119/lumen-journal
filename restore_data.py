@@ -521,7 +521,7 @@ def _save_record(db, kind, identifier, value, revision):
 def _remove_chat(db, scope, cid):
     db.execute("DELETE FROM mem_turn_images WHERE turn_id IN (SELECT id FROM mem_turns WHERE scope=? AND cid=?)", (scope, cid))
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    for table in ("mem_chats", "mem_turns", "mem_turn_aliases", "mem_images", "mem_batches", "mem_snapshots", "mem_results", "mem_vectors"):
+    for table in ("mem_chats", "mem_turns", "mem_turn_aliases", "mem_images", "mem_batches", "mem_snapshots", "mem_results", "mem_vectors", "mem_item_guards", "mem_maintenance_runs"):
         if table in tables:
             db.execute(f"DELETE FROM {table} WHERE scope=? AND cid=?", (scope, cid))
 
@@ -670,6 +670,119 @@ def _map_bindings(settings, connections):
     return result
 
 
+def _maintenance_maps(source, mapping, owner):
+    # A new restore generation cannot accept a pre-restore in-flight candidate.
+    def mapped(kind, value):
+        return _identifier(mapping["plan_id"], kind, _json([owner, value])) if value else ""
+    def epoch(value):
+        return mapped("maintenance-epoch", value or "legacy")
+    def run_id(value):
+        row = source.execute("SELECT json_extract(payload,'$.epoch'),json_extract(payload,'$.state') FROM source "
+            "WHERE name='mem_maintenance_runs' AND identity=? AND owner=?", (value, owner)).fetchone() if value else None
+        # MaintenanceStore compacts to exactly one marker per live epoch. Its
+        # restored identity must follow that same rule, including references.
+        if row and row[1] == "expired":
+            return "expired:" + epoch(row[0])
+        return mapped("maintenance-run", value)
+    return epoch, run_id
+
+
+def _restore_maintenance(source, target, mapping, owner, scope, cid, row, original, memory, batch, turn, cancel):
+    from .memory.maintenance_store import fingerprint
+    def projected(value):
+        # v1 permits omitted empty collections. Fill only this lookup, never
+        # rewrite the original memory JSON or invent provenance for it.
+        result = {(c, item["id"]): item for c in _COLLECTIONS for item in value.get(c, []) if isinstance(item.get("id"), str)}
+        result.update({("overview", "overview"): value.get("overview", ""), ("keywords", "keywords"): value.get("keywords", [])})
+        return result
+    epoch, run_id = _maintenance_maps(source, mapping, owner)
+    current_epoch = epoch(row.get("maintenance_epoch", ""))
+    old_items = projected(json.loads(row["memory"]))
+    if not original:
+        # Semantic continuation is a new, protected baseline; old proof and
+        # inverse receipts remain only in the original authenticated archive.
+        for (collection, identifier), value in projected(memory).items():
+            data = {"sources": [], "source_complete": False, "legacy_unverified": True, "protected": True,
+                    "last_writer": {"kind": "legacy", "id": ""}, "dependencies": []}
+            _insert(target, "mem_item_guards", {"scope": scope, "cid": cid, "epoch": current_epoch,
+                "collection": collection, "item_id": identifier, "version": 1, "content_hash": fingerprint(value), "data": _json(data)})
+        return
+
+    def writer(value):
+        result = copy.deepcopy(value)
+        if result["kind"] == "summary":
+            result["id"] = batch(result["id"])
+        elif result["kind"] in ("maintenance", "undo"):
+            result["id"] = run_id(result["id"])
+        return result
+
+    def proof(value):
+        result = copy.deepcopy(value)
+        result["turn_id"] = turn(result["turn_id"])
+        result["batch"] = batch(result.get("batch"))
+        # Content evidence hashes are deliberately immutable. Missing or stale
+        # source evidence must remain stale after ID/ownership mapping.
+        return result
+
+    def refs(value):
+        result = copy.deepcopy(value)
+        for field in ("dependencies", "batches"):
+            if field in result:
+                result[field] = [batch(i) for i in result[field]]
+        if "sources" in result:
+            result["sources"] = [proof(i) if isinstance(i, dict) else turn(i) for i in result["sources"]]
+        for field in ("last_writer", "previous_writer"):
+            if field in result:
+                result[field] = writer(result[field])
+        return result
+
+    def mapped_hash(digest, collection, candidates):
+        for candidate in candidates:
+            if digest == fingerprint(candidate):
+                mapped = _map_item(candidate, collection, batch) if isinstance(candidate, dict) and collection in _COLLECTIONS else candidate
+                return fingerprint(mapped)
+        return digest  # Never turn a failed source identity into a valid one.
+
+    for saved in _rows(source, "mem_item_guards", owner):
+        check_cancel(cancel)
+        collection, identifier = saved["collection"], saved["item_id"]
+        digest = mapped_hash(saved["content_hash"], collection, [old_items.get((collection, identifier))])
+        _insert(target, "mem_item_guards", {**saved, "scope": scope, "cid": cid, "epoch": epoch(saved["epoch"]),
+            "content_hash": digest, "data": _json(refs(json.loads(saved["data"])))} )
+    for saved in _rows(source, "mem_maintenance_runs", owner):
+        check_cancel(cancel)
+        old = json.loads(saved["payload"])
+        payload = refs(old)
+        for change in payload.get("changes", []):
+            change.update(refs(change))
+            change["hash"] = mapped_hash(change["hash"], change["collection"], [change["before"]])
+            for part in ("before", "after"):
+                change[part] = _map_item(change[part], change["collection"], batch)
+        for expected in payload.get("undo_expected", []):
+            key = (expected["collection"], expected["id"])
+            candidates = [old_items.get(key)]
+            candidates.extend(c[part] for c in old.get("changes", []) if (c["collection"], c["id"]) == key for part in ("before", "after"))
+            expected["hash"] = mapped_hash(expected["hash"], key[0], candidates)
+        if "evidence" in payload:
+            payload["evidence"] = [proof(p) for p in payload["evidence"]]
+        if "expected" in payload:
+            expected = payload["expected"]
+            expected["epoch"] = epoch(expected.get("epoch", saved["epoch"]))
+            if expected.get("source_upper"):
+                expected["source_upper"] = turn(expected["source_upper"])
+            for item in expected.get("items", []):
+                item.update(refs(item))
+                if "hash" in item:
+                    candidates = [item.get("value"), old_items.get((item["collection"], item["id"]))]
+                    item["hash"] = mapped_hash(item["hash"], item["collection"], candidates)
+                if "value" in item:
+                    if item["collection"] in _COLLECTIONS:
+                        item["value"] = _map_item(item["value"], item["collection"], batch)
+        state = "interrupted" if saved["state"] in ("queued", "reading", "requesting", "validating", "committing") else saved["state"]
+        _insert(target, "mem_maintenance_runs", {**saved, "id": run_id(saved["id"]), "task_id": run_id(saved["task_id"]),
+            "scope": scope, "cid": cid, "epoch": epoch(saved["epoch"]), "state": state, "payload": _json(payload)})
+
+
 def _apply_memory(source, target, mapping, connections, pending, cancel):
     for item in mapping["chats"]:
         if item["mode"] == "archive":
@@ -688,8 +801,10 @@ def _apply_memory(source, target, mapping, connections, pending, cancel):
         _remove_chat(target, scope, cid)
         settings = _map_bindings(json.loads(row["settings"]), connections)
         memory = map_memory(json.loads(row["memory"]), batch, baseline=not original)
+        epoch, run_id = _maintenance_maps(source, mapping, owner)
         new_row = {**row, "scope": scope, "cid": cid, "enabled": 0, "revision": item["revision"], "generation": item["generation"],
-                   "settings": _json(settings), "memory": _json(memory), "next_ordinal": row["next_ordinal"] if original else 1}
+                   "settings": _json(settings), "memory": _json(memory), "next_ordinal": row["next_ordinal"] if original else 1,
+                   "maintenance_epoch": epoch(row.get("maintenance_epoch", ""))}
         _insert(target, "mem_chats", new_row)
         if original:
             for table in ("mem_turns", "mem_batches", "mem_images", "mem_turn_aliases", "mem_snapshots"):
@@ -699,7 +814,8 @@ def _apply_memory(source, target, mapping, connections, pending, cancel):
                     if table == "mem_turns":
                         value.update(id=turn(saved["id"]), batch=batch(saved["batch"]))
                     elif table == "mem_batches":
-                        value.update(id=batch(saved["id"]), diff=_json(map_diff(json.loads(saved["diff"]), batch)))
+                        value.update(id=batch(saved["id"]), diff=_json(map_diff(json.loads(saved["diff"]), batch)),
+                                     maintenance_claim=run_id(saved.get("maintenance_claim", "")))
                     elif table == "mem_turn_aliases":
                         value["turn_id"] = turn(saved["turn_id"])
                     elif table == "mem_snapshots":
@@ -713,6 +829,7 @@ def _apply_memory(source, target, mapping, connections, pending, cancel):
                 source_turn = _get(source, "mem_turns", saved["turn_id"])
                 if source_turn and chat_key(source_turn["scope"], source_turn["cid"]) == owner:
                     _insert(target, "mem_turn_images", {**saved, "turn_id": turn(saved["turn_id"])})
+        _restore_maintenance(source, target, mapping, owner, scope, cid, row, original, memory, batch, turn, cancel)
         pending.append({"kind": "memory", "id": chat_key(scope, cid), "scope": scope, "cid": cid,
                         "intent": {"enabled": bool(row["enabled"]), "mode": item["mode"], "source_scope": row["scope"],
                                    "source_cid": row["cid"], "retention_days": settings.get("retention_days", 30),
@@ -738,6 +855,17 @@ def _apply_settings(source, current, mapping, pending):
     _need(len(rows) == 1)
     incoming = _data(rows[0])
     value = _key_slots(incoming, mapping["archive_id"], "primary")
+    from .store import memory_maintenance_settings, plan_recovery_settings
+    value["plan_recovery"] = plan_recovery_settings(value.get("plan_recovery"))
+    binding = value["plan_recovery"]["assistant_binding"]
+    if binding["mode"] == "preset":
+        old = binding["preset_id"]
+        binding["preset_id"] = mapping["connections"].get("presets", {}).get(old) or _identifier(mapping["archive_id"], "model", old)
+    value["memory_maintenance"] = memory_maintenance_settings(value.get("memory_maintenance"))
+    binding = value["memory_maintenance"]["binding"]
+    if binding["mode"] == "preset":
+        old = binding["preset_id"]
+        binding["preset_id"] = mapping["connections"].get("presets", {}).get(old) or _identifier(mapping["archive_id"], "model", old)
     reuse = mapping["connections"].get("providers", {})
     current_providers = {"primary": current, **{p["id"]: p for p in current.get("providers", [])}}
     source_providers = {"primary": incoming, **{p["id"]: p for p in incoming.get("providers", [])}}
@@ -776,6 +904,11 @@ def _apply_settings(source, current, mapping, pending):
             value[field] = False
     for item in value["providers"]:
         item["enabled"] = False
+    intent["plan_assistant_enabled"] = value["plan_recovery"]["assistant_enabled"]
+    value["plan_recovery"]["assistant_enabled"] = False
+    intent["memory_maintenance_enabled"] = value["memory_maintenance"]["enabled"]
+    intent["memory_maintenance_auto"] = value["memory_maintenance"]["auto_after_summary"]
+    value["memory_maintenance"].update(enabled=False, auto_after_summary=False)
     pending.append({"kind": "settings", "id": "global", "intent": intent})
     return value
 

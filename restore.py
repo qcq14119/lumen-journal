@@ -606,6 +606,42 @@ class Restores:
                 errors.append("CREDENTIALS_REQUIRED")
         return errors
 
+    async def _plan_assistant_dependencies(self, settings):
+        """Check only configured task owners, without selecting another chat."""
+        binding = settings.get("plan_recovery", {}).get("assistant_binding", {"mode": "summary"})
+        if binding.get("mode") == "preset":
+            return self._memory_dependencies({"model_bindings": {"summary": binding}})
+        with self.store.lock:
+            rows = self.store.db.execute("SELECT id,data FROM records WHERE kind='life_plan' "
+                "AND json_extract(data,'$.archived') IS NOT 1 LIMIT 201").fetchall()
+            pending = self.store.db.execute("SELECT json_extract(data,'$.target_id') FROM records "
+                "WHERE kind='restore_pending' AND json_extract(data,'$.kind')='life_plan' "
+                "AND json_extract(data,'$.intent.enabled')=1 LIMIT 201").fetchall()
+        if len(rows) > 200 or len(pending) > 200:
+            return ["RESTORE_CATALOG_LIMIT"]
+        enabled_pending = {row[0] for row in pending}
+        owners, errors = set(), []
+        for row in rows:
+            plan = json.loads(row["data"])
+            if plan.get("enabled") or row["id"] in enabled_pending:
+                owners.add((plan.get("scope", ""), plan.get("origin_cid", "")))
+        for scope, cid in owners:
+            if scope and not cid:
+                try:
+                    cid = await self.plugin.context.conversation_manager.get_curr_conversation_id(scope)
+                except (AttributeError, ValueError, KeyError):
+                    cid = ""
+            with self.store.lock:
+                exists = self.store.db.execute("SELECT 1 FROM sqlite_master WHERE name='mem_chats'").fetchone()
+                row = self.store.db.execute("SELECT settings FROM mem_chats WHERE scope=? AND cid=?", (scope, cid)).fetchone() if exists else None
+            policy = json.loads(row[0]) if row else {}
+            chosen = policy.get("model_bindings", {}).get("summary", {})
+            if chosen.get("mode") != "preset" or not chosen.get("preset_id"):
+                errors.append("CREDENTIALS_REQUIRED")
+            else:
+                errors += self._memory_dependencies({"model_bindings": {"summary": chosen}})
+        return errors
+
     def _session_binding_conflicts(self, values):
         """Return target character ids whose final session bindings collide."""
         with self.store.lock:
@@ -733,6 +769,12 @@ class Restores:
                     wanted = intent.get("primary_enabled") if provider["id"] == "primary" else intent.get("providers", {}).get(provider["id"])
                     if wanted and not all(provider.get(field) for field in ("base_url", "model", "api_key")):
                         errors.append("CREDENTIALS_REQUIRED")
+                if intent.get("plan_assistant_enabled"):
+                    errors += await self._plan_assistant_dependencies(settings)
+                if intent.get("memory_maintenance_enabled"):
+                    binding = settings.get("memory_maintenance", {}).get("binding", {"mode": "summary"})
+                    if binding.get("mode") == "preset":
+                        errors += self._memory_dependencies({"model_bindings": {"summary": binding}})
             elif kind == "calendar":
                 with self.store.lock:
                     row = self.store.db.execute("SELECT revision FROM records WHERE kind='calendar' AND id='default'").fetchone()
@@ -822,6 +864,11 @@ class Restores:
                                 settings[field] = intent[field]
                             for provider in settings.get("providers", []):
                                 provider["enabled"] = intent["providers"].get(provider["id"], False)
+                            if "plan_recovery" in settings:
+                                settings["plan_recovery"]["assistant_enabled"] = bool(intent.get("plan_assistant_enabled", False))
+                            if "memory_maintenance" in settings:
+                                settings["memory_maintenance"].update(enabled=bool(intent.get("memory_maintenance_enabled", False)),
+                                    auto_after_summary=bool(intent.get("memory_maintenance_auto", False)))
                             settings["settings_revision"] = settings.get("settings_revision", 0) + 1
                         self.store.db.execute("DELETE FROM records WHERE kind='restore_pending' AND id=?", (value["pending_id"],))
                 journal.atomic_json(self.store.settings_path, settings)

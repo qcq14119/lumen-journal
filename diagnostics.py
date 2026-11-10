@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .store import AlbumError, now
+from .store import AlbumError, PLAN_RECOVERY_DEFAULTS, now
 from .memory.store import DEFAULTS
 from .memory.models import MODELS, MemoryResponseError
+from .memory.maintenance_protocol import CODES as MAINTENANCE_CODES
 from .plans import DAY_MODES
+from .continuity import SAFE_CODES, SAFE_STAGES, SAFE_STATUSES, safe_counts
 
 MAX_EVENTS = 5000
 MAX_BYTES = 5 * 1024 * 1024
@@ -37,18 +39,16 @@ STATES = {
     "image_described", "image_failed", "indexed", "index_failed", "recalled",
     "recall_fallback", "recall_failed", "inject_failed", "imported", "undone", "restored",
     "copied", "cleared", "download_failed", "complete", "completed", "waiting", "abandoned",
+    "maintenance_completed", "maintenance_failed", "maintenance_cancelled", "maintenance_stale", "maintenance_partial",
 }
 PHOTO_CODES = {
     "PHOTO_DISABLED", "PHOTO_NO_SCENE", "PHOTO_ENGINE_UNAVAILABLE", "TIMER_ONLY",
     "PHOTO_SUBMIT_FAILED", "PHOTO_TASK_CREATED",
 }
-CODES = PHOTO_CODES | {
-    "TIMEOUT", "CONNECTION", "STORAGE", "VALIDATION", "INTERNAL", "PROTOCOL_THOUGHT",
-    "PROTOCOL_STRUCTURE", "PROTOCOL_JSON", "PROTOCOL_FIELDS",
-}
+CODES = SAFE_CODES
 RECALL_STATES = {"recalled", "recall_fallback", "recall_failed", "indexed", "index_failed"}
 FAILED_STATES = {"failed", "summary_failed", "image_failed", "recall_failed", "recall_fallback", "index_failed", "inject_failed"}
-STAGES = {"generation", "validation", "sending", "history", "photo", "follow_up"}
+STAGES = SAFE_STAGES
 ATTEMPT_CODES = {"authentication", "rate_limit", "http_error", "poll_timeout", "too_large", "redirect_limit", "local_wait_cancelled", "unsupported", "failed", "TimeoutError", "OSError", "ValueError", "ClientError", "ClientConnectorError", "ClientConnectionError", "ServerDisconnectedError", "ClientPayloadError", "ClientConnectorCertificateError", "ClientConnectorSSLError", "ConnectionTimeoutError", "SocketTimeoutError", "UnidentifiedImageError", "DecompressionBombWarning", "DecompressionBombError"}
 MEMORY_FEATURES = {k for k, v in DEFAULTS.items() if type(v) in (bool, int, float)}
 PLAN_FEATURES = {"enabled", "timezone", "cron", "window_before", "window_after", "photo_mode", "contact_mode", "run_once", "day_mode"}
@@ -102,6 +102,18 @@ def _field(path, alias=None, column="data", limit=MAX_TEXT):
 
 def _memory_diagnostic(state, detail):
     """Accept only a complete diagnostic previously emitted by our serializer."""
+    if state.startswith("maintenance_") and isinstance(detail, str):
+        try:
+            value = json.loads(detail)
+        except ValueError:
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        counts = {k: v for k, v in value.items() if k in {"calls", "checked", "modified", "findings", "not_checked",
+            "input_tokens", "output_tokens", "tokens_estimated", "source_turns", "tool_calls", "elapsed_ms",
+            "max_calls", "window", "unit_timeout", "manual_timeout"}
+            and type(v) is int and 0 <= v <= 10**9}
+        return {"reason": value.get("code") if value.get("code") in MAINTENANCE_CODES else "NOT_RECORDED", **counts}
     if state not in {"summary_failed", "retrying"} or not isinstance(detail, str):
         return {}
     attempt, delay = None, None
@@ -521,10 +533,10 @@ class Diagnostics:
                 raw = []
             if not isinstance(raw, list):
                 return result
-            for stage in raw[:20]:
+            for stage in raw[:32]:
                 if not isinstance(stage, dict) or stage.get("stage") not in STAGES:
                     continue
-                result.append({"stage": stage["stage"], "status": _enum(stage.get("status"), STATES), "code": _enum(stage.get("code"), CODES, "NOT_RECORDED"), "at": _number(stage.get("at"))})
+                result.append({"stage": stage["stage"], "status": _enum(stage.get("status"), STATES | SAFE_STATUSES), "code": _enum(stage.get("code"), CODES, "NOT_RECORDED"), "at": _number(stage.get("at")), **safe_counts(stage)})
             return result
 
         stamp = now()
@@ -610,7 +622,7 @@ class Diagnostics:
                 else:
                     condition, args = matching("scope", "cid")
                     extra, fargs = filtered("state", ["detail"], memory=True)
-                    for row in rows("SELECT id,scope,cid,at,substr(state,1,60) AS state,CASE WHEN state IN ('summary_failed','retrying') AND length(detail)<=1000 THEN detail END AS diagnostic FROM mem_logs WHERE at BETWEEN ? AND ? AND " + condition + (" AND state IN (" + ",".join("?" for _ in RECALL_STATES) + ")" if categories & {"memory", "recall"} == {"recall"} else " AND state NOT IN (" + ",".join("?" for _ in RECALL_STATES) + ")" if "recall" not in categories else "") + extra + " ORDER BY at DESC,id DESC", (start, end, *args, *(sorted(RECALL_STATES) if not {"memory", "recall"} <= categories else []), *fargs)):
+                    for row in rows("SELECT id,scope,cid,at,substr(state,1,60) AS state,CASE WHEN (state IN ('summary_failed','retrying') OR state LIKE 'maintenance_%') AND length(detail)<=1000 THEN detail END AS diagnostic FROM mem_logs WHERE at BETWEEN ? AND ? AND " + condition + (" AND state IN (" + ",".join("?" for _ in RECALL_STATES) + ")" if categories & {"memory", "recall"} == {"recall"} else " AND state NOT IN (" + ",".join("?" for _ in RECALL_STATES) + ")" if "recall" not in categories else "") + extra + " ORDER BY at DESC,id DESC", (start, end, *args, *(sorted(RECALL_STATES) if not {"memory", "recall"} <= categories else []), *fargs)):
                         events.append({"category": "recall" if row["state"] in RECALL_STATES else "memory", "kind": "memory_log", "id": ref("log", str(row["id"])), "chat": ref("chat", (row["scope"], row["cid"])), "at": _number(row["at"]), "state": _enum(row["state"], STATES), "reason": "NOT_RECORDED", "detail": "NOT_INCLUDED", **_memory_diagnostic(row["state"], row["diagnostic"])})
                 if "memory" in categories and self._table("mem_images"):
                     condition, args = matching("scope", "cid")
@@ -693,7 +705,7 @@ class Diagnostics:
         for identifier in objects["plans"]:
             if not include & {"features", "models", "plans"}:
                 continue
-            fields = sorted(PLAN_FEATURES | {"scope"} | ({"name", "instruction"} if "plans" in include else set()))
+            fields = sorted(PLAN_FEATURES | {"scope", "origin_cid"} | ({"name", "instruction"} if "plans" in include else set()))
             row = self.store.db.execute("SELECT revision," + ",".join(_field(k) for k in fields) + " FROM records WHERE kind='life_plan' AND id=?", (identifier,)).fetchone()
             if row is None:
                 missing.add("SELECTED_PLAN_UNAVAILABLE")
@@ -718,10 +730,13 @@ class Diagnostics:
                     else:
                         value = self._text(value, secrets) if isinstance(value, str) and len(value) <= 100 else None
                     item["features"][key] = value
+                item["plan_recovery"] = self._recovery_policy()
             if "plans" in include:
                 item["plan"] = {k: self._text(row[k], secrets) for k in ("name", "instruction")}
             if "models" in include:
                 item.update(host_model={}, _host_scope=row["scope"] or "")
+                item["plan_assistant"] = self._plan_assistant(row["scope"], row["origin_cid"], secrets, missing)
+                item["plan_recovery"] = self._recovery_policy()
             if len(item) > 3:
                 result.append(item)
         for identifier in objects["characters"]:
@@ -763,6 +778,8 @@ class Diagnostics:
             if "features" in include:
                 item["features"] = {k: row[k] if row and type(row[k]) in (int, float, bool) else DEFAULTS[k] for k in sorted(MEMORY_FEATURES)}
                 item["enabled"] = bool(row["enabled"]) if row else False
+                item["plan_recovery"] = self._recovery_policy()
+                item["memory_maintenance"] = self._maintenance_policy()
             if "summary_prompt" in include:
                 item["summary_prompt"] = self._text(row["summary_prompt"] if row else "", secrets)
             if "models" in include:
@@ -772,13 +789,72 @@ class Diagnostics:
                     bindings = {}
                 settings = {"model_bindings": bindings, "vector_enabled": bool(row["vector_enabled"]) if row else DEFAULTS["vector_enabled"], "assistant_enabled": bool(row["assistant_enabled"]) if row else False, **{r + "_provider_id": row[r + "_provider_id"] if row else "" for r in MODELS}}
                 item["models"] = self._memory_models(settings, secrets, missing)
+                item["models"]["plan_assistant"] = self._plan_assistant(chat["scope"], chat["cid"], secrets, missing)
+                policy = self.store.settings.get("memory_maintenance", {})
+                item["models"]["memory_maintenance"] = self._plan_assistant(chat["scope"], chat["cid"], secrets, missing,
+                    policy_override={"assistant_enabled": policy.get("enabled", False), "assistant_binding": policy.get("binding", {"mode": "summary"})})
+                item["memory_maintenance"] = self._maintenance_policy()
                 item["call_policy"] = {key: _number(row[key]) if row and row[key] is not None else DEFAULTS[key] for key in ("summary_timeout", "summary_max_retries")}
+                item["plan_recovery"] = self._recovery_policy()
                 item["_host_scope"] = chat["scope"]
             result.append(item)
         if "models" in include and (objects["plans"] or objects["characters"] or (objects["chats"] and "images" in categories)):
             sites = self.store.provider_configs()
             result.append({"object": "image_service", "availability": "CONFIGURED" if sites else "NO_USABLE_IMAGE_SITE", "collected_at": stamp, "revision": self.store.settings.get("settings_revision", 0), "policy": {k: self.store.settings.get(k) if type(self.store.settings.get(k)) in (bool, int, float) else None for k in sorted(IMAGE_POLICY)}, "sites": [self._model({**site, "type": "image"}, secrets) for site in sites]})
         return result
+
+    def _recovery_policy(self):
+        """Current global policy only, never guessed as a past run's policy."""
+        value = self.store.settings.get("plan_recovery", PLAN_RECOVERY_DEFAULTS)
+        if not isinstance(value, dict):
+            return {"availability": "FIELD_LIMIT"}
+        result = {"assistant_enabled": value.get("assistant_enabled") if type(value.get("assistant_enabled")) is bool else None}
+        for field, minimum, maximum in (("extra_attempts", 0, 5), ("total_timeout", 30, 1200)):
+            number = value.get(field, PLAN_RECOVERY_DEFAULTS[field])
+            result[field] = number if type(number) is int and minimum <= number <= maximum else None
+        return result
+
+    def _maintenance_policy(self):
+        value = self.store.settings.get("memory_maintenance", {})
+        return {field: value.get(field) if type(value.get(field)) is kind else None for field, kind in (
+            ("enabled", bool), ("auto_after_summary", bool), ("max_calls", int), ("unit_timeout", int), ("manual_timeout", int))}
+
+    def _plan_assistant(self, scope, cid, secrets, missing, *, policy_override=None):
+        policy = policy_override if policy_override is not None else self.store.settings.get("plan_recovery", PLAN_RECOVERY_DEFAULTS)
+        binding = policy.get("assistant_binding", {"mode": "summary"}) if isinstance(policy, dict) else {}
+        if not isinstance(binding, dict):
+            binding = {}
+        mode = _enum(binding.get("mode"), {"summary", "preset"})
+        info = {"binding_mode": mode, "availability": "NOT_CONFIGURED"}
+        if not isinstance(policy, dict) or policy.get("assistant_enabled") is not True:
+            return {**info, "availability": "DISABLED"}
+        if mode == "summary":
+            if not scope or not cid:
+                return {**info, "availability": "TASK_CHAT_DEPENDENT"}
+            row = self.store.db.execute("SELECT " + _field("model_bindings", column="settings", limit=8000)
+                + " FROM mem_chats WHERE scope=? AND cid=?", (scope, cid)).fetchone() if self._table("mem_chats") else None
+            if row and row[0] == FIELD_LIMIT:
+                missing.add("FIELD_LIMIT")
+                return {**info, "availability": "FIELD_LIMIT"}
+            try:
+                binding = json.loads(row[0] or "{}").get("summary", {}) if row else {}
+            except (ValueError, AttributeError, TypeError):
+                binding = {}
+        if not isinstance(binding, dict) or binding.get("mode") != "preset":
+            return info
+        if set(binding) != {"mode", "preset_id"} or not isinstance(binding.get("preset_id"), str) or not self._table("memory_model_settings"):
+            return info
+        fields = ["name", "model", "type", "base_url", "api_key", "max_context_tokens"]
+        row = self.store.db.execute("SELECT s.revision," + ",".join(_field(k, column="p.value") for k in fields)
+            + " FROM memory_model_settings s,json_each(s.data,'$.presets') p WHERE s.id=1 AND json_extract(p.value,'$.id')=? LIMIT 1",
+            (binding["preset_id"],)).fetchone()
+        if row is None or row["type"] != "chat":
+            return {**info, "availability": "CONNECTION_UNAVAILABLE"}
+        if FIELD_LIMIT in row:
+            missing.add("FIELD_LIMIT")
+            return {**info, "availability": "FIELD_LIMIT"}
+        return {**info, **self._model(dict(row), secrets), "revision": row["revision"],
+                "availability": "CONFIGURED" if row["api_key"] else "CREDENTIALS_REQUIRED"}
 
     def _model(self, config, secrets):
         return {"name": self._text(config.get("name", ""), secrets), "model": self._text(config.get("model", ""), secrets), "type": _enum(config.get("type", "chat"), {"chat", "image", "embedding", "rerank"}), "address": self._address(config.get("base_url", ""), secrets), "key_configured": bool(config.get("api_key")), **{k: _number(config[k]) if type(config[k]) in (int, float) else self._text(config[k], secrets) for k in ("size", "reference_field", "dimensions", "max_context_tokens", "timeout") if k in config}}

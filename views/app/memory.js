@@ -4,6 +4,7 @@ const ROLE_ALL = "", ROLE_NONE = "未标注";
 let mountNumber = 0;
 let pollTimer;
 let followTimer;
+let closeMaintenance = null;
 
 export function parseMemoryImport(text) {
   if (!text.trim()) throw new Error("请选择记忆文件");
@@ -25,7 +26,271 @@ function dateText(seconds) {
   return new Date(seconds * 1000).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"});
 }
 
+
+// The maintenance view owns only bounded memory metadata/results, never source bodies.
+export function openMemoryMaintenance(env) {
+  closeMaintenance?.();
+  const {bridge, showDialog, footer, escape:esc, target, isCurrent, onChange=()=>{}, openAssistantSettings}=env;
+  const settingsMarkup='<details id="mm-settings-section" class="mm-settings-section"><summary id="mm-settings">助手设置</summary><div id="mm-settings-content"></div></details>';
+  let assistantPanel=null,assistantOpening=false;
+  if (!target?.scope || !target?.cid) {
+    showDialog("记忆助手", `<div id="maintenance-empty" class="memory-dialog lj-dialog-body">${settingsMarkup}<p class="lj-muted">选择聊天后可检查记忆或查看结果。</p></div>`, footer('<button type="button" data-close>关闭</button>'));
+    const dialog=document.getElementById("dialog"),root=document.getElementById("maintenance-empty");
+    let disposed=false;
+    const valid=()=>!disposed&&isCurrent()&&dialog.open&&root.isConnected;
+    root.querySelector("#mm-settings").onclick=async event=>{
+      const section=root.querySelector("#mm-settings-section");if(section.open)return;
+      event?.preventDefault?.();section.open=true;
+      if(assistantOpening||assistantPanel)return;
+      assistantOpening=true;
+      try{const session=await openAssistantSettings?.({container:root.querySelector("#mm-settings-content"),isCurrent:valid});if(valid())assistantPanel=session;else session?.dispose();}
+      finally{assistantOpening=false;}
+    };
+    const dispose=()=>{if(disposed)return;disposed=true;assistantPanel?.dispose();dialog.removeEventListener("close",dispose);if(closeMaintenance===dispose)closeMaintenance=null;};
+    closeMaintenance=dispose;dialog.addEventListener("close",dispose,{once:true});
+    return {dispose,refresh:()=>{}};
+  }
+  const frozen={scope:target.scope,cid:target.cid};
+  const labels={events:"剧情",people:"人物",profiles:"生活档案",plans:"记忆约定",overview:"概况",keywords:"关键词"};
+  const states={queued:"等待检查",reading:"核对来源",requesting:"正在检查",validating:"校验建议",committing:"保存修正",completed:"已完成",findings_only:"只报告疑点",partial:"部分完成",cancelled:"已停止",stale:"资料已变化",failed:"检查失败",interrupted:"执行已中断",undone:"已撤销",unknown:"结果待核对"};
+  const reasons={BATCH_LIMIT:"最多选择120个批次，请减少批次选择",ITEM_MISSING:"此条记忆已删除，请关闭后重新选择",FACT:"事实核对",OWNER:"归属核对",STATUS:"状态核对",REFERENCE:"引用核对",DUPLICATE:"可能重复",UNCERTAIN:"依据不足",SCOPE:"超出修正范围",SOURCE_MISSING:"缺少完整原文",PROTECTED:"助手不自动修改",DISABLED:"助手或聊天记忆未启用",CONNECTION_MISSING:"当前聊天的助手连接不可用，请在设置中核对",CHAT_DELETED:"聊天已删除，未提交修正",HOST_METADATA_UNAVAILABLE:"聊天元数据暂不可核验，检查已停止",STALE:"资料或设置已变化，请重新预览",SOURCE_CHANGED:"来源已变化",CALL_LIMIT:"已到调用上限",TIME_LIMIT:"已到总时限",QUEUE_FULL:"等待队列已满",QUEUE_EXPIRED:"等待超时",CAPACITY:"所选范围或资料超出上限",PROTOCOL:"返回格式不符合要求",JSON_FORMAT:"返回JSON格式不正确",CONTENT_SAFETY:"内容未通过安全校验",CANCELLED:"已停止",REQUEST_FAILED:"模型请求失败",REQUEST_TIMEOUT:"模型请求超时",MODEL_AUTH:"模型鉴权失败，请检查连接",MODEL_CONFIG:"模型配置不正确",COMMIT_UNKNOWN:"提交结果待核对，请刷新",STORAGE:"结果保存失败",INTERRUPTED:"执行已中断",UNDO_UNAVAILABLE:"此单元已无法撤销，原结果已清理或没有可撤销修正",UNDO_CONFLICT:"后续修改与本单元冲突，未撤销任何记忆",MAINTENANCE_DEPENDENCY:"请先逆序撤销依赖本次总结的助手修正",MAINTENANCE_EXPIRED:"依赖的助手修正详情已清理，无法安全撤销本次总结"};
+  const reason=code=>reasons[code]||"操作未完成，请刷新核对结果";
+  const number=v=>Number.isSafeInteger(v)&&v>=0?v:0;
+  const sourceText=list=>(Array.isArray(list)?list:[]).map(source=>`轮次 ${number(source.ordinal)}${source.batch?` · 批次 ${number(source.batch)}`:""}`).join("；");
+  showDialog("记忆助手",`<div id="maintenance-dialog" class="memory-dialog lj-dialog-body lj-maintenance"><p class="lj-muted">${esc(target.title||"当前聊天")}</p><p id="mm-error" class="memory-error" role="alert" hidden></p>${settingsMarkup}<div class="lj-actions"><label class="check"><input id="mm-pause" type="checkbox">暂停此聊天的总结后自动检查</label><button type="button" class="lj-btn" id="mm-refresh">刷新结果</button></div><p id="mm-status" role="status" aria-live="polite"></p><details id="mm-scope" open><summary>选择要检查的记忆</summary><label for="mm-search">查找记忆</label><input id="mm-search" type="search" placeholder="按记忆名称查找"><div class="lj-actions"><button type="button" class="lj-btn" id="mm-select">选择可见项目</button><button type="button" class="lj-btn" id="mm-clear">清空选择</button><span id="mm-count" class="lj-muted"></span></div><p id="mm-capacity" class="memory-error" role="alert" hidden>已超过120项，请减少选择后再预览；当前选择未被截断。</p><div class="lj-actions"><button type="button" class="lj-btn" id="mm-latest" disabled>最近一次总结涉及的记忆</button><span id="mm-latest-info" class="lj-muted"></span></div><div id="mm-items" class="mm-items"></div><details id="mm-batches"><summary>或按总结批次选择实际变化</summary><div id="mm-batch-items"></div></details><label class="check"><input id="mm-apply" type="checkbox">有明确依据时应用修正</label><label class="check"><input id="mm-protected" type="checkbox" disabled>允许本次修正选中的受保护条目</label><p class="lj-muted">默认只报告疑点。最多120项，每6项为一个单元；记忆约定修正不会操作真实计划。</p><button type="button" class="lj-btn" id="mm-preview">预览范围与费用</button><div id="mm-preview-result" role="status" hidden></div><button type="button" class="lj-btn lj-btn-primary" id="mm-start" hidden>确认开始检查</button></details><div class="lj-section-head"><h3>检查结果</h3><button type="button" class="lj-btn" id="mm-stop" hidden>停止检查</button></div><div id="mm-results"></div><details id="mm-limits"><summary>保留期与处理上限</summary><p class="lj-muted">私有修正及疑点详情默认保留30天；每聊天100个单元、全局1000个单元或128MiB容量用满时，较旧的已结束详情可提前清理，撤销资料清理后不可撤销。人工保护不随详情清理。</p><p class="lj-muted">手动一次最多120项，每单元6个主项目；最多24个只读依赖、18次本地读取操作、200个完整文字轮次。请求受所选连接窗口限制，单请求16MiB、响应2MiB；超限停止或标记未检查，不截断为完整证据。费用预览只限制助手调用，相关向量更新可能另计。</p></details></div>`,footer('<button type="button" data-close>关闭</button>'));
+  const dialog=document.getElementById("dialog"),root=document.getElementById("maintenance-dialog");
+  const q=id=>root.querySelector("#mm-"+id);
+  let disposed=false,writing=false,reading=false,previewing=false,readVersion=0,serial=0,timer=null,current=null,preview=null,requestId=null,pendingStart=null,resultSignature="",itemSignature="";
+  const selected=new Set(),selectedBatches=new Set(),batchSelections=new Map();
+  const valid=()=>!disposed&&isCurrent()&&dialog.open&&root.isConnected;
+  const identity=item=>JSON.stringify([item.collection,item.id]);
+  const showError=code=>{if(valid()){q("error").textContent=reason(code);q("error").hidden=false;}};
+  const invalidate=()=>{serial++;preview=null;requestId=null;q("preview-result").textContent="";q("preview-result").hidden=true;q("start").hidden=!pendingStart;};
+  const selectedIds=()=>new Set([...selected,...[...batchSelections.values()].flat()]);
+  const count=()=>{const size=selectedIds().size;q("count").textContent=`已选 ${size} 项${selectedBatches.size?` · ${selectedBatches.size} 个批次`:""}`;q("capacity").hidden=size<=120;};
+  const updateControls=()=>{
+    q("preview").disabled=writing||previewing||!!pendingStart||!current?.enabled||!current?.configured||!!current?.running||!selectedIds().size||selectedIds().size>120;
+    q("start").disabled=writing||(!preview&&!pendingStart)||!!current?.running;
+    q("stop").hidden=!current?.running;q("stop").disabled=writing;
+    q("refresh").disabled=reading||writing;
+    for(const input of root.querySelectorAll("[data-mm-item], [data-mm-batch], [data-mm-protect]"))input.disabled=writing||!!pendingStart;
+    for(const id of ["apply","select","clear","pause","latest"])q(id).disabled=writing||!!pendingStart;
+    q("protected").disabled=writing||!!pendingStart||!q("apply").checked;
+    q("latest").disabled=writing||!!pendingStart||!current?.latest_batch;
+  };
+  const filter=()=>{
+    const query=q("search").value.trim().toLowerCase();
+    root.querySelectorAll("[data-mm-row]").forEach(row=>{row.hidden=!(row.dataset.mmSearch||"").includes(query);});
+    root.querySelectorAll("[data-mm-group]").forEach(group=>{group.hidden=!!query&&![...group.querySelectorAll("[data-mm-row]")].some(row=>!row.hidden);});
+  };
+  const selectedKeys=()=>[...selectedIds()].map(value=>{const [collection,id]=JSON.parse(value);return {collection,id};});
+  const batchKeys=batch=>(batch?.keys||[]).map(identity);
+  const refreshIncluded=()=>{
+    const included=new Set([...batchSelections.values()].flat());
+    for(const node of root.querySelectorAll("[data-mm-included]"))node.textContent=included.has(node.dataset.mmIncluded)?"所选批次包含":"";
+    for(const input of root.querySelectorAll("[data-mm-batch]"))input.checked=selectedBatches.has(Number(input.dataset.mmBatch));
+  };
+  const chooseBatch=(batch,checked)=>{
+    if(!batch||writing||pendingStart)return;
+    if(checked&&(batch.state&&batch.state!=="applied"||!selectedBatches.has(batch.id)&&selectedBatches.size>=120)){refreshIncluded();showError(batch.state&&batch.state!=="applied"?"STALE":"BATCH_LIMIT");return;}
+    if(checked){selectedBatches.add(batch.id);batchSelections.set(batch.id,batchKeys(batch));}
+    else {selectedBatches.delete(batch.id);batchSelections.delete(batch.id);}
+    invalidate();refreshIncluded();count();updateControls();
+  };
+  let detailDialog=null,detailBody=null,detailItem=null,detailButton=null,detailSerial=0,detailPending=false,detailQueued=null,detailScroll=null;
+  const detailAlive=token=>valid()&&detailDialog?.open&&token===detailSerial;
+  const releaseDetail=(returnFocus=true)=>{
+    detailSerial++;detailQueued=null;const button=detailButton,scroll=detailScroll;detailButton=null;detailItem=null;detailScroll=null;
+    detailBody?.replaceChildren();
+    if(detailDialog?.open)detailDialog.close();
+    if(returnFocus&&valid()){
+      const focus=[button,q("search"),q("settings")].find(node=>node?.isConnected&&!node.disabled&&node.getClientRects().length);
+      focus?.focus({preventScroll:true});
+      if(scroll){for(const [node,top,left]of scroll.nodes)if(node.isConnected){node.scrollTop=top;node.scrollLeft=left;}window.scrollTo?.(scroll.x,scroll.y);}
+    }
+  };
+  const detailCancel=event=>{event.preventDefault();event.stopPropagation();releaseDetail();};
+  const detailClosed=()=>{if(!detailDialog?.open&&detailItem)releaseDetail();};
+  const detailKeyboard=event=>{
+    if(event.key==="Escape"){event.preventDefault();event.stopPropagation();releaseDetail();return;}
+    if(event.key!=="Tab")return;
+    const nodes=[...detailDialog.querySelectorAll('button, summary, [tabindex]')].filter(node=>!node.disabled&&node.tabIndex>=0&&node.getClientRects().length);
+    const index=nodes.indexOf(document.activeElement);
+    if(event.shiftKey&&index<=0){event.preventDefault();nodes.at(-1)?.focus();}
+    else if(!event.shiftKey&&(index<0||index===nodes.length-1)){event.preventDefault();nodes[0]?.focus();}
+  };
+  const ensureDetail=()=>{
+    if(detailDialog)return;
+    detailDialog=document.createElement("dialog");detailDialog.className="mm-detail-dialog";detailDialog.id="mm-detail-dialog";
+    detailDialog.setAttribute("aria-labelledby","mm-detail-title");
+    detailDialog.innerHTML='<div class="mm-detail-shell"><div class="dialog-head"><h2 id="mm-detail-title">记忆详情</h2><button type="button" class="close" id="mm-detail-close" aria-label="关闭记忆详情" autofocus>×</button></div><div id="mm-detail-body" class="dialog-body" tabindex="0"></div></div>';
+    document.body.append(detailDialog);detailBody=detailDialog.querySelector("#mm-detail-body");
+    detailDialog.querySelector("#mm-detail-close").onclick=()=>releaseDetail();
+    detailDialog.addEventListener("cancel",detailCancel);detailDialog.addEventListener("close",detailClosed);detailDialog.addEventListener("keydown",detailKeyboard);
+  };
+  const renderDetail=(result,item)=>{
+    const value=result.value,relations=result.relations||[],fields=[];
+    const ref=(collection,id)=>{const row=relations.find(row=>row.collection===collection&&row.id===id);return row?`${row.label||id}${row.missing?"（已不存在）":""}`:String(id??"");};
+    const list=(values,collection)=>(Array.isArray(values)?values:[]).map(value=>collection?ref(collection,value):String(value)).join("、");
+    const add=(label,value)=>{if(value!==undefined&&value!==null&&value!=="")fields.push([label,String(value)]);};
+    if(typeof value==="string")add(labels[item.collection],value);
+    else if(item.collection==="keywords"&&Array.isArray(value))for(const word of value)add(word&&typeof word==="object"?word.weight||"关键词":"关键词",word&&typeof word==="object"?word.text:word);
+    else if(value&&typeof value==="object"){
+      add("标题",value.title);add("姓名",value.name);add("其他称呼",list(value.aliases));add("介绍",value.description);
+      add(item.collection==="plans"?"约定":"经过",value.summary);add("内容",value.text);
+      if(value.person)add("所属人物",ref("people",value.person));
+      if(value.kind)add("档案类别",({preference:"偏好",habit:"习惯",recent:"近况",background:"背景"})[value.kind]||value.kind);
+      add("时间",value.time);add("日期",value.date);add("持续到",value.until);add("类别",value.role);
+      if(value.status)add("状态",({proposed:"提议中",agreed:"已约定",ongoing:"进行中",paused:"暂停",done:"已完成",cancelled:"已取消",failed:"未能完成"})[value.status]||value.status);
+      add("原因",value.reason);add("参与人物",list(value.participants,"people"));add("前因",list(value.causes,"events"));add("相关剧情",list(value.events,"events"));
+      for(const relation of Array.isArray(value.relationships)?value.relationships:[]){if(!relation)continue;add(`与${ref("people",relation.to)}的关系`,relation.text);for(const history of Array.isArray(relation.history)?relation.history:[])add("此前关系",history?.text);}
+    }
+    detailBody.innerHTML=`<dl id="mm-detail-value" class="mm-detail-fields">${fields.map(([label],i)=>`<dt>${esc(label)}</dt><dd data-mm-detail-text="${i}"></dd>`).join("")}</dl><p id="mm-detail-relations" class="lj-muted"></p><details id="mm-detail-technical"><summary>完整字段与编号</summary><p id="mm-detail-identity" class="lj-muted"></p><pre id="mm-detail-raw"></pre></details>`;
+    for(const node of detailBody.querySelectorAll("[data-mm-detail-text]"))node.textContent=fields[Number(node.dataset.mmDetailText)][1];
+    detailBody.querySelector("#mm-detail-relations").textContent=relations.map(row=>`${labels[row.collection]||"记忆"}：${row.label||row.id}${row.missing?"（已不存在）":""}`).join("；");
+    detailBody.querySelector("#mm-detail-identity").textContent=`条目编号 ${item.id} · 版本 ${result.version}`;
+    detailBody.querySelector("#mm-detail-raw").textContent=pretty(value);
+  };
+  const readDetail=async(item,expected,token)=>{
+    detailPending=true;
+    try {
+      const result=await bridge.apiGet("memory/maintenance/detail",expected);
+      if(!detailAlive(token))return;
+      if(result.scope!==frozen.scope||result.cid!==frozen.cid||result.epoch!==expected.epoch||result.collection!==expected.collection||result.id!==expected.id||result.version!==expected.version||result.hash!==expected.hash){detailBody.textContent=reason("STALE");return;}
+      detailDialog.querySelector("#mm-detail-title").textContent=`${labels[item.collection]} · ${["overview","keywords"].includes(item.collection)?"只报告疑点":item.label||item.id}`;
+      renderDetail(result,item);
+    } catch(error) {if(detailAlive(token))detailBody.textContent=reason(error?.code||error?.message);}
+    finally {detailPending=false;const queued=detailQueued;detailQueued=null;if(queued&&detailAlive(queued.token))readDetail(queued.item,queued.expected,queued.token);}
+  };
+  const openDetail=(item,button)=>{
+    if(!valid())return;
+    ensureDetail();const previousScroll=detailScroll;releaseDetail(false);
+    const ancestors=[];for(let node=root;node;node=node.parentElement)ancestors.push(node);
+    detailScroll=previousScroll||{nodes:[...new Set([...ancestors,q("items"),dialog])].map(node=>[node,node.scrollTop,node.scrollLeft]),x:window.scrollX||0,y:window.scrollY||0};
+    detailItem={...item,epoch:current.epoch};detailButton=button;
+    const token=detailSerial,expected={...frozen,collection:item.collection,id:item.id,epoch:current.epoch,version:item.version,hash:item.hash};
+    detailBody.textContent="正在读取记忆…";detailDialog.showModal();
+    if(detailPending){detailQueued={item,expected,token};return;}
+    return readDetail(item,expected,token);
+  };
+  const renderItems=(items,batches)=>{
+    const signature=JSON.stringify([items,batches]);if(signature===itemSignature)return;itemSignature=signature;
+    const ordered=Object.keys(labels).flatMap(collection=>items.filter(item=>item.collection===collection));
+    const previousIds=[...root.querySelectorAll("[data-mm-item]")].map(el=>el.dataset.mmItem);
+    if(JSON.stringify(previousIds)!==JSON.stringify(ordered.map(identity))){
+      const focus=document.activeElement,focused=["mmItem","mmDetail","mmProtect"].map(key=>({key,value:focus?.dataset?.[key]})).find(row=>row.value);
+      const groups=new Map([...root.querySelectorAll("[data-mm-group]")].map(el=>[el.dataset.mmGroup,el.open])),scroll=q("items").scrollTop;
+      q("items").innerHTML=Object.entries(labels).map(([collection,label])=>{
+        const rows=ordered.filter(item=>item.collection===collection),report=["overview","keywords"].includes(collection);
+        return `<details class="lj-group mm-group" data-mm-group="${collection}" ${groups.get(collection)===false?"":"open"}><summary>${label} <span>${rows.length}</span>${report?" · 只报告疑点":""}</summary>${rows.map(item=>`<div class="mm-item" data-mm-row data-mm-search="${esc(`${labels[item.collection]} ${item.label||item.id}`.toLowerCase())}"><div class="mm-item-head"><label class="check"><input type="checkbox" data-mm-item="${esc(identity(item))}"><span data-mm-label="${esc(identity(item))}"></span></label><button type="button" class="lj-text" data-mm-detail="${esc(identity(item))}" aria-haspopup="dialog">查看</button></div><span class="lj-muted" data-mm-source="${esc(identity(item))}"></span><span class="lj-muted mm-included" data-mm-included="${esc(identity(item))}"></span>${report?"":`<label class="check mm-protection"><input type="checkbox" data-mm-protect="${esc(identity(item))}">助手不自动修改</label>`}</div>`).join("")}</details>`;
+      }).join("");
+      for(const input of root.querySelectorAll("[data-mm-item]")){
+        input.checked=selected.has(input.dataset.mmItem);
+        input.onchange=()=>{if(writing||pendingStart)return;if(input.checked)selected.add(input.dataset.mmItem);else selected.delete(input.dataset.mmItem);invalidate();count();updateControls();};
+      }
+      q("items").scrollTop=scroll;
+      if(focused)[...root.querySelectorAll("[data-mm-item], [data-mm-detail], [data-mm-protect]")].find(el=>el.dataset[focused.key]===focused.value)?.focus({preventScroll:true});
+    }
+    const known=new Set(items.map(identity));for(const id of selected)if(!known.has(id)){selected.delete(id);invalidate();}
+    for(const [id,keys]of batchSelections){const remaining=keys.filter(key=>known.has(key));if(remaining.length!==keys.length){batchSelections.set(id,remaining);invalidate();}}
+    for(const item of items){
+      const id=identity(item),input=[...root.querySelectorAll("[data-mm-protect]")].find(el=>el.dataset.mmProtect===id);
+      if(input){input.checked=item.protected;input.onchange=()=>{if(writing)return;const value=input.checked;input.checked=item.protected;invalidate();write({op:"protect",collection:item.collection,id:item.id,version:item.version,epoch:current?.epoch,protected:value});};}
+      const label=[...root.querySelectorAll("[data-mm-label]")].find(el=>el.dataset.mmLabel===id);
+      label.textContent=["overview","keywords"].includes(item.collection)?labels[item.collection]:item.label||item.id;
+      label.closest("[data-mm-row]").dataset.mmSearch=`${labels[item.collection]} ${item.label||item.id}`.toLowerCase();
+      const button=[...root.querySelectorAll("[data-mm-detail]")].find(el=>el.dataset.mmDetail===id);
+      button.onclick=()=>openDetail(item,button);
+      const source=[...root.querySelectorAll("[data-mm-source]")].find(el=>el.dataset.mmSource===id);
+      source.textContent=[item.legacy_unverified?"旧来源未核实":"",!item.source_complete?"缺少完整原文":""].filter(Boolean).join(" · ");
+    }
+    const oldBatches=[...root.querySelectorAll("[data-mm-batch]")].map(el=>Number(el.dataset.mmBatch));
+    if(JSON.stringify(oldBatches)!==JSON.stringify(batches.map(b=>b.id))){
+      q("batch-items").innerHTML=batches.map(b=>`<label class="check"><input type="checkbox" data-mm-batch="${number(b.id)}"><span data-mm-batch-label="${number(b.id)}"></span></label>`).join("")||'<p class="lj-muted">没有总结批次</p>';
+    }
+    for(const input of root.querySelectorAll("[data-mm-batch]")){
+      const batch=batches.find(row=>row.id===Number(input.dataset.mmBatch));
+      input.onchange=()=>chooseBatch(batch,input.checked);
+      const label=[...root.querySelectorAll("[data-mm-batch-label]")].find(row=>Number(row.dataset.mmBatchLabel)===batch.id);
+      label.textContent=`第${number(batch.first)}—${number(batch.last)}轮 · 批次${number(batch.id)} · ${batchKeys(batch).length}项`;
+    }
+    refreshIncluded();count();filter();
+  };
+  const pretty=value=>typeof value==="string"?value:JSON.stringify(value,null,2);
+  const renderResults=runs=>{
+    const signature=JSON.stringify(runs);if(signature===resultSignature)return;resultSignature=signature;
+    const privateText=[],slot=value=>{privateText.push(value);return `<span data-mm-text="${privateText.length-1}"></span>`;};
+    const active=document.activeElement, focusKey=active?.dataset?.mmUndo?{attr:"data-mm-undo",value:active.dataset.mmUndo}:active?.dataset?.mmResolve?{attr:"data-mm-resolve",value:active.dataset.mmResolve}:null;
+    const opened=new Set([...root.querySelectorAll("[data-mm-run]")].filter(el=>el.open).map(el=>el.dataset.mmRun));
+    q("results").innerHTML=runs.map(run=>`<details class="lj-group" data-mm-run="${esc(run.id)}" ${opened.has(run.id)?"open":""}><summary>${run.id===run.task_id?"任务合计":"检查单元"} · ${esc(states[run.state]||"待核对")} · ${esc(dateText(run.created))} · 已修正 ${number(run.counts?.modified)} 项</summary>${run.code?`<p class="memory-error">${esc(reason(run.code))}</p>`:""}<p class="lj-muted">${run.trigger==="auto"?"总结后自动检查":"手动检查"} · 已检查 ${number(run.counts?.checked)} 项 · 疑点 ${number(run.counts?.findings)} 项 · 未检查 ${number(run.counts?.not_checked)} 项 · 调用 ${number(run.counts?.calls)} 次${run.expired?" · 私有详情已清理":""}${run.expires?` · 私有结果保留至 ${esc(dateText(run.expires))}`:""}</p>${(run.changes||[]).map(change=>`<article class="mm-change"><h4>${esc(labels[change.collection]||"记忆")} · ${esc(change.id)}</h4><div class="mm-comparison"><div><strong>修正前</strong><pre>${slot(pretty(change.before))}</pre></div><div><strong>修正后</strong><pre>${slot(pretty(change.after))}</pre></div></div>${change.reason?`<p>${slot(change.reason)}</p>`:""}<p class="lj-muted">${esc(sourceText(change.sources))}</p></article>`).join("")}${(run.findings||[]).map(finding=>`<article class="mm-finding"><strong>${esc(labels[finding.collection]||"记忆")} · ${esc(finding.id)} · ${esc(reason(finding.category))}${run.resolved||finding.resolved?" · 已处理":""}</strong>${finding.reason?`<p>${slot(finding.reason)}</p>`:""}${finding.suggestion?`<details><summary>仅建议，未应用</summary><pre>${slot(pretty(finding.suggestion))}</pre></details>`:""}<p class="lj-muted">${esc(sourceText(finding.sources))}</p></article>`).join("")}<p class="lj-muted">${esc(sourceText(run.sources))}</p><div class="lj-actions">${run.can_undo?`<button type="button" class="lj-btn" data-mm-undo="${esc(run.id)}">撤销本单元修正</button>`:""}${!run.resolved&&(run.findings||[]).some(f=>!f.resolved)?`<button type="button" class="lj-btn" data-mm-resolve="${esc(run.id)}">疑点标记已处理</button>`:""}</div></details>`).join("")||'<p class="lj-muted">暂无检查结果</p>';
+    for(const node of root.querySelectorAll("[data-mm-text]"))node.textContent=privateText[Number(node.dataset.mmText)];
+    for(const button of root.querySelectorAll("[data-mm-undo]"))button.onclick=()=>{if(!writing&&window.confirm("只撤销本单元修正；后续修改有冲突时将整单元拒绝。继续？")){invalidate();write({op:"undo",id:button.dataset.mmUndo});}};
+    for(const button of root.querySelectorAll("[data-mm-resolve]"))button.onclick=()=>write({op:"resolve",id:button.dataset.mmResolve});
+    if(focusKey)[...root.querySelectorAll(`[${focusKey.attr}]`)].find(el=>el.getAttribute(focusKey.attr)===focusKey.value)?.focus();
+  };
+  const accept=result=>{
+    for(const row of result.unavailable_batches||[])if(selectedBatches.has(row.id)){selectedBatches.delete(row.id);batchSelections.delete(row.id);invalidate();}
+    if(current&&(preview||previewing)&&(current.revision!==result.revision||current.policy_signature!==result.policy_signature||JSON.stringify(current.items)!==JSON.stringify(result.items)))invalidate();
+    if(detailItem){const item=(result.items||[]).find(row=>identity(row)===identity(detailItem));if(!item||result.epoch!==detailItem.epoch||item.version!==detailItem.version||item.hash!==detailItem.hash){detailSerial++;detailBody.textContent=reason(item?"STALE":"ITEM_MISSING");}}
+    if(current&&current.epoch!==result.epoch){selected.clear();selectedBatches.clear();batchSelections.clear();itemSignature="";invalidate();root.querySelectorAll("[data-mm-item]").forEach(el=>el.checked=false);root.querySelectorAll("[data-mm-batch]").forEach(el=>el.checked=false);}
+    current=result;q("pause").checked=!!result.paused;
+    const owner=result.task||{}, activeRun=(result.runs||[]).find(run=>run.task_id===owner.id&&["reading","requesting","validating","committing"].includes(run.state));
+    const task=activeRun?{state:activeRun.state,calls:activeRun.counts?.calls}:owner;
+    q("status").textContent=result.running?`${states[task.state]||"正在检查"}${Number.isSafeInteger(task.calls)?` · 已调用 ${task.calls} 次`:""}`:!result.enabled?"助手未启用；可打开助手设置，也可查看和撤销已有结果。":!result.configured?reason(result.error_code):"";
+    q("status").hidden=!q("status").textContent;
+    if(result.items){const batches=[...(result.batches||[])];if(result.latest_batch&&!batches.some(row=>row.id===result.latest_batch.id))batches.unshift(result.latest_batch);renderItems(result.items,batches);}
+    const latest=result.latest_batch;q("latest-info").textContent=latest?`批次${number(latest.id)} · 第${number(latest.first)}—${number(latest.last)}轮${latest.keys?.length?"":" · 无可选变化"}`:"没有有效总结批次";
+    if(result.runs)renderResults(result.runs);
+    updateControls();
+  };
+  const schedule=()=>{clearTimeout(timer);if(valid())timer=setTimeout(()=>refresh(),3000);};
+  const refresh=async()=>{
+    if(!valid()){dispose();return;}if(reading||writing)return;reading=true;const version=readVersion,batchVersion=JSON.stringify([...selectedBatches]);updateControls();
+    try{const result=await bridge.apiGet("memory/maintenance",{...frozen,...(selectedBatches.size?{selected_batches:batchVersion}:{})});if(valid()&&!writing&&version===readVersion&&batchVersion===JSON.stringify([...selectedBatches]))accept(result);}catch{showError("REQUEST_FAILED");}
+    finally{reading=false;if(valid()){updateControls();schedule();}}
+  };
+  const write=async(payload)=>{
+    if(!valid()||writing)return;writing=true;readVersion++;
+    const assistantControls=new Set(q("settings-content").querySelectorAll("input,button"));
+    const controls=[...root.querySelectorAll("input,button")].filter(el=>!assistantControls.has(el)),disabled=controls.map(el=>[el,el.disabled]);controls.forEach(el=>el.disabled=true);
+    q("error").hidden=true;clearTimeout(timer);
+    try{const result=await bridge.apiPost("memory/maintenance",{...frozen,...payload,...(selectedBatches.size?{selected_batches:[...selectedBatches]}:{})});if(!valid())return;if(payload.op==="start"){pendingStart=null;q("start").hidden=true;q("start").textContent="确认开始检查";}accept(result);onChange();}
+    catch(error){if(!valid())return;const code=error?.code||error?.message;if(payload.op==="start"&&reasons[code]){pendingStart=null;q("start").hidden=true;showError(code);}else if(payload.op==="start"&&valid()){q("error").textContent="启动回执未收到，请刷新核对；继续本次启动会复用同一请求编号。";q("error").hidden=false;q("start").hidden=false;q("start").textContent="继续核对本次启动";}else showError(error?.code||error?.message);}
+    finally{writing=false;if(valid()){for(const [el,value]of disabled)if(el.isConnected)el.disabled=value;updateControls();schedule();}}
+  };
+  q("search").oninput=filter;
+  q("select").onclick=()=>{if(writing||pendingStart)return;for(const row of root.querySelectorAll("[data-mm-row]")){if(row.hidden||!row.closest("[data-mm-group]")?.open)continue;const input=row.querySelector("[data-mm-item]");input.checked=true;selected.add(input.dataset.mmItem);}invalidate();count();updateControls();};
+  q("clear").onclick=()=>{if(writing)return;selected.clear();selectedBatches.clear();batchSelections.clear();refreshIncluded();root.querySelectorAll("[data-mm-item]").forEach(el=>el.checked=false);root.querySelectorAll("[data-mm-batch]").forEach(el=>el.checked=false);invalidate();count();updateControls();};
+  q("apply").onchange=()=>{if(!q("apply").checked)q("protected").checked=false;q("protected").disabled=!q("apply").checked;invalidate();updateControls();};
+  q("protected").onchange=()=>{invalidate();updateControls();};
+  q("pause").onchange=()=>{const paused=q("pause").checked;q("pause").checked=!!current?.paused;invalidate();write({op:"pause",paused,revision:current?.revision});};
+  q("latest").onclick=()=>{const batch=current?.latest_batch;if(batch&&!selectedBatches.has(batch.id))chooseBatch(batch,true);};
+  q("settings").onclick=async event=>{
+    const section=q("settings-section");if(section.open)return;
+    event?.preventDefault?.();section.open=true;
+    if(assistantOpening||assistantPanel)return;
+    assistantOpening=true;
+    try{const session=await openAssistantSettings?.({container:q("settings-content"),isCurrent:valid,onChange:()=>{if(valid()){invalidate();refresh();}}});if(valid())assistantPanel=session;else session?.dispose();}
+    finally{assistantOpening=false;}
+  };
+  q("refresh").onclick=refresh;
+  q("stop").onclick=()=>write({op:"stop",task_id:current?.task?.id||current?.task?.task_id});
+  q("preview").onclick=async()=>{
+    if(writing||q("preview").disabled)return;invalidate();const token=serial;previewing=true;q("error").hidden=true;updateControls();
+    try{const result=await bridge.apiPost("memory/maintenance",{...frozen,op:"preview",keys:selectedKeys(),batches:[...selectedBatches],apply:q("apply").checked,allow_protected:q("protected").checked});
+      if(!valid()||token!==serial)return;preview=result;requestId=crypto.randomUUID();q("preview-result").innerHTML=`<p>检查 ${number(result.selected)} 项 · ${number(result.units)} 个单元 · 最多 ${number(result.max_calls)} 次模型调用</p><p>总时限 ${number(result.total_timeout)} 秒 · 受保护 ${number(result.protected)} 项 · 缺少完整原文 ${number(result.source_missing)} 项</p><p class="lj-muted">将产生模型费用${result.vector_enabled?"；有修正时还会更新相关向量":""}。${q("apply").checked?"仅在有效依据支持时应用白名单修正。":"本次只报告，不自动改写。"}</p>`;q("preview-result").innerHTML+='<p class="lj-muted">概况和关键词仅报告疑点。</p>';q("preview-result").hidden=false;q("start").hidden=false;
+    }catch(error){if(token===serial)showError(error?.code||error?.message);}finally{previewing=false;if(valid())updateControls();}
+  };
+  q("start").onclick=async()=>{if(writing||(!preview&&!pendingStart)||q("start").disabled)return;pendingStart ||= {token:preview.token,request_id:requestId};const payload={...pendingStart};invalidate();await write({op:"start",...payload});};
+  const dispose=()=>{if(disposed)return;disposed=true;assistantPanel?.dispose();serial++;clearTimeout(timer);dialog.removeEventListener("close",dispose);releaseDetail(false);if(detailDialog){detailDialog.removeEventListener("cancel",detailCancel);detailDialog.removeEventListener("close",detailClosed);detailDialog.removeEventListener("keydown",detailKeyboard);detailDialog.remove();detailDialog=null;detailBody=null;}preview=null;pendingStart=null;current=null;selected.clear();selectedBatches.clear();batchSelections.clear();root.innerHTML="";if(closeMaintenance===dispose)closeMaintenance=null;};
+  closeMaintenance=dispose;
+  dialog.addEventListener("close",dispose,{once:true});
+  updateControls();refresh();
+  return {dispose,refresh};
+}
+
 export async function mountMemory(env) {
+  closeMaintenance?.();
   const own = ++mountNumber;
   const {main, bridge, showDialog, footer, busy, toast, escape: esc} = env;
   const alive = () => own === mountNumber && env.isCurrent();
@@ -50,7 +315,7 @@ export async function mountMemory(env) {
         const box = content.querySelector("#memory-dialog-error");
         if (box) box.hidden = true;
         try { await fn(); } catch (error) {
-          if (box) { box.textContent = error.message || "操作失败"; box.hidden = false; }
+          if (box) { box.textContent = ({MAINTENANCE_DEPENDENCY:"请先在记忆维护中逆序撤销依赖本次总结的修正",MAINTENANCE_EXPIRED:"依赖的助手修正详情已清理，无法安全撤销本次总结"})[error.message] || error.message || "操作失败"; box.hidden = false; }
         }
       }),
     };
@@ -172,14 +437,15 @@ export async function mountMemory(env) {
     if (!alive()) return;
     main.dataset.page = "memory";
     if (!view.target) {
-      main.innerHTML = `<div class="lj"><div class="lj-topbar"><span class="lj-brand">拾忆回响</span></div><div class="lj-empty"><h2>选择一份聊天</h2><p>也可以绑定QQ对象，自动跟随它当前使用的聊天。</p><div class="lj-actions lj-center"><button class="lj-btn lj-btn-primary" id="lj-choose">选择聊天</button><button class="lj-btn" id="lj-bind">会话绑定</button></div></div></div>`;
+      main.innerHTML = `<div class="lj"><div class="lj-topbar"><span class="lj-brand">拾忆回响</span><button class="lj-btn" id="lj-maintenance">记忆助手</button></div><div class="lj-empty"><h2>选择一份聊天</h2><p>也可以绑定QQ对象，自动跟随它当前使用的聊天。</p><div class="lj-actions lj-center"><button class="lj-btn lj-btn-primary" id="lj-choose">选择聊天</button><button class="lj-btn" id="lj-bind">会话绑定</button></div></div></div>`;
       main.querySelector("#lj-choose").onclick = chooseConversation;
       main.querySelector("#lj-bind").onclick = bindingDialog;
+      main.querySelector("#lj-maintenance").onclick=()=>openMemoryMaintenance({bridge,showDialog,footer,escape:esc,target:null,isCurrent:alive,openAssistantSettings:env.openAssistantSettings});
       return;
     }
     const m = data.memory, enabled = data.state.enabled;
     const tabs = [["story", "剧情", m.events.length], ["people", "人物", m.people.length], ["profiles", "生活小档案", profiles().length], ["plans", "约定", openPlans().length], ["records", "整理记录", ""]];
-    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-logs">拾忆日志</button><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button><button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
+    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-btn" id="lj-maintenance">记忆助手</button><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-logs">拾忆日志</button><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button><button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
     if (!enabled) {
       main.innerHTML = `<div class="lj">${topbar}<div class="lj-empty"><h2>此聊天未启用记忆</h2><p>启用后从下一条消息开始备份对话，满设定轮数自动整理。</p><button class="lj-btn lj-btn-primary" id="lj-enable">启用记忆</button></div></div>`;
       bind();
@@ -205,6 +471,7 @@ export async function mountMemory(env) {
     const more = $("details.lj-more");
     more?.querySelectorAll("div button").forEach(b => b.addEventListener("click", () => { more.open = false; }));
     $("#lj-settings")?.addEventListener("click", settingsPage);
+    $("#lj-maintenance")?.addEventListener("click", () => {const target={...view.target};openMemoryMaintenance({bridge,showDialog,footer,escape:esc,target,openAssistantSettings:env.openAssistantSettings,isCurrent:()=>alive()&&view.target.scope===target.scope&&view.target.cid===target.cid,onChange:()=>{load().catch(()=>{});}});});
     $("#lj-logs")?.addEventListener("click", () => env.openDiagnostics({...params()}));
     $("#lj-bind")?.addEventListener("click", bindingDialog);
     $("#lj-enable")?.addEventListener("click", e => busy(e.target, async () => { data = await act("enable", {enabled: true}); await render(); }));
@@ -468,7 +735,11 @@ export async function mountMemory(env) {
     };
     const visible = t => currentSession() && t.display === owner.display && t.root === content.firstElementChild && t.form === content.querySelector("form") && t.open === dialog.open && t.kind === dialog.getAttribute("data-memory-dialog") && t.tab === view.settingsTab;
     const current = t => visible(t) && (!t.strict || (t.intent === owner.intent && t.fields === fields()));
-    const invalidate = () => { ++owner.display; ++owner.intent; clearTimeout(vecTimer); clearTimeout(imageTimer); };
+    const clearConnectionKeys = (root = content) => {
+      root.querySelectorAll("[data-connection-key]").forEach(input => { input.value = ""; input.type = "password"; });
+      root.querySelectorAll("[data-preset-key]").forEach(button => { button.textContent = "显示"; button.setAttribute("aria-pressed", "false"); });
+    };
+    const invalidate = () => { ++owner.display; ++owner.intent; clearConnectionKeys(); clearTimeout(vecTimer); clearTimeout(imageTimer); };
     const guarded = async (t, fn) => { try { return await fn(); } catch (error) { if (current(t)) throw error; } };
     const busyButtons = new WeakMap();
     const run = async (ed, button, strict, fn) => {
@@ -544,10 +815,15 @@ export async function mountMemory(env) {
     const presetSummary = (p, kind) => kind === "chat"
       ? `${esc(p.model)} · 窗口 ${p.max_context_tokens || "未设置"} token`
       : kind === "embedding" ? `${esc(p.model)} · ${p.dimensions || "?"} 维` : esc(p.model);
+    const connectionCard = kind => {
+      const meta = KINDS[kind], active = s.presets.find(p => p.type === kind && p.id === s[meta.field]);
+      if (!active) return `<p class="lj-muted">${meta.empty}</p>`;
+      const key = `<div class="lj-key"><input data-connection-key="${kind}" aria-label="${meta.title} API Key" readonly type="password" autocomplete="off" spellcheck="false" placeholder="${active.key_configured ? "已保存" : "未配置"}">${active.key_configured ? `<button type="button" class="lj-btn" data-preset-key="${kind}" aria-label="${meta.title}密钥显示" aria-pressed="false">显示</button>` : ""}</div>`;
+      return `<div class="lj-connection"><strong>${esc(active.name)}</strong><span>${presetSummary(active, kind)}</span><button type="button" class="lj-text" data-preset-edit="${kind}">编辑</button><dl class="lj-connection-details"><div><dt>接口地址</dt><dd data-connection-url>${esc(active.base_url)}</dd></div><div><dt>API Key</dt><dd>${key}</dd></div></dl></div>`;
+    };
     const kindSection = kind => {
       const meta = KINDS[kind], options = s.presets.filter(p => p.type === kind), chosen = s[meta.field];
-      const active = options.find(p => p.id === chosen);
-      const card = active ? `<div class="lj-connection"><strong>${esc(active.name)}</strong><span>${presetSummary(active, kind)} · ${active.key_configured ? "Key 已保存" : "未填 Key"}</span><button type="button" class="lj-text" data-preset-edit="${kind}">编辑</button></div>` : `<p class="lj-muted">${meta.empty}</p>`;
+      const card = `<div data-preset-summary="${kind}">${connectionCard(kind)}</div>`;
       const editor = editing && editing.kind === kind ? presetEditor(editing.item, kind) : `<button type="button" class="lj-btn" data-preset-new="${kind}">新建连接</button>`;
       return `<section class="lj-settings-section"><h3>${meta.title}<small>${meta.hint}</small></h3><label class="lj-setting"><span>使用的连接</span><select name="${meta.field}"><option value="">${kind === "chat" ? "未选择" : "不使用"}</option>${options.map(p => `<option value="${esc(p.id)}" ${p.id === chosen ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>${card}${editor}</section>`;
     };
@@ -639,7 +915,14 @@ export async function mountMemory(env) {
         content.querySelector("#lj-unsaved").hidden = snapshot() === saved;
       };
       collectSettings = collect;
-      form.oninput = form.onchange = () => { ++owner.intent; collect(); };
+      form.oninput = form.onchange = event => {
+        ++owner.intent; collect();
+        const kind = Object.keys(KINDS).find(k => KINDS[k].field === event.target.getAttribute("name"));
+        if (kind) {
+          const card = form.querySelector(`[data-preset-summary="${kind}"]`);
+          clearConnectionKeys(card); card.innerHTML = connectionCard(kind);
+        }
+      };
       content.querySelectorAll("[data-stab]").forEach(b => b.onclick = () => run(ed, b, true, async t => {
         collect();
         const tab = b.dataset.stab;
@@ -714,7 +997,22 @@ export async function mountMemory(env) {
         });
       };
       content.querySelectorAll("[data-preset-new]").forEach(b => b.onclick = () => { collect(); const kind = b.dataset.presetNew; editing = {kind, item: {...KINDS[kind].defaults}}; draw(); });
-      content.querySelectorAll("[data-preset-edit]").forEach(b => b.onclick = () => { collect(); const kind = b.dataset.presetEdit; editing = {kind, item: s.presets.find(p => p.id === s[KINDS[kind].field]) || {}}; draw(); });
+      content.querySelectorAll("[data-preset-summary]").forEach(card => card.onclick = event => {
+        const button = event.target.closest("button");
+        if (button?.dataset.presetKey && !button.disabled) return run(ed, button, true, async t => {
+          const kind = button.dataset.presetKey, input = card.querySelector("[data-connection-key]");
+          if (input.type === "text") { clearConnectionKeys(card); return; }
+          const preset = s.presets.find(p => p.type === kind && p.id === s[KINDS[kind].field]);
+          if (!preset?.key_configured) return;
+          const result = await bridge.apiPost("memory/model_key", {id: preset.id, base_url: preset.base_url, revision: s.models_revision});
+          if (!current(t)) return;
+          input.value = result.value; input.type = "text";
+          button.textContent = "隐藏"; button.setAttribute("aria-pressed", "true");
+        });
+        const kind = button?.dataset.presetEdit;
+        if (!kind) return;
+        collect(); editing = {kind, item: s.presets.find(p => p.id === s[KINDS[kind].field]) || {}}; draw();
+      });
       content.querySelector("#lj-preset-cancel")?.addEventListener("click", () => { editing = null; draw(); });
       const presetData = () => {
         const v = n => content.querySelector(`[data-p="${n}"]`)?.value.trim();
