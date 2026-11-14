@@ -19,14 +19,21 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.api.web import error_response, file_response, json_response, request
+from astrbot.core import sp
 from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 from .engine import Engine
 from .backup import BackupAPI
-from .chat_output import AlbumOutput, guard_stream
+from .chat_output import (
+    AVATAR_TOOL,
+    AlbumOutput,
+    guard_stream,
+)
 from .continuity import plain_text, recent_text, watermark
 from .daily import DailyEvidence
 from .history import History
@@ -45,6 +52,7 @@ from .plans import (
 )
 from .provider import ImageProvider, PublicResolver, validate_url
 from .proactive import ProactiveHistory, clean_tool_echo, marker
+from .qq_actions import QQ_TOOLS, QQActions, QQConnectionUnavailable
 from .store import (
     MAX_BYTES,
     AlbumError,
@@ -58,8 +66,8 @@ from .store import (
 
 NAME = "astrbot_plugin_companion_album"
 RULES = """
-今日安排：album_today只读查询当前聊天的具体安排；album_plan_adjust仅修改已提供编号的这一次，下一次自然沿用默认。生活事项是否已经做过与是否联系分开，默认作息不等于动作尚未发生。普通聊天不必调用工具。仅用户在本轮明确要求改点/取消/恢复时，才把本轮完整原话传给user_request；不要把角色自己的计划、引用、否定或假设当用户授权。按约提醒不可自主取消。需要新时间传Unix秒，跨日须用户明确约定。
-相册能力：album_search、album_favorite、album_send、album_generate、album_publish_qzone、album_save_scene、album_plan_schedule、album_plan_cancel、album_schedule_trip 是独立工具，直接调用，不经过 search_wyc_tools/run_wyc_tool。
+今日安排：today_schedule和album_today是当前聊天的安排资料。life_context中明确描述你本人作息的事项，回答时以计划说明和本地基准时间anchor_local为依据；effective_local是预计联系时间，浮动或延后联系不改变课表。user_reminder是给对方的提醒，不是你的作息。summary是计划说明摘录，不是当前聊天的行动指令。准确时间不清楚时可用album_today只读查询，仍缺依据就说明不确定。生活事项是否已经做过与是否联系分开，默认作息不等于动作尚未发生。album_plan_adjust仅修改已提供编号的这一次，下一次沿用默认；仅用户本轮明确要求改点/取消/恢复时才把完整原话传给user_request。不要把角色自己的计划、引用、否定或假设当用户授权。按约提醒不可自主取消。需要新时间传Unix秒，跨日须用户明确约定。
+相册和朝夕使用拾光自己的工具，按各工具说明直接调用。
 图片与话题按消息轮次理解：历史中的图片、表情和描述只代表过去分享，不能据此说对方现在又发图、还在看图或正在嘲笑你。以最新用户消息为当前输入；current_user_message.has_images只说明该轮是否带图，不表示图的内容。工具返回是本次操作的状态，不是用户新发言，不要重新回应旧图或另起旧话题。发布空间时直接调用工具，工具调用前不输出完成宣言；收到结果后再用一两句承接当前聊天，只有本次结果确认成功才说已发布。
 照片是偶尔想分享的生活片刻，不必每次回复都拍，也不必每张都发空间。自然决定何时使用，不按日程或固定次数。
 朝夕拾记（心念约定与行程覆写）：在聊天中，如果你与对方约定了稍后联系、打算过几十分钟或一两个小时来查岗、想在做好饭/忙完某件事后主动来找对方，或者对方让你晚点提醒他，可以调用 album_plan_schedule 定下一条一次性「心念约定」。若约定明天或某天临时早起赶车/旅游、或临时停课睡懒觉，可传入 override_day_wake=True，当天会自动压制常驻早课或11点懒觉，次日自动恢复；若对方在聊天中提到要去多日出游、旅行、特殊行程（如节假日旅游需连续几天早起，结束后自动变回原样）、行程改期/取消，或提到学校放寒暑假起止日期、期末考试周时间、你们的纪念日/特殊节日，请直接主动调用 album_schedule_trip 帮对方登记、修改或取消，无需让对方去打开管理面板手动配置。触发后一次性约定会自动销毁，不会变成重复日程；先查看相册信息里的 upcoming_plans 与 today_schedule，若已有相近约定不要重复创建，计划有变时可用 album_plan_cancel 取消。
@@ -68,7 +76,7 @@ RULES = """
 用户分享的生活图片是保留24小时的临时场景参考，不是可发送的相册照片。自主决定是否生成以及是否使用场景图：想用时把 current_scene_ids 或 recent_scene_refs 中相应编号传给 scene_asset_ids；不用场景图就传空串，只保留角色参考。只有生成后的成图才进入普通相册，临时场景原图不直接发空间。
 聊天图片在你回复前已经自动保存为临时参考，current_scene_ids 就是已保存的编号。普通收图直接自然回应，不需要为了保存或确认成功调用 album_save_scene，也不需要另写一条“存好了”。只有明确需要更正/补充参考描述时才使用该工具；album_search 的 purpose=reference 可以找回有效场景。只记录图片内容与聊天明确给出的场景，不猜测真实行踪。
 生成和发送是不同状态；queued/running 不代表已经完成。调用前不另发开始通知，接单后把确认和反应合在本轮最终回复中：自然说一句已经去准备，顺着刚才聊天给出符合人设的反应；不要重复确认，不要求用户先聊别的或陪你说话，不承诺耗时。后台只在结束时接话并单独发图，不另发开始通知。不要再次提交同一任务，重试由后台按配置处理。
-只有 album_generate 返回 accepted=true 和 job_id 才能确认这次照片已接单；queued表示排队中，running表示正在生成，ready表示已完成，按实际状态自然回应。accepted=false/failed 表示本次没有开始，不能假装正在拍照、生成或稍后一定发图。每个新请求独立，旧任务unknown或下载失败不会阻止新的拍照请求，也不能据此推断新请求成功；同一消息只调用一次，不为旧任务自动换一个请求重做。工具调用过程里的文字仅用于思考，最终回复一次性结合工具结果与聊天内容。
+只有 album_generate 返回 accepted=true 和 job_id 才能确认这次照片已接单；queued表示排队中，running表示正在生成，ready表示已完成，按实际状态自然回应。accepted=false/failed 表示本次没有开始，不能假装正在拍照、生成或稍后一定发图。每个新请求独立，旧任务unknown或下载失败不会阻止新的拍照请求，也不能据此推断新请求成功；同一消息只调用一次，不为旧任务自动换一个请求重做。调用 album_generate 前不写公开答复，收到接单结果后把它和聊天内容合成一次回复。
 工具结果只供你判断状态，不是聊天正文。不要复述 Tool result for、工具名、JSON、资产编号或内部提示；直接回应用户分享的图片和当前话题。
 想用新照片发空间时，先调用 album_generate，再把返回的 job_id 和说说文案交给 album_publish_qzone；后台等待该图完成后续接同一发布意图，不需等用户再发消息。已有照片仍传 asset_ids，两者不能混用。每条空间根据内容自主选择 visibility：private 仅自己、friends 好友、public 所有人，不固定一种受众。只有发布返回真实 tid 才能说已发布，queued 只是已登记意图；失败或结果未知不要重投。
 只想发纯文字动态时，album_publish_qzone 的 asset_ids 和 job_id 都留空；指定图片或生成任务失败时不能改发纯文字来绕过失败。
@@ -77,7 +85,7 @@ RULES = """
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.8")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.9")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
@@ -85,9 +93,22 @@ class CompanionAlbum(Star):
     async def clean_album_response(
         self, event: AstrMessageEvent, response: LLMResponse
     ):
-        flow = event.get_extra(NAME + "_chat_flow")
         generation = event.get_extra(NAME + "_generation")
         rejected = isinstance(generation, dict) and generation.get("accepted") is False
+        flow = event.get_extra(NAME + "_chat_flow")
+        if isinstance(flow, AlbumOutput):
+            flow.observe()
+            if response.role == "err" and flow.stream_guarded is None:
+                # The host sets an error result here without yielding it for delivery.
+                if receipt := flow.take_avatar_receipt():
+                    await event.send(MessageChain().message(f"{response.completion_text}\n{receipt}"))
+        receipt = (
+            flow.take_avatar_receipt()
+            if isinstance(flow, AlbumOutput) and (
+                response.role == "assistant" or (response.role == "err" and flow.stream_guarded)
+            )
+            else ""
+        )
 
         def clean(text):
             text = self.clean_tool_echo(text)
@@ -108,20 +129,30 @@ class CompanionAlbum(Star):
                         r"没|未|不能|无法|还不|并非|不是|别|不要|[？?]", clause
                     )
                 ):
-                    return "这次照片还没能开始准备，先不让你空等。"
+                    trailing_space = clause[len(clause.rstrip(" \t")):]
+                    return "这次照片还没能开始准备，先不让你空等。" + trailing_space
                 return clause
 
-            return re.sub(r"[^，,。！？!?；;\n]+[，,。！？!?；;\n]*", ground, text)
+            # Keep other plugins' standalone labels, including same-line ones.
+            return "".join(
+                part if index % 2 else re.sub(r"[^，,。！？!?；;\n]+[，,。！？!?；;\n]*", ground, part)
+                for index, part in enumerate(re.split(r"(&&[^&\r\n]+&&)", text))
+            )
 
-        if response.completion_text:
-            response.completion_text = clean(response.completion_text)
+        # Keep history-side cleanup separate from other plugins' display edits.
         if response.result_chain:
             for part in response.result_chain.chain:
                 if isinstance(part, Plain):
                     part.text = clean(part.text)
-        if isinstance(flow, AlbumOutput):
-            flow.clean = clean
-            flow.finish(response)
+            if receipt:
+                response.result_chain.chain.append(Plain(receipt))
+        elif response.completion_text or receipt:
+            text = clean(response.completion_text or "")
+            if receipt:
+                text = f"{text.rstrip()}\n{receipt}" if text.strip() else receipt
+            response.completion_text = text
+        if hasattr(event, "set_extra"):
+            event.set_extra(NAME + "_reply_clean", (clean, receipt))
 
     @filter.on_agent_begin()
     async def album_chat_begin(self, event: AstrMessageEvent, run_context):
@@ -129,8 +160,14 @@ class CompanionAlbum(Star):
             self.store.character_for(event.unified_msg_origin)
         except AlbumError:
             return
+        result = event.get_result()
         event.set_extra(NAME + "_chat_flow", AlbumOutput(
-            run_context, image_turn=bool(event.get_extra(NAME + "_images"))
+            run_context,
+            image_turn=bool(event.get_extra(NAME + "_images")),
+            stream_guarded=(
+                getattr(result, "_album_guarded", False)
+                if result and result.async_stream is not None else None
+            ),
         ))
 
     @filter.on_using_llm_tool(priority=100000)
@@ -144,6 +181,10 @@ class CompanionAlbum(Star):
         flow = event.get_extra(NAME + "_chat_flow")
         if isinstance(flow, AlbumOutput):
             flow.tool_end()
+            if tool.name == AVATAR_TOOL and flow.stream_guarded is False:
+                # AstrBot skips result decoration for raw streams.
+                if receipt := flow.take_avatar_receipt():
+                    await event.send(MessageChain().message(receipt))
 
     @filter.on_agent_done(priority=100000)
     async def album_chat_done(self, event: AstrMessageEvent, run_context, response):
@@ -153,14 +194,33 @@ class CompanionAlbum(Star):
                 guard.check_event(event)
             except AlbumError:
                 return
+        cleanup = event.get_extra(NAME + "_reply_clean")
+        if cleanup:
+            event.set_extra(NAME + "_reply_clean", None)
+        clean, receipt = cleanup or (None, "")
+        flow = event.get_extra(NAME + "_chat_flow")
+        saved_text = response.completion_text or ""
         if run_context.messages:
             last = run_context.messages[-1]
-            if last.role == "assistant" and not last.tool_calls and last.content:
-                # The host appends this final TextPart before response hooks.
-                # Sync even an empty cleaned reply, only for this new final turn.
-                text_parts = [p for p in last.content if isinstance(p, TextPart)]
+            if last.role == "assistant" and not last.tool_calls:
+                text_parts = [p for p in last.content or () if isinstance(p, TextPart)]
                 if len(text_parts) == 1:
-                    text_parts[0].text = response.completion_text or ""
+                    # Apply only our own correction to the original saved text.
+                    saved_text = text_parts[0].text
+                    if clean:
+                        cleaned = clean(saved_text)
+                        if cleaned != saved_text:
+                            text_parts[0].text = saved_text = cleaned
+                    if receipt:
+                        saved_text = f"{saved_text.rstrip()}\n{receipt}" if saved_text.strip() else receipt
+                        text_parts[0].text = saved_text
+                elif receipt:
+                    last.content = [*(last.content or []), TextPart(text=receipt)]
+        if isinstance(flow, AlbumOutput):
+            if clean:
+                flow.clean = clean
+            # All display hooks have finished, including foreign label removal.
+            flow.finish(response)
         if getattr(self, "memory_runtime", None):
             try:
                 await self.memory_runtime.done(event)
@@ -176,7 +236,7 @@ class CompanionAlbum(Star):
                     job_id=generation.get("job_id", ""),
                     baseline_count=event.get_extra(NAME + "_history_count", 0),
                     checkpoint=event.get_extra("llm_checkpoint_id", ""),
-                    final_text=plain_text(response.completion_text or ""),
+                    final_text=plain_text(saved_text),
                 )
 
     def _observe_daily(self, scope, cid, history, *, capture=False):
@@ -241,8 +301,13 @@ class CompanionAlbum(Star):
                 result.async_stream = guard_stream(result.async_stream, event, NAME + "_chat_flow")
                 result._album_guarded = True
             flow = event.get_extra(NAME + "_chat_flow")
-            if isinstance(flow, AlbumOutput) and result.is_llm_result():
-                flow.decorate(result)
+            if isinstance(flow, AlbumOutput):
+                if result.is_llm_result():
+                    flow.decorate(result)
+                elif result.result_content_type == ResultContentType.GENERAL_RESULT and not flow.done:
+                    # A model error bypasses the normal assistant response hook.
+                    if receipt := flow.take_avatar_receipt():
+                        result.chain.append(Plain("\n" + receipt))
             for part in result.chain:
                 if isinstance(part, Plain):
                     part.text = self.clean_tool_echo(part.text)
@@ -253,6 +318,7 @@ class CompanionAlbum(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.store = Store(Path(get_astrbot_plugin_data_path()) / NAME)
+        self.qq_actions = QQActions(self, config if config is not None else {})
         self.engine = Engine(self.store, self.complete_job)
         self.plans = LifePlans(
             self.store,
@@ -278,6 +344,7 @@ class CompanionAlbum(Star):
         self.backup_api.register(NAME)
         routes = [
             ("state", self.api_state, ["GET"]),
+            ("qq/accounts", self.api_qq_accounts, ["GET"]),
             ("history", self.api_history, ["GET"]),
             ("diagnostics/options", self.api_diagnostics_options, ["GET"]),
             ("diagnostics/preview", self.api_diagnostics_preview, ["POST"]),
@@ -304,6 +371,7 @@ class CompanionAlbum(Star):
         self.store.cleanup_media()
         await self.engine.start()
         await self.plans.start()
+        self.qq_actions.start()
         History(self.store).cleanup(busy=self.engine.tasks)
         self.media_cleanup_task = asyncio.create_task(self.cleanup_media_loop())
 
@@ -326,6 +394,7 @@ class CompanionAlbum(Star):
         for task in recovery_tasks:
             task.cancel()
         await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        await self.qq_actions.close()
         await self.backup_api.service.close()
         await self.proactive.close()
         await self.memory_service.close()
@@ -425,6 +494,8 @@ class CompanionAlbum(Star):
 
     @managed
     async def api_state(self):
+        characters = self.store.all("character")
+        qq = getattr(self, "qq_actions", None)
         assets = self.store.all("asset")
         expired = {a["id"] for a in assets if a.get("expired")}
         jobs = [
@@ -440,8 +511,13 @@ class CompanionAlbum(Star):
         ]
         return json_response(
             {
-                "characters": self.store.all("character"),
+                "characters": characters,
                 "settings": self.store.public_settings(),
+                "qq_actions": qq.web_settings() if qq else None,
+                "qq_scopes": [
+                    scope for character in characters
+                    for scope in character["sessions"] if qq.is_qq_scope(scope)
+                ] if qq else [],
                 "jobs": jobs,
                 "deliveries": self.store.deliveries(),
                 "sessions": list(self.seen_sessions.values())[-50:],
@@ -450,6 +526,14 @@ class CompanionAlbum(Star):
                 ),
             }
         )
+
+    @managed
+    async def api_qq_accounts(self):
+        try:
+            scope = text_value(request.query.get("scope", ""), 300)
+            return json_response({"accounts": self.qq_actions.accounts_for_scope(scope)})
+        except AlbumError as exc:
+            return error_response(str(exc), status_code=getattr(exc, "status_code", 400))
 
     @managed
     async def api_assets(self):
@@ -991,6 +1075,11 @@ class CompanionAlbum(Star):
                 if data.get("base_url"):
                     validate_url(data["base_url"])
                 return json_response(self.store.save_settings(data))
+            if action == "qq_settings":
+                self.store.restore_guard.external_allowed()
+                settings = self.qq_actions.save_web_settings(data)
+                self.qq_actions.start()
+                return json_response(settings)
             if action == "save_provider":
                 return json_response(self.store.save_provider(data))
             if action == "history_manage":
@@ -1296,6 +1385,21 @@ class CompanionAlbum(Star):
                 "Album context media could not be collected; chat will continue"
             )
 
+    @staticmethod
+    def _chat_schedule_item(row: dict, *, include_editable: bool = False) -> dict:
+        fields = (
+            "id", "name", "anchor_ts", "effective_ts", "anchor_local", "effective_local",
+            "timezone", "state", "decision", "progress", "revision", "mode", "reason",
+        )
+        if include_editable:
+            fields += ("editable",)
+        item = {key: row[key] for key in fields if key in row}
+        item["kind"] = "user_reminder" if row.get("mode") == "reminder" else "life_context"
+        summary = next(iter(plain_text(row.get("instruction")).splitlines()), "").strip()
+        if summary:
+            item["summary"] = summary if len(summary) <= 120 else summary[:119].rstrip() + "…"
+        return item
+
     def _today_schedule_hint(self, scope: str, cid: str = "") -> dict:
         """Build the optional today_schedule hint; failures must not drop album context."""
         try:
@@ -1332,29 +1436,155 @@ class CompanionAlbum(Star):
                     )
                 )
                 schedule["occurrences"] = [
-                    {
-                        k: row[k]
-                        for k in (
-                            "id",
-                            "name",
-                            "effective_ts",
-                            "anchor_ts",
-                            "timezone",
-                            "state",
-                            "decision",
-                            "progress",
-                            "revision",
-                            "mode",
-                            "reason",
-                        )
-                        if k in row
-                    }
-                    for row in items[:6]
+                    self._chat_schedule_item(row) for row in items[:6]
                 ]
             return {"today_schedule": schedule}
         except Exception:
             logger.warning("Today schedule hint unavailable; album context continues")
             return {}
+
+    @filter.on_waiting_llm_request(priority=-100001)
+    async def qq_request_origin(self, event: AstrMessageEvent):
+        # ProcessStage sets this before entering the agent for plugin requests.
+        ordinary = event.get_extra("provider_request") is None
+        event.set_extra(NAME + "_qq_chat_request", ordinary)
+        qq = getattr(self, "qq_actions", None)
+        if ordinary and qq is not None:
+            qq.observe_account(event)
+
+    @filter.on_llm_request(priority=-100001)
+    async def qq_tool_scope(self, event: AstrMessageEvent, req: ProviderRequest):
+        """Add account tools only to an authorized live chat request."""
+        tools = [tool for tool in req.func_tool.tools if tool.name not in QQ_TOOLS] if req.func_tool else []
+        if req.func_tool and len(tools) != len(req.func_tool.tools):
+            req.func_tool = ToolSet(tools=tools)
+        # The host stores the ordinary request itself; it copies a plugin's request.
+        ordinary = event.get_extra(NAME + "_qq_chat_request") is True
+        event.set_extra(NAME + "_qq_chat_request", None)
+        if not ordinary or event.get_extra("provider_request") is not req:
+            return
+        try:
+            service = getattr(self, "qq_actions", None)
+            if service is None:
+                return
+            session, _, _ = service.authorize(event)
+        except (AlbumError, ValueError):
+            return
+        plugins = getattr(event, "plugins_name", None)
+        if plugins is not None and NAME not in plugins:
+            return
+        allowed = QQ_TOOLS if service.admin_private(event, session) else {"album_qq_poke"}
+        persona_id = event.get_extra("_trace_persona_id")
+        if persona_id is not None:
+            persona = self.context.persona_manager.get_persona_v3_by_id(persona_id)
+            if persona and persona.get("tools") is not None:
+                allowed = allowed.intersection(persona["tools"])
+        # Local tools are not in the host's default tool set, so cron cannot load them.
+        disabled = await sp.global_get("inactivated_llm_tools", []) or []
+        permissions = await sp.global_get("tool_permissions", {})
+        defaults = permissions.get("_default", {}) if isinstance(permissions, dict) else {}
+        defaults = defaults if isinstance(defaults, dict) else {}
+        req.func_tool = ToolSet(tools=tools + [
+            FunctionTool(
+                name=name,
+                description=description,
+                parameters=params,
+                handler=getattr(self, name),
+                handler_module_path=__name__,
+            )
+            for name, (description, params) in self.QQ_TOOL_SPECS.items()
+            if name in allowed and name not in disabled
+            and (event.is_admin() or defaults.get(name) != "admin")
+        ])
+
+    QQ_TOOL_SPECS = {
+        "album_qq_profile": (
+            "Change your own QQ nickname or personal signature.",
+            {"type": "object", "properties": {
+                "nickname": {"type": "string", "description": "New nickname, or leave empty."},
+                "signature": {"type": "string", "description": "New signature, or leave empty."},
+            }},
+        ),
+        "album_qq_status": (
+            "Set your own QQ status temporarily. It returns to online at expiry.",
+            {"type": "object", "required": ["status"], "properties": {
+                "status": {"type": "string", "description": "online, qme, away, busy, dnd, invisible, listening, sleeping, or studying."},
+                "duration_minutes": {"type": "number", "description": "Whole minutes from 1 to 1440. Defaults to 60."},
+                "delay_minutes": {"type": "number", "description": "Whole minutes from 0 to 1440. Defaults to immediate."},
+            }},
+        ),
+        "album_qq_status_read": (
+            "Read the last confirmed QQ status and any pending or failed recovery.",
+            {"type": "object", "properties": {}},
+        ),
+        "album_qq_poke": (
+            "Poke the sender of the current QQ message once, when it suits the conversation.",
+            {"type": "object", "properties": {}},
+        ),
+        AVATAR_TOOL: (
+            "Choose a favorite photo from your own album as your QQ avatar. Keep your public reply conversational; the plugin reports the QQ avatar result separately.",
+            {"type": "object", "required": ["asset_id"], "properties": {
+                "asset_id": {"type": "string", "description": "Photo ID returned by this role's album. Use album_search if needed."},
+            }},
+        ),
+    }
+
+    async def album_qq_profile(
+        self, event: AstrMessageEvent, nickname: str = "", signature: str = ""
+    ) -> dict:
+        try:
+            return await self.qq_actions.profile(event, nickname, signature)
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_status(
+        self,
+        event: AstrMessageEvent,
+        status: str,
+        duration_minutes: int = 60,
+        delay_minutes: int = 0,
+    ) -> dict:
+        try:
+            if type(duration_minutes) is float and duration_minutes.is_integer():
+                duration_minutes = int(duration_minutes)
+            if type(delay_minutes) is float and delay_minutes.is_integer():
+                delay_minutes = int(delay_minutes)
+            return await self.qq_actions.set_status(
+                event, status, duration_minutes, delay_minutes
+            )
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_status_read(self, event: AstrMessageEvent) -> dict:
+        try:
+            return await self.qq_actions.read_status(event)
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_poke(self, event: AstrMessageEvent) -> dict:
+        try:
+            return await self.qq_actions.poke(event)
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_avatar(self, event: AstrMessageEvent, asset_id: str) -> dict:
+        flow = event.get_extra(NAME + "_chat_flow")
+        if isinstance(flow, AlbumOutput):
+            if flow.avatar_outcome not in (None, "started"):
+                return {"status": "already_handled", "original_status": flow.avatar_outcome}
+            # If execution is interrupted after dispatch, a second call must not retry.
+            flow.avatar_outcome = "unknown"
+        try:
+            result = await self.qq_actions.avatar(event, asset_id)
+        except QQConnectionUnavailable:
+            result = {"status": "unavailable"}
+        except (AlbumError, ValueError) as exc:
+            result = {"status": "failed", "message": str(exc)}
+        except OSError:
+            result = {"status": "failed", "message": "无法读取所选相册图片"}
+        if isinstance(flow, AlbumOutput):
+            flow.avatar_outcome = result["status"]
+        return result
 
     def event_key(self, event: AstrMessageEvent, operation: str) -> str:
         message_id = str(getattr(event.message_obj, "message_id", ""))
@@ -1395,27 +1625,7 @@ class CompanionAlbum(Star):
         rows = self.plans.today(scope, cid)
         event.set_extra(NAME + "_today_ids", {x["id"] for x in rows})
         return {
-            "items": [
-                {
-                    k: row[k]
-                    for k in (
-                        "id",
-                        "name",
-                        "anchor_ts",
-                        "effective_ts",
-                        "timezone",
-                        "state",
-                        "revision",
-                        "decision",
-                        "progress",
-                        "reason",
-                        "mode",
-                        "editable",
-                    )
-                    if k in row
-                }
-                for row in rows
-            ]
+            "items": [self._chat_schedule_item(row, include_editable=True) for row in rows]
         }
 
     @filter.llm_tool(name="album_plan_adjust")

@@ -1,1 +1,15 @@
-{}
+{
+  "qq_actions_enabled": {
+    "description": "QQ 资料与互动",
+    "type": "bool",
+    "default": false,
+    "hint": "授权会话可戳当前发言者。改昵称、签名、状态和头像仅限管理员 QQ 私聊。"
+  },
+  "qq_actions_sessions": {
+    "description": "QQ 动作授权会话",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": [],
+    "hint": "每项填写 接入ID:机器人QQ号:FriendMessage或GroupMessage:会话ID。会话还需绑定角色。"
+  }
+}

@@ -54,10 +54,11 @@ const selectedPlans = new Map();
 let planSortMenuEvents;
 let albumPanelEvents;
 let settingsSession;
+let qqSettingsSession;
 let assistantSettingsSession;
 let settingsWriteBusy = false;
 window.addEventListener("beforeunload", event => {
-  if (settingsWriteBusy || [settingsSession, assistantSettingsSession].some(session => session && (session.saving || session.dirty()))) { event.preventDefault(); event.returnValue = ""; }
+  if (settingsWriteBusy || [settingsSession, assistantSettingsSession, qqSettingsSession].some(session => session && (session.saving || session.dirty()))) { event.preventDefault(); event.returnValue = ""; }
 });
 const selectedHistory = new Map();
 const historyState = {kind: "jobs", status: "", character: "", query: "", offset: 0, manage: false, page: null};
@@ -155,7 +156,7 @@ function toast(text, error = false) {
   toastTimer = setTimeout(() => (el.className = ""), 6000);
 }
 async function act(action, payload) {
-  if (!["settings", "save_provider"].includes(action)) return bridge.apiPost("action/" + action, payload);
+  if (!["settings", "save_provider", "qq_settings"].includes(action)) return bridge.apiPost("action/" + action, payload);
   if (settingsWriteBusy) throw new Error("设置正在保存，请稍后重试");
   settingsWriteBusy = true;
   try { return await bridge.apiPost("action/" + action, payload); }
@@ -231,6 +232,7 @@ async function render() {
     dialog.close();
   }
   settingsSession?.dispose(); settingsSession = null;
+  qqSettingsSession = null;
   assistantSettingsSession?.dispose();
   disposeBackup();
   const serial = ++state.serial;
@@ -270,7 +272,7 @@ async function reload() {
 function nav(tab) {
   document.getElementById("mobile-app-select").value = state.tab;
   if (state.tab === tab) return Promise.resolve(true);
-  if (settingsWriteBusy || settingsSession?.saving || assistantSettingsSession?.saving || (settingsSession?.dirty() || assistantSettingsSession?.dirty()) && !window.confirm("有未保存的设置，离开后将放弃这些修改。继续离开？")) {
+  if (settingsWriteBusy || settingsSession?.saving || assistantSettingsSession?.saving || (settingsSession?.dirty() || assistantSettingsSession?.dirty() || qqSettingsSession?.dirty()) && !window.confirm("有未保存的设置，离开后将放弃这些修改。继续离开？")) {
     return false;
   }
   selectedPhotos.clear(); state.albumManage = false;
@@ -2357,9 +2359,135 @@ async function openMemoryAssistantSettings(options = {}) {
   return session;
 }
 
+function mountQQSettings(form, data, characters, qqScopes) {
+  const find = id => form.querySelector("#qq-" + id);
+  let saved = structuredClone(data), sessions = [...data.sessions], saving = false;
+  const enabled = find("enabled"), target = find("target"), account = find("account");
+  const picker = find("account-choice"), accountLabel = find("account-label"), add = find("add");
+  let lookup = 0, loadingAccounts = false;
+  const list = find("grants"), status = find("status"), submit = find("save"), cancel = find("cancel");
+  const value = () => ({enabled: enabled.checked, sessions});
+  const dirty = () => JSON.stringify(value()) !== JSON.stringify(saved);
+  const options = characters.flatMap(character => (character.sessions || []).flatMap(scope => {
+    if (!qqScopes.includes(scope)) return [];
+    const match = /^([^:]+):(FriendMessage|GroupMessage):([1-9][0-9]{0,15}(?:_[1-9][0-9]{0,15})?)$/.exec(scope);
+    if (!match) return [];
+    const [, platform, kind, id] = match;
+    if (kind === "FriendMessage" && id.includes("_")) return [];
+    const label = `${character.name} · ${platform} · ${kind === "FriendMessage" ? "私聊" : "群聊"} ${id}`;
+    return [`<option value="${escape(scope)}">${escape(label)}</option>`];
+  }));
+  target.innerHTML = `<option value="">${options.length ? "选择已绑定会话" : "请先在角色页绑定 QQ 会话"}</option>` + options.join("");
+  add.disabled = true;
+  const update = () => {
+    submit.hidden = cancel.hidden = !dirty() && !saving;
+    submit.disabled = cancel.disabled = saving;
+  };
+  target.onchange = async () => {
+    const scope = target.value, version = ++lookup;
+    loadingAccounts = !!scope;
+    account.value = ""; account.readOnly = false;
+    account.hidden = false; account.disabled = true;
+    picker.hidden = true; picker.disabled = true; picker.value = "";
+    accountLabel.setAttribute("for", "qq-account");
+    add.disabled = true; status.textContent = "";
+    if (!scope) return;
+    try {
+      const result = await bridge.apiGet("qq/accounts", {scope});
+      if (version !== lookup || !form.isConnected) return;
+      const accounts = result.accounts;
+      if (accounts.length === 1) {
+        account.value = accounts[0];
+        account.readOnly = true;
+      } else if (accounts.length > 1) {
+        account.hidden = true;
+        picker.innerHTML = '<option value="">选择机器人 QQ 号</option>' +
+          accounts.map(id => `<option value="${escape(id)}">${escape(id)}</option>`).join("");
+        picker.value = ""; picker.hidden = false; picker.disabled = false;
+        accountLabel.setAttribute("for", "qq-account-choice");
+      } else {
+        status.textContent = "此会话还没有识别到机器人。可以手填，或发一条消息后重新选择。";
+      }
+    } catch {
+      if (version !== lookup || !form.isConnected) return;
+      status.textContent = "读取机器人失败，请重新选择会话重试。";
+      return;
+    } finally {
+      if (version === lookup) loadingAccounts = false;
+    }
+    account.disabled = account.hidden;
+    add.disabled = false;
+  };
+  const draw = () => {
+    list.innerHTML = sessions.map((grant, index) => {
+      const [platform, bot, kind, id] = grant.split(":");
+      const label = id ? `${platform} · 机器人 ${bot} · ${kind === "FriendMessage" ? "私聊" : "群聊"} ${id}` : grant;
+      return `<li>${escape(label)} <button type="button" data-qq-remove="${index}">移除</button></li>`;
+    }).join("");
+    for (const button of list.querySelectorAll("[data-qq-remove]")) {
+      button.onclick = () => {
+        if (saving) return;
+        sessions.splice(Number(button.dataset.qqRemove), 1);
+        status.textContent = ""; draw(); target.focus();
+      };
+    }
+    update();
+  };
+  enabled.onchange = () => { status.textContent = ""; update(); };
+  add.onclick = () => {
+    if (saving || loadingAccounts || add.disabled) return;
+    const field = picker.hidden ? account : picker;
+    const robot = field.value.trim();
+    if (!target.value || !/^[1-9][0-9]{0,15}$/.test(robot)) {
+      status.textContent = "请选择会话并填写机器人 QQ 号。";
+      (target.value ? field : target).focus();
+      return;
+    }
+    const separator = target.value.indexOf(":");
+    const grant = target.value.slice(0, separator) + ":" + robot + target.value.slice(separator);
+    if (sessions.includes(grant)) { status.textContent = "这条会话已授权给该机器人。"; return; }
+    sessions.push(grant);
+    status.textContent = ""; draw();
+  };
+  cancel.onclick = () => {
+    enabled.checked = saved.enabled; sessions = [...saved.sessions];
+    status.textContent = ""; draw(); enabled.focus();
+  };
+  form.onsubmit = async event => {
+    event.preventDefault();
+    if (!dirty() || saving || loadingAccounts || settingsWriteBusy || settingsSession?.saving) return;
+    saving = true; status.textContent = ""; update();
+    const controls = [...form.querySelectorAll("input, select, button")];
+    const disabled = controls.map(el => [el, el.disabled]);
+    controls.forEach(el => el.disabled = true);
+    try {
+      saved = await act("qq_settings", {...value(), expected: saved});
+      state.data.qq_actions = structuredClone(saved);
+      enabled.checked = saved.enabled; sessions = [...saved.sessions];
+      status.textContent = "已保存";
+    } catch (error) { status.textContent = error.message || "保存失败，修改已保留"; }
+    finally {
+      saving = false;
+      for (const [el, old] of disabled) el.disabled = old;
+      draw();
+    }
+  };
+  draw();
+  return {dirty};
+}
+
 function renderSettings() {
   const s = state.data.settings;
   main.innerHTML = `<div class="page-tools"><div class="subhead"><h2>设置</h2><div class="savebar"><p class="help" id="settings-status" role="status" aria-live="polite"></p><button id="save-settings" class="primary" type="submit" form="settings-form" hidden>保存设置</button></div></div></div>
+  ${state.data.qq_actions ? `<form id="qq-settings-form" class="panel" novalidate>
+  <h3>QQ 资料与互动</h3>
+  <label class="check"><input type="checkbox" id="qq-enabled" ${state.data.qq_actions.enabled ? "checked" : ""}>启用 QQ 资料与互动</label>
+  <p class="help">授权会话可戳当前发言者。改昵称、签名、状态和头像仅限管理员 QQ 私聊。</p>
+  <ul id="qq-grants" aria-label="已授权会话"></ul>
+  <div class="form-row"><div><label for="qq-target">要授权的会话</label><select id="qq-target"></select></div>
+  <div><label id="qq-account-label" for="qq-account">机器人 QQ 号</label><input id="qq-account" inputmode="numeric" maxlength="16" disabled><select id="qq-account-choice" hidden disabled></select></div></div>
+  <div class="actions"><button type="button" id="qq-add">添加授权</button><button type="button" id="qq-cancel" hidden>取消修改</button><button class="primary" id="qq-save" type="submit" hidden>保存 QQ 设置</button></div>
+  <p id="qq-status" class="help" role="status" aria-live="polite"></p></form>` : ""}
   <form id="settings-form" novalidate><div class="settings-grid"><section class="panel" id="site-panel"></section>
   <section class="panel"><h3>生成与重试</h3>
   <label for="preferred-provider">首选生成站点</label><select id="preferred-provider"></select>
@@ -2384,6 +2512,8 @@ function renderSettings() {
   <p class="help">超时有任务编号时保留查询；无编号按“结果未知时允许重试”设置处理。</p></details></section></div></form><section class="panel backup-entry"><h3>备份与恢复</h3><button type="button" id="open-backup">备份与恢复</button></section>`;
   const directory = {};
   settingsSession = providerFields(s, planRecoverySettings(s.plan_recovery, false, directory));
+  const qqForm = main.querySelector("#qq-settings-form");
+  if (qqForm) qqSettingsSession = mountQQSettings(qqForm, state.data.qq_actions, state.data.characters || [], state.data.qq_scopes || []);
   main.querySelector("#memory-assistant-link").onclick = () => openMemoryAssistantSettings();
   main.querySelector("#open-backup").onclick = event => {
     const session = settingsSession;

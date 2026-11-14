@@ -26,6 +26,7 @@ OWN_TOOLS = frozenset({
     "album_search", "album_favorite", "album_save_scene", "album_generate",
     "album_send", "album_publish_qzone", "album_plan_schedule",
     "album_plan_cancel", "album_schedule_trip",
+    "album_qq_profile", "album_qq_status", "album_qq_status_read", "album_qq_poke", "album_qq_avatar",
 })
 _ENVELOPE_OR_JSON = re.compile(
     r'\[Tool result for (?P<tool>[A-Za-z_][A-Za-z_0-9]*)\]\s*:\s*|[\[{"]'
