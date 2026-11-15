@@ -8,9 +8,18 @@ from weakref import ref
 
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import TextPart
 from astrbot.core.persona_error_reply import extract_persona_custom_error_message_from_event
 
 AVATAR_TOOL = "album_qq_avatar"
+SILENT_TOOLS = frozenset(
+    {
+        "album_generate",
+        AVATAR_TOOL,
+        "album_qq_profile_read",
+        "album_qq_qzone_read",
+    }
+)
 AVATAR_RECEIPTS = {
     "confirmed": "已经换上新头像啦！",
     "failed": "这次没能换成 QQ 头像。",
@@ -35,7 +44,9 @@ class AlbumOutput:
         self.has_final_body = False
         self.pending = []
         self.ready = []
-        self.meme_parts = set()
+        self.published = set()
+        self.repeated = None
+        self.suppress_final = False
         self.avatar_outcome = None
         self.avatar_receipt_emitted = False
         # None means ordinary results; False means a host stream without our wrapper.
@@ -117,7 +128,7 @@ class AlbumOutput:
                 continue
             names = {call.function.name for call in calls}
             self.had_tools = True
-            drop = self.image_turn or bool(names & {"album_generate", AVATAR_TOOL})
+            drop = self.image_turn or bool(names & SILENT_TOOLS)
             meme = not drop and names == {"send_meme"}
             self.had_meme |= meme
             if len(self.steps) < self.MAX_STEPS:
@@ -126,7 +137,7 @@ class AlbumOutput:
                     part.text for part in content or () if getattr(part, "type", "") == "text"
                 )
                 action = "drop" if drop else "meme" if meme else "keep"
-                self.steps.append((self._signature(text), action))
+                self.steps.append((self._signature(text), action, ref(message)))
             else:
                 self.steps_invalid = True
             self.tools.update(names)
@@ -148,16 +159,17 @@ class AlbumOutput:
         self.executing = max(0, self.executing - 1)
 
     def _resolve(self):
-        if not self.image_turn and not self.tools & {"album_generate", AVATAR_TOOL}:
+        if self.pending and not self.image_turn and not (self.tools & SILENT_TOOLS):
             meme = self.tools == {"send_meme"}
+            separator = "" if self.stream_guarded else " "
+            signature = self._signature(separator.join(part.text for part in self.pending))
             if meme:
                 self.size -= sum(max(1, len(part.text)) for part in self.pending)
                 text = self.clean_meme_text("".join(part.text for part in self.pending))
                 self.pending = [Plain(text)] if text else []
                 self.size += sum(max(1, len(part.text)) for part in self.pending)
                 self.had_meme = True
-                self.meme_parts.update(id(part) for part in self.pending)
-            self.ready.extend(self.pending)
+            self.ready.append((signature, meme, self.pending))
         else:
             self.size -= sum(max(1, len(part.text)) for part in self.pending)
         self.pending = []
@@ -172,7 +184,6 @@ class AlbumOutput:
             if self.size + max(1, len(part.text)) > self.MAX_CHARS:
                 self.pending.clear()
                 self.ready.clear()
-                self.meme_parts.clear()
                 self.size = 0
                 self.overflow = True
                 continue
@@ -182,17 +193,18 @@ class AlbumOutput:
     def take_ready(self):
         if self.tools and not self.executing:
             self._resolve()
-        # Keep subsequent text in order behind a held tool draft.
-        end = len(self.ready)
-        if not self.done:
-            end = next(
-                (i for i, part in enumerate(self.ready) if id(part) in self.meme_parts), end
-            )
-        result, self.ready = self.ready[:end], self.ready[end:]
-        self.size -= sum(max(1, len(part.text)) for part in result)
-        if self.done and self.had_meme:
-            result = [part for part in result if not self.has_final_body or id(part) not in self.meme_parts]
-            self.meme_parts.clear()
+        # Keep subsequent text in order behind a held meme-only draft.
+        result = []
+        for index, (signature, meme, parts) in enumerate(self.ready):
+            if meme and not self.done:
+                self.ready = self.ready[index:]
+                return result
+            self.size -= sum(max(1, len(part.text)) for part in parts)
+            if signature != self.repeated and not (meme and self.has_final_body):
+                result.extend(parts)
+                if parts and len(self.published) < self.MAX_STEPS:
+                    self.published.add(signature)
+        self.ready.clear()
         return result
 
     def decorate(self, result):
@@ -202,6 +214,10 @@ class AlbumOutput:
             self.pending.clear()
             if self.had_tools and not self.saw_intermediate:
                 result.chain = self._filter_merged(result.chain)
+            elif self.suppress_final:
+                result.chain = [part for part in result.chain if not isinstance(part, Plain)]
+                if self.final_text:
+                    result.chain.append(Plain(self.final_text))
             else:
                 for part in result.chain:
                     if isinstance(part, Plain):
@@ -224,7 +240,7 @@ class AlbumOutput:
         # run_agent merges complete step chains. Match their exact public text
         # against each observed occurrence; media keep their original order.
         # Only hashes/lengths are retained, never another copy of step bodies.
-        expected = list(self.steps)
+        expected = [(signature, action) for signature, action, _ in self.steps]
         if self.final_signature and self.final_signature[0]:
             expected.append((self.final_signature, "final" if self.had_meme else "keep"))
         cursor, empty_steps = 0, 0
@@ -284,7 +300,7 @@ class AlbumOutput:
             kept.append(Plain(self.final_text))
         return kept
 
-    def finish(self, response):
+    def finish(self, response, original_body="", receipt=""):
         self.observe()
         self.done = True
         self.final_text = response.completion_text or "".join(
@@ -295,22 +311,41 @@ class AlbumOutput:
             self.final_text = self.clean_meme_text(self.final_text)
         # A program receipt does not replace the fallback text of a meme-only step.
         body = self.final_text.rstrip()
-        if receipt := self.avatar_receipt:
-            body = body.removesuffix(receipt)
+        if self.avatar_receipt:
+            body = body.removesuffix(self.avatar_receipt)
         self.has_final_body = bool(body.strip())
+        if response.role == "assistant" and original_body.strip():
+            signature = self._signature(original_body)
+            current_messages = {id(message) for message in self.context.messages}
+            for index, (previous, action, message_ref) in enumerate(self.steps):
+                if previous != signature:
+                    continue
+                message = message_ref()
+                if message is not None and id(message) in current_messages:
+                    # The tool call and result keep their IDs and position in history.
+                    message.content = (
+                        None if isinstance(message.content, str) else
+                        [part for part in message.content or () if not isinstance(part, TextPart)]
+                    )
+                if action != "drop":
+                    self.steps[index] = previous, "drop", message_ref
+                    self.repeated = signature
+            if self.repeated is not None and signature in self.published:
+                self.suppress_final = True
+                self.final_text = receipt
         if (
-            self.had_meme
+            (self.had_meme or self.pending or self.ready)
             and response.role == "assistant"
             and not response.completion_text
             and not response.result_chain
         ):
-            # Keep an empty final boundary so non-streaming releases held prose.
+            # The host skips an empty final without a chain. Release held prose.
             response.result_chain = MessageChain(chain=[Plain("")])
 
     def clear(self):
         self.pending.clear()
         self.ready.clear()
-        self.meme_parts.clear()
+        self.published.clear()
         self.tools.clear()
         self.cursor = 0
         self.boundary = None

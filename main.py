@@ -52,7 +52,7 @@ from .plans import (
 )
 from .provider import ImageProvider, PublicResolver, validate_url
 from .proactive import ProactiveHistory, clean_tool_echo, marker
-from .qq_actions import QQ_TOOLS, QQActions, QQConnectionUnavailable
+from .qq_actions import QQ_READ_TOOLS, QQ_TOOLS, QQActions, QQConnectionUnavailable
 from .store import (
     MAX_BYTES,
     AlbumError,
@@ -82,6 +82,7 @@ RULES = """
 只想发纯文字动态时，album_publish_qzone 的 asset_ids 和 job_id 都留空；指定图片或生成任务失败时不能改发纯文字来绕过失败。
 旧相册图按旧照片表达，不声称刚拍的。只用工具给出的图片编号。工具失败时不要反复调用，继续自然聊天。
 想念过去、结束出游或回顾一周/一个月时，可以用album_search的日期范围翻相册，按返回的next_offset翻页；这些是自然的回顾场景，不是必须执行的日程。描述与日期是回忆依据，不编造照片里没记录的经历。喜欢或想长期留下的成图用album_favorite收藏，收藏不自动发布。普通相册照已可用于聊天/空间，不必让用户去网页逐张赋权。挑选相符的1至9张已有照片交给album_publish_qzone分享，可组成九图回顾，不必凑满九张或重新生成。
+QQ自查：需要确认你自己的QQ昵称、个性签名或最近QQ空间说说时，按需调用只读工具 album_qq_profile_read 或 album_qq_qzone_read；调用工具时不要先发“我去看看”等过渡消息或提前猜测内容，收到真实返回结果后再用符合当前人设的口吻自然回答。signature状态为empty表示已确认当前签名为空，missing或status非ok表示未能确认，不编造未返回的昵称、签名或空间内容。
 """.strip()
 
 
@@ -200,13 +201,14 @@ class CompanionAlbum(Star):
         clean, receipt = cleanup or (None, "")
         flow = event.get_extra(NAME + "_chat_flow")
         saved_text = response.completion_text or ""
+        original_body = ""
         if run_context.messages:
             last = run_context.messages[-1]
             if last.role == "assistant" and not last.tool_calls:
                 text_parts = [p for p in last.content or () if isinstance(p, TextPart)]
                 if len(text_parts) == 1:
                     # Apply only our own correction to the original saved text.
-                    saved_text = text_parts[0].text
+                    original_body = saved_text = text_parts[0].text
                     if clean:
                         cleaned = clean(saved_text)
                         if cleaned != saved_text:
@@ -220,7 +222,7 @@ class CompanionAlbum(Star):
             if clean:
                 flow.clean = clean
             # All display hooks have finished, including foreign label removal.
-            flow.finish(response)
+            flow.finish(response, original_body, receipt)
         if getattr(self, "memory_runtime", None):
             try:
                 await self.memory_runtime.done(event)
@@ -1473,7 +1475,11 @@ class CompanionAlbum(Star):
         plugins = getattr(event, "plugins_name", None)
         if plugins is not None and NAME not in plugins:
             return
-        allowed = QQ_TOOLS if service.admin_private(event, session) else {"album_qq_poke"}
+        allowed = (
+            QQ_TOOLS
+            if service.admin_private(event, session)
+            else ({"album_qq_poke"} | QQ_READ_TOOLS)
+        )
         persona_id = event.get_extra("_trace_persona_id")
         if persona_id is not None:
             persona = self.context.persona_manager.get_persona_v3_by_id(persona_id)
@@ -1505,6 +1511,14 @@ class CompanionAlbum(Star):
                 "signature": {"type": "string", "description": "New signature, or leave empty."},
             }},
         ),
+        "album_qq_profile_read": (
+            "Read your own current QQ nickname and personal signature on demand. Call silently without preliminary text and answer naturally after receiving the result.",
+            {"type": "object", "properties": {}},
+        ),
+        "album_qq_qzone_read": (
+            "Read your own recent Qzone posts on demand (up to 5 items with time, text summary, and image count). Call silently without preliminary text and answer naturally after receiving the result.",
+            {"type": "object", "properties": {}},
+        ),
         "album_qq_status": (
             "Set your own QQ status temporarily. It returns to online at expiry.",
             {"type": "object", "required": ["status"], "properties": {
@@ -1534,6 +1548,18 @@ class CompanionAlbum(Star):
     ) -> dict:
         try:
             return await self.qq_actions.profile(event, nickname, signature)
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_profile_read(self, event: AstrMessageEvent) -> dict:
+        try:
+            return await self.qq_actions.read_profile(event)
+        except (AlbumError, ValueError) as exc:
+            return {"status": "failed", "message": str(exc)}
+
+    async def album_qq_qzone_read(self, event: AstrMessageEvent) -> dict:
+        try:
+            return await self.qq_actions.read_qzone(event)
         except (AlbumError, ValueError) as exc:
             return {"status": "failed", "message": str(exc)}
 

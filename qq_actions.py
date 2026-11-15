@@ -8,6 +8,8 @@ import hashlib
 import io
 import warnings
 from collections import OrderedDict
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiocqhttp.exceptions import ActionFailed, ApiNotAvailable
 from astrbot.api import logger
@@ -19,7 +21,13 @@ from .restore_guard import managed
 from .store import MAX_BYTES, MAX_PIXELS, AlbumError, now, text_value
 
 
-QQ_TOOLS = frozenset(
+QQ_READ_TOOLS = frozenset(
+    {
+        "album_qq_profile_read",
+        "album_qq_qzone_read",
+    }
+)
+QQ_TOOLS = QQ_READ_TOOLS | frozenset(
     {
         "album_qq_profile",
         "album_qq_status",
@@ -257,6 +265,108 @@ class QQActions:
         except Exception:
             return "unknown"
         return "confirmed"
+
+    async def read_self(self, event, action, **params):
+        session, account, _ = self.authorize(event)
+        try:
+            client = self.client(session.platform_id)
+            data = await asyncio.wait_for(
+                client.call_action(action, self_id=account, **params), 12
+            )
+        except (QQConnectionUnavailable, ApiNotAvailable):
+            return "unavailable"
+        except TimeoutError:
+            return "timeout"
+        except (ActionFailed, Exception):
+            return "failed"
+        return ("ok", data) if isinstance(data, dict) else "failed"
+
+    @managed
+    async def read_profile(self, event):
+        _, account, _ = self.authorize(event)
+        result = await self.read_self(
+            event, "get_stranger_info", user_id=account
+        )
+        if not isinstance(result, tuple):
+            return {"status": result}
+        data = result[1]
+        if data.get("user_id") not in (account, str(account)):
+            return {"status": "failed"}
+        nickname = (
+            data["nickname"].strip()[:60]
+            if isinstance(data.get("nickname"), str)
+            else ""
+        )
+        raw_signature = data.get("long_nick")
+        signature = (
+            raw_signature.strip()[:120] if isinstance(raw_signature, str) else ""
+        )
+        confirmed_profile = bool(
+            nickname or (isinstance(data.get("uid"), str) and data["uid"].strip())
+        )
+        fields = {
+            "nickname": "ok" if nickname else "missing",
+            "signature": (
+                "ok"
+                if signature
+                else "empty"
+                if isinstance(raw_signature, str) and confirmed_profile
+                else "missing"
+            ),
+        }
+        status = (
+            "failed"
+            if fields == {"nickname": "missing", "signature": "missing"}
+            else "partial"
+            if "missing" in fields.values()
+            else "ok"
+        )
+        return {
+            "status": status,
+            "nickname": nickname,
+            "signature": signature,
+            "fields": fields,
+        }
+
+    @managed
+    async def read_qzone(self, event):
+        result = await self.read_self(event, "get_qzone_msg_list", pos=0, num=5)
+        if not isinstance(result, tuple):
+            return {"status": result}
+        items = result[1].get("msglist")
+        if items is None:
+            items = []
+        if not isinstance(items, list):
+            return {"status": "failed"}
+        posts = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            images = item.get("images")
+            timestamp = (
+                item["time"]
+                if type(item.get("time")) is int and item["time"] > 0
+                else 0
+            )
+            posts.append(
+                {
+                    "time": timestamp,
+                    "time_local": (
+                        datetime.fromtimestamp(
+                            timestamp, ZoneInfo("Asia/Shanghai")
+                        ).strftime("%Y-%m-%d %H:%M")
+                        if timestamp
+                        else ""
+                    ),
+                    "text": (
+                        item["content"].strip()[:160]
+                        if isinstance(item.get("content"), str)
+                        else ""
+                    ),
+                    "image_count": len(images) if isinstance(images, list) else 0,
+                }
+            )
+        return {"status": "ok", "posts": posts, "timezone": "Asia/Shanghai"}
 
     @managed
     async def profile(self, event, nickname, signature):
