@@ -86,7 +86,7 @@ QQ自查：需要确认你自己的QQ昵称、个性签名或最近QQ空间说�
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.9")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.10")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
