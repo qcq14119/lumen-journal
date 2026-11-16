@@ -869,7 +869,7 @@ function renderActionStages(stages = [], photoMode = "", isLifeRun = false) {
     const status = photo && s.status === "ok" ? "照片任务已建立" : states[s.status] || s.status;
     const reason = photo ? photoReasons[s.code] || "原因未记录" : failureReasons[s.code] || s.code;
     const count = (key, max) => Number.isSafeInteger(s[key]) && s[key] >= 0 && s[key] <= max;
-    const counts = [count("attempt",6)?`第${s.attempt}次尝试`:"",count("calls",6)?`插件调用${s.calls}次`:"",count("elapsed_ms",1200000)?`耗时${(s.elapsed_ms/1000).toFixed(1)}秒`:""].filter(Boolean).join(" · ");
+    const counts = [count("http_status",599)&&s.http_status>=100?`HTTP ${s.http_status}`:"",count("retry_after",1200)&&s.retry_after>0?`退避${s.retry_after}秒`:"",count("attempt",6)?`第${s.attempt}次尝试`:"",count("calls",6)?`插件调用${s.calls}次`:"",count("elapsed_ms",1200000)?`耗时${(s.elapsed_ms/1000).toFixed(1)}秒`:""].filter(Boolean).join(" · ");
     return `<p>${s.at ? escape(date(s.at)) + " · " : ""}${escape(labels[s.stage] || s.stage)} · ${escape(photo && photoReasons[s.code] ? photoReasons[s.code] : status)}${reason && (!photo || !photoReasons[s.code]) ? ` · ${escape(reason)}` : ""}${counts ? ` · ${escape(counts)}` : ""}</p>`;
   }).join("")}</details>`;
 }
@@ -1720,7 +1720,7 @@ function providerFields(s, recovery, maintenance) {
   const dirty = (site = editing) => !!site && signature(site) !== (baseline.find(p => p.id === site.id) ? signature(baseline.find(p => p.id === site.id)) : "");
   const anyDirty = () => {
     return drafts.some(p => dirty(p)) || JSON.stringify(drafts.map(p => p.id)) !== JSON.stringify(baseline.map(p => p.id))
-      || preferred !== saved.preferred_provider || globalFields.some(el => globals()[el.name] !== saved[el.name]) || !!recovery?.dirty() || !!maintenance?.dirty();
+      || preferred !== saved.preferred_provider || globalFields.some(el => (el.type === "checkbox" ? globals()[el.name] !== !!saved[el.name] : globals()[el.name] !== saved[el.name])) || !!recovery?.dirty() || !!maintenance?.dirty();
   };
   const valid = () => !disposed && panel.isConnected;
   const updateSelectors = () => {
@@ -2058,7 +2058,7 @@ function providerFields(s, recovery, maintenance) {
       } else {
         for (const site of drafts) Object.assign(site, normalized.find(p => p.id === site.id));
         preferred = result.preferred_provider;
-        for (const el of globalFields) { if (el.type === "checkbox") el.checked = result[el.name]; else el.value = result[el.name]; }
+        for (const el of globalFields) { if (el.type === "checkbox") el.checked = !!result[el.name]; else el.value = result[el.name]; }
         recovery?.accept(result.plan_recovery); maintenance?.accept(result.memory_maintenance);
       }
       baseline = normalized; saved = structuredClone(result); state.data.settings = structuredClone(result);
@@ -2111,7 +2111,7 @@ function providerFields(s, recovery, maintenance) {
     draw(); panel.querySelector("#site-name").focus();
   };
   main.querySelector("#preferred-provider").onchange = event => { if (!saving) { preferred = event.target.value; updateStatus(); } };
-  form.addEventListener("input", event => { if (event.target.name && !saving) updateStatus(); });
+  for (const type of ["input", "change"]) form.addEventListener(type, event => { if (event.target.name && !saving) updateStatus(); });
   document.addEventListener("pointerdown", event => { if (!panel.querySelector("#site-keys")?.contains(event.target)) closeKeys(); }, {signal: events.signal});
   const controller = {
     get saving() { return saving || !!recovery?.saving || !!maintenance?.saving; }, dirty: anyDirty, saveAll: () => save(),
@@ -2184,14 +2184,68 @@ function planRecoverySettings(initial, maintenance = false, directory = {}, root
     if(editorDirty()){notice("请先保存或取消当前连接编辑。",true);return;}
     closeEditor();editing=item||{};editorRevision=revision;
     const used=item ? `此连接被 ${Number.isSafeInteger(item.usage_count)?item.usage_count:0} 份聊天使用${item.global_roles?.includes("plan_recovery")?"，用于朝夕失败修正":item.global_roles?.includes("memory_maintenance")?"，用于记忆维护":""}。` : "保存到共享文本连接目录。";
-    q("connection-editor").innerHTML=scoped(`<div class="plan-connection-editor"><div class="subhead"><h4>${item?"查看/编辑连接":"新建助手连接"}</h4><button type="button" class="close" id="plan-connection-close" aria-label="关闭连接详情">×</button></div><p class="help">${escape(used)}</p><label for="plan-connection-name">名称</label><input id="plan-connection-name" maxlength="60" value="${escape(item?.name||"")}"><label for="plan-connection-url">接口地址</label><input id="plan-connection-url" type="url" value="${escape(item?.base_url||"")}" placeholder="https://example.com/v1"><label for="plan-connection-key">API Key</label><div class="key-summary"><input id="plan-connection-key" type="password" autocomplete="off" spellcheck="false" placeholder="${item?.key_configured?"已保存，留空保留":""}"><button type="button" id="plan-connection-key-toggle" aria-pressed="false">显示</button></div><label for="plan-connection-model">模型名称</label><input id="plan-connection-model" value="${escape(item?.model||"")}"><label for="plan-connection-window">模型窗口（token）</label><input id="plan-connection-window" type="number" min="1024" max="2000000" step="1" value="${item?.max_context_tokens||32000}"><p class="help">按服务商公布的模型窗口填写。修改地址后须填写新 Key。</p><div class="actions"><button type="button" id="plan-connection-save" hidden>保存连接</button><button type="button" id="plan-connection-cancel" hidden>取消</button></div></div>`);
+    q("connection-editor").innerHTML=scoped(`<div class="plan-connection-editor"><div class="subhead"><h4>${item?"查看/编辑连接":"新建助手连接"}</h4><button type="button" class="close" id="plan-connection-close" aria-label="关闭连接详情">×</button></div><p class="help">${escape(used)}</p><label for="plan-connection-name">名称</label><input id="plan-connection-name" maxlength="60" value="${escape(item?.name||"")}"><label for="plan-connection-url">接口地址</label><input id="plan-connection-url" type="url" value="${escape(item?.base_url||"")}" placeholder="https://example.com/v1"><label for="plan-connection-key">API Key</label><div class="key-summary"><input id="plan-connection-key" type="password" autocomplete="off" spellcheck="false" placeholder="${item?.key_configured?"已保存，留空保留":""}"><button type="button" id="plan-connection-key-toggle" aria-pressed="false">显示</button></div><label for="plan-connection-model">模型名称</label><div class="key-summary"><input id="plan-connection-model" autocomplete="off" spellcheck="false" value="${escape(item?.model||"")}"><button type="button" id="plan-connection-list" title="从接口读取可用模型">拉取模型</button></div><datalist id="plan-model-list"></datalist><select id="plan-connection-model-pick" aria-label="选择已拉取的模型" hidden></select><label for="plan-connection-window">模型窗口（token）</label><input id="plan-connection-window" type="number" min="1024" max="2000000" step="1" value="${item?.max_context_tokens||32000}"><p class="help">按服务商公布的模型窗口填写。修改地址后须填写新 Key。</p><p id="plan-connection-feedback" class="help" role="status" aria-live="polite"></p><div class="actions"><button type="button" id="plan-connection-test">测试连接</button><button type="button" id="plan-connection-save" hidden>保存连接</button><button type="button" id="plan-connection-cancel" hidden>取消</button></div></div>`);
     baseline=editorValue();q("connection-name").focus();
-    q("connection-url").oninput=()=>{generation++;clearSecret();};
+    const feedback = (text = "", error = false) => { const el = q("connection-feedback"); if (el) { el.textContent = text; el.classList.toggle("error", error); } };
+    const buildDraft = (requireModel, requireName) => {
+      const input = q("connection-key");
+      const config = {type:"chat", name:q("connection-name").value.trim(), base_url:q("connection-url").value.trim(), model:q("connection-model").value.trim(), max_context_tokens:Number(q("connection-window").value)};
+      if ((requireName && !config.name) || (requireModel && !config.model) || !/^\d+$/.test(q("connection-window").value) || !Number.isSafeInteger(config.max_context_tokens) || config.max_context_tokens<1024 || config.max_context_tokens>2000000) {
+        return {error: requireName ? "请填写名称、模型和有效的整数窗口。" : requireModel ? "请填写模型名称和有效的整数窗口。" : "请填写有效的整数窗口。"};
+      }
+      try { const u = new URL(config.base_url); if (u.protocol!=="https:" || u.username || u.password || u.search || u.hash) throw Error(); }
+      catch { return {error: "请填写不含凭据或查询参数的公开 HTTPS 地址。"}; }
+      if (input.value && !input.dataset.revealed) config.api_key = input.value;
+      if (!config.api_key && (!editing.key_configured || config.base_url.replace(/\/+$/,"") !== (editing.base_url||"").replace(/\/+$/,""))) {
+        return {error: "请填写此地址的 API Key。"};
+      }
+      return {config};
+    };
+    q("connection-url").oninput=()=>{generation++;clearSecret();feedback();const pick=q("connection-model-pick"),list=q("model-list");if(list)list.innerHTML="";if(pick){pick.innerHTML="";pick.hidden=true;}};
     q("connection-close").onclick=dismissEditor;
     q("connection-cancel").onclick=()=>{
       if(saving||settingsWriteBusy)return;
       generation++;const values=JSON.parse(baseline);[...q("connection-editor").querySelectorAll("input")].forEach((input,i)=>input.value=values[i]);
-      clearSecret();updateEditorActions();refreshSummary();controller.changed();q("connection-name").focus();
+      clearSecret();feedback();const pick=q("connection-model-pick");if(pick)pick.hidden=true;updateEditorActions();refreshSummary();controller.changed();q("connection-name").focus();
+    };
+    q("connection-model-pick").onchange=ev=>{
+      if(saving||!ev.target.value)return;
+      generation++;q("connection-model").value=ev.target.value;updateEditorActions();controller.changed();
+    };
+    q("connection-list").onclick=async()=>{
+      if(saving||settingsWriteBusy)return;
+      const draft=buildDraft(false,false);
+      if(draft.error){feedback(draft.error,true);return;}
+      const button=q("connection-list"),token=++generation,identifier=editing.id;
+      button.disabled=true;button.setAttribute("aria-busy","true");feedback("正在拉取模型列表…");
+      try{
+        const result=await bridge.apiPost("memory/model_preset",{operation:"list",id:identifier,revision:editorRevision,config:draft.config});
+        if(!valid()||token!==generation||!button.isConnected)return;
+        const items=Array.isArray(result.items)?result.items:[];
+        const listEl=q("model-list"),pickEl=q("connection-model-pick");
+        if(listEl)listEl.innerHTML=items.map(m=>`<option value="${escape(m)}"></option>`).join("");
+        if(pickEl){
+          pickEl.innerHTML=`<option value="">选择已拉取的模型（共 ${items.length} 个）</option>`+items.map(m=>`<option value="${escape(m)}">${escape(m)}</option>`).join("");
+          const currentModel=q("connection-model").value.trim();
+          if(items.includes(currentModel))pickEl.value=currentModel;
+          pickEl.hidden=items.length===0;
+        }
+        feedback(items.length?`读到 ${items.length} 个模型，可在上方选择或手动填写。`:"接口未返回可用模型，请手动填写模型名称。");
+      }catch(err){if(valid()&&token===generation&&button.isConnected)feedback(err?.message||"拉取模型失败，请检查地址和 API Key。",true);}
+      finally{if(button.isConnected){button.disabled=saving;button.removeAttribute("aria-busy");}}
+    };
+    q("connection-test").onclick=async()=>{
+      if(saving||settingsWriteBusy)return;
+      const draft=buildDraft(true,false);
+      if(draft.error){feedback(draft.error,true);return;}
+      const button=q("connection-test"),token=++generation,identifier=editing.id;
+      button.disabled=true;button.setAttribute("aria-busy","true");feedback("正在测试连接…");
+      try{
+        await bridge.apiPost("memory/model_preset",{operation:"test",id:identifier,revision:editorRevision,config:draft.config});
+        if(!valid()||token!==generation||!button.isConnected)return;
+        feedback("连接测试成功，模型响应正常。");
+      }catch(err){if(valid()&&token===generation&&button.isConnected)feedback(err?.message||"连接测试失败，请检查地址、API Key 和模型名称。",true);}
+      finally{if(button.isConnected){button.disabled=saving;button.removeAttribute("aria-busy");}}
     };
     q("connection-key-toggle").onclick=async()=>{
       if(saving)return;
@@ -2206,7 +2260,7 @@ function planRecoverySettings(initial, maintenance = false, directory = {}, root
           input.value=result.value||"";
           // A read-only reveal must never become a key update or dirty draft.
           input.dataset.revealed="true";
-        }catch{if(valid()&&token===generation)notice("密钥读取失败，请重试。",true);return;}
+        }catch(err){if(valid()&&token===generation)notice(err?.message?`密钥读取失败：${err.message}`:"密钥读取失败，请重试。",true);return;}
         finally{if(button.isConnected)button.disabled=false;}
       }
       if(valid()&&token===generation&&input.isConnected){input.type="text";button.textContent="隐藏";button.setAttribute("aria-pressed","true");}
@@ -2214,11 +2268,9 @@ function planRecoverySettings(initial, maintenance = false, directory = {}, root
     q("connection-key").oninput=()=>{delete q("connection-key").dataset.revealed;};
     q("connection-save").onclick=async()=>{
       if(saving||settingsWriteBusy||!editorDirty())return;
-      const input=q("connection-key"),config={type:"chat",name:q("connection-name").value.trim(),base_url:q("connection-url").value.trim(),model:q("connection-model").value.trim(),max_context_tokens:Number(q("connection-window").value)};
-      if(!config.name||!config.model||!/^\d+$/.test(q("connection-window").value)||!Number.isSafeInteger(config.max_context_tokens)||config.max_context_tokens<1024||config.max_context_tokens>2000000){notice("请填写名称、模型和有效的整数窗口。",true);return;}
-      try{const u=new URL(config.base_url);if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash)throw Error();}catch{notice("请填写不含凭据或查询参数的公开 HTTPS 地址。",true);return;}
-      if(input.value&&!input.dataset.revealed)config.api_key=input.value;
-      if(!config.api_key&&(!editing.key_configured||config.base_url.replace(/\/+$/,"")!==(editing.base_url||"").replace(/\/+$/,""))){notice("请填写此地址的 API Key。",true);return;}
+      const draft=buildDraft(true,true);
+      if(draft.error){notice(draft.error,true);return;}
+      const config=draft.config;
       const token=++generation,ids=new Set(catalogue.map(p=>p.id)),identifier=editing.id;
       // A read started before this write cannot replace its catalogue or error.
       readNumber++;directory.epoch=(directory.epoch||0)+1;directory.pending=null;
@@ -2230,7 +2282,7 @@ function planRecoverySettings(initial, maintenance = false, directory = {}, root
         catalogue=result.presets.filter(p=>p.type==="chat");revision=result.models_revision;
         for(const receive of directory.receivers||[])receive(result);
         const added=catalogue.find(p=>!ids.has(p.id));closeEditor();drawCatalogue(added?.id||select.value);notice("连接已保存；保存设置后应用助手选择。");controller.changed();directory.onSaved?.();
-      }catch{if(valid()&&token===generation)notice("连接保存失败，请核对字段或刷新连接版本后重试；输入已保留。",true);}
+      }catch(err){if(valid()&&token===generation)notice(err?.message?`连接保存失败：${err.message}`:"连接保存失败，请核对字段或刷新连接版本后重试；输入已保留。",true);}
       finally{saving=false;settingsWriteBusy=false;for(const [el,old]of disabled)if(el.isConnected)el.disabled=old;if(valid()){q("connection-save")?.removeAttribute("aria-busy");q("edit-connection").disabled=!catalogue.some(p=>p.id===select.value);controller.changed();}}
     };
   };
@@ -2499,7 +2551,9 @@ function renderSettings() {
   <p class="help">重试等待逐步增加，限流时遵守服务端等待时间；已成图只重取原图。并行请求仅采用先取得可读图片的结果，之后优先使用该站点。</p>
   <p class="help">HTTP 524、断线等可能已经提交成功；有任务编号时继续查询，重启和历史任务不自动重投。</p></details></section>
   <section class="panel" id="plan-recovery-panel"></section>
-  <section class="panel"><h3>记忆助手</h3><button type="button" id="memory-assistant-link">记忆助手设置</button></section>
+  <section class="panel"><h3>拾忆回响</h3>
+  <label class="check"><input name="memory_auto_enable" type="checkbox" ${s.memory_auto_enable ? "checked" : ""}>开启新聊天时自动启用记忆</label>
+  <button type="button" id="memory-assistant-link">记忆助手设置</button></section>
   <section class="panel"><h3>QQ 空间与相册保留</h3>
   <label class="check"><input name="qzone_enabled" type="checkbox" ${s.qzone_enabled ? "checked" : ""}>允许所属角色发布相册照片</label><p class="help">开启不会立即发布。</p>
   <label for="visibility">默认可见范围</label><select id="visibility" name="qzone_visibility"><option value="4" ${s.qzone_visibility === 4 ? "selected" : ""}>好友可见</option><option value="64" ${s.qzone_visibility === 64 ? "selected" : ""}>仅自己可见</option><option value="1" ${s.qzone_visibility === 1 ? "selected" : ""}>所有人可见</option></select>

@@ -643,6 +643,21 @@ def _import_models(source, target, mapping):
                 current[role] = copy.deepcopy(incoming[role])
                 if current[role].get("preset_id"):
                     current[role]["preset_id"] = aliases.get(current[role]["preset_id"], "")
+        if isinstance(incoming.get("model_bindings"), dict):
+            mapped_bindings = {}
+            for role, binding in incoming["model_bindings"].items():
+                if not isinstance(binding, dict):
+                    continue
+                item = copy.deepcopy(binding)
+                if item.get("preset_id"):
+                    mapped_id = aliases.get(item["preset_id"], "")
+                    if not mapped_id:
+                        continue
+                    item["preset_id"] = mapped_id
+                mapped_bindings[role] = item
+            current["model_bindings"] = mapped_bindings
+        if isinstance(incoming.get("chat_settings"), dict):
+            current["chat_settings"] = copy.deepcopy(incoming["chat_settings"])
     _need(len(presets) <= 24, "RESTORE_CONNECTION_LIMIT")
     target.execute("INSERT OR REPLACE INTO memory_model_settings(id,revision,data) VALUES(1,?,?)", (revision + 1, _json(current)))
     return {"aliases": aliases, "legacy": legacy, "source_config": source_config}
@@ -897,7 +912,7 @@ def _apply_settings(source, current, mapping, pending):
     value["provider_order"] = [providers[p] for p in value.get("provider_order", []) if p in providers]
     value["preferred_provider"] = providers.get(value.get("preferred_provider"), "primary")
     value["settings_revision"] = int(current.get("settings_revision", 0)) + 1
-    intent = {k: value.get(k, False) for k in ("qzone_enabled", "generated_qzone_allowed", "primary_enabled")}
+    intent = {k: value.get(k, False) for k in ("qzone_enabled", "memory_auto_enable", "generated_qzone_allowed", "primary_enabled")}
     intent["providers"] = {p["id"]: p.get("enabled", True) for p in value["providers"]}
     for field in intent:
         if field != "providers":

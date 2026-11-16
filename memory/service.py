@@ -14,7 +14,9 @@ from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from ..store import AlbumError
+from astrbot.api import logger
+
+from ..store import AlbumError, format_exception_detail
 from . import core
 from .images import ImageIndex, UNSAFE_REASON
 from .models import (
@@ -562,6 +564,12 @@ class MemoryService:
             self.store.log(scope, cid, "stopped", "整理已停止，未保存的批次保留为待整理")
             raise
         except Exception as error:
+            logger.warning(
+                "Memory summary failed (scope=%s cid=%s): %s",
+                scope,
+                cid,
+                format_exception_detail(error),
+            )
             self.failed[key] = error_kind(error)[0]
             self.store.log(scope, cid, "summary_failed", diagnostic(error))
         else:
@@ -573,6 +581,12 @@ class MemoryService:
                     self.maintenance.after_summary(scope, cid, batches)
                 except Exception as exc:
                     from .maintenance_protocol import CODES, packed
+                    logger.warning(
+                        "Memory post-summary maintenance trigger failed (scope=%s cid=%s): %s",
+                        scope,
+                        cid,
+                        format_exception_detail(exc),
+                    )
                     code = getattr(exc, "code", "")
                     self.store.log(scope, cid, "maintenance_failed", packed({"code": code if code in CODES else "STORAGE"}))
         finally:

@@ -18,7 +18,7 @@ from astrbot.core.platform.message_type import MessageType
 from PIL import Image as PillowImage, ImageOps, UnidentifiedImageError
 
 from .restore_guard import managed
-from .store import MAX_BYTES, MAX_PIXELS, AlbumError, now, text_value
+from .store import MAX_BYTES, MAX_PIXELS, AlbumError, format_exception_detail, now, text_value
 
 
 QQ_READ_TOOLS = frozenset(
@@ -655,8 +655,8 @@ class QQActions:
                 await self.tick()
             except AlbumError:
                 pass
-            except Exception:
-                logger.warning("QQ status timer could not be checked")
+            except Exception as exc:
+                logger.warning("QQ status timer could not be checked: %s", format_exception_detail(exc))
             await asyncio.sleep(5)
 
     def start(self):

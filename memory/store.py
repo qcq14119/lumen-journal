@@ -74,6 +74,53 @@ FLOAT_LIMITS = {
     "recall_rerank_min": (0.0, 1.0),
     "recall_vector_min": (0.0, 1.0),
 }
+GLOBAL_CHAT_SETTING_KEYS = tuple(
+    k for k in DEFAULTS if k not in ("model_bindings", "maintenance_paused")
+)
+
+
+def apply_setting_patch(base, patch):
+    """Validate and apply a memory settings patch without mutating base."""
+    if not isinstance(patch, dict) or set(patch) - {*DEFAULTS, "enabled"}:
+        raise AlbumError("记忆设置字段不正确")
+    settings = dict(base)
+    enabled = None
+    for key, value in patch.items():
+        if key == "enabled" or key in (
+            "auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "maintenance_paused"
+        ):
+            if type(value) is not bool:
+                raise AlbumError("开关格式不正确")
+            if key == "enabled":
+                enabled = int(value)
+            else:
+                settings[key] = value
+        elif key in FLOAT_LIMITS:
+            low, high = FLOAT_LIMITS[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+                raise AlbumError(f"设置超出范围（{low}—{high}）")
+            settings[key] = round(float(value), 2)
+        elif key in LIMITS:
+            low, high = LIMITS[key]
+            if type(value) is not int or not low <= value <= high:
+                raise AlbumError(f"设置超出范围（{low}—{high}）")
+            settings[key] = value
+        elif key == "summary_prompt":
+            if not isinstance(value, str) or len(value) > 20000:
+                raise AlbumError("写作要求最多20000字")
+            settings[key] = value
+        elif key == "user_name":
+            if not isinstance(value, str) or len(value.strip()) > 40:
+                raise AlbumError("用户称呼最多40字")
+            settings[key] = value.strip()
+        elif key == "model_bindings":
+            if not isinstance(value, dict) or set(value) - {"summary", "embedding", "rerank"}:
+                raise AlbumError("模型选用格式不正确")
+            for binding in value.values():
+                if not isinstance(binding, dict) or binding.get("mode") != "preset" or set(binding) - {"mode", "preset_id"}:
+                    raise AlbumError("模型选用格式不正确")
+            settings[key] = value
+    return settings, enabled
 PENDING, SUMMARIZED = "pending", "summarized"
 # Recall records get their own short window, independent of summary logs.
 RECALL_STATES = ("recalled", "recall_fallback", "recall_failed")
@@ -100,6 +147,7 @@ def _now() -> int:
 
 class MemoryStore:
     def __init__(self, album_store):
+        self.album_store = album_store
         self.db = album_store.db
         self.lock = album_store.lock
         self.restore_guard = album_store.restore_guard
@@ -228,6 +276,12 @@ class MemoryStore:
                     low, high = LIMITS[target]
                     if type(value) is int and low <= value <= high:
                         settings[target] = value
+            else:
+                enabled = int(bool(self.album_store.settings.get("memory_auto_enable", False)))
+                settings.update(self._global_chat_settings())
+                bindings = self._global_model_bindings()
+                if bindings:
+                    settings["model_bindings"] = bindings
             ledger_id = hashlib.sha256(_json([scope, cid]).encode()).hexdigest()
             ledger = self.db.execute(
                 "SELECT data FROM records WHERE kind='restore_epoch' AND id=?", (ledger_id,)
@@ -347,49 +401,12 @@ class MemoryStore:
     @managed
     def configure(self, scope, cid, patch, revision):
         self.restore_guard.check_chat(scope, cid)
-        if not isinstance(patch, dict) or set(patch) - {*DEFAULTS, "enabled"}:
-            raise AlbumError("记忆设置字段不正确")
         with self.transaction():
             row = self._ensure(scope, cid)
             if revision is not None and revision != row["revision"]:
                 raise AlbumError("记忆版本已变化，请刷新后重试")
-            settings = {**json.loads(row["settings"])}
-            enabled = row["enabled"]
-            for key, value in patch.items():
-                if key == "enabled" or key in (
-                    "auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "maintenance_paused"
-                ):
-                    if type(value) is not bool:
-                        raise AlbumError("开关格式不正确")
-                    if key == "enabled":
-                        enabled = int(value)
-                    else:
-                        settings[key] = value
-                elif key in FLOAT_LIMITS:
-                    low, high = FLOAT_LIMITS[key]
-                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
-                        raise AlbumError(f"设置超出范围（{low}—{high}）")
-                    settings[key] = round(float(value), 2)
-                elif key in LIMITS:
-                    low, high = LIMITS[key]
-                    if type(value) is not int or not low <= value <= high:
-                        raise AlbumError(f"设置超出范围（{low}—{high}）")
-                    settings[key] = value
-                elif key == "summary_prompt":
-                    if not isinstance(value, str) or len(value) > 20000:
-                        raise AlbumError("写作要求最多20000字")
-                    settings[key] = value
-                elif key == "user_name":
-                    if not isinstance(value, str) or len(value.strip()) > 40:
-                        raise AlbumError("用户称呼最多40字")
-                    settings[key] = value.strip()
-                elif key == "model_bindings":
-                    if not isinstance(value, dict) or set(value) - {"summary", "embedding", "rerank"}:
-                        raise AlbumError("模型选用格式不正确")
-                    for binding in value.values():
-                        if not isinstance(binding, dict) or binding.get("mode") != "preset" or set(binding) - {"mode", "preset_id"}:
-                            raise AlbumError("模型选用格式不正确")
-                    settings[key] = value
+            settings, new_enabled = apply_setting_patch(json.loads(row["settings"]), patch)
+            enabled = row["enabled"] if new_enabled is None else new_enabled
             self.db.execute(
                 "UPDATE mem_chats SET enabled=?,settings=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
                 (enabled, _json(settings), _now(), scope, cid),
@@ -1111,6 +1128,96 @@ class MemoryStore:
                 )
             else:
                 self.db.execute("DELETE FROM memory_view_bindings WHERE username=?", (username,))
+
+    def _global_model_settings_data(self):
+        if not self._table("memory_model_settings"):
+            return {}
+        row = self.db.execute(
+            "SELECT data FROM memory_model_settings WHERE id=1"
+        ).fetchone()
+        return json.loads(row["data"] or "{}") if row else {}
+
+    def _global_chat_settings(self):
+        raw = self._global_model_settings_data().get("chat_settings")
+        if not isinstance(raw, dict):
+            return {}
+        clean = {}
+        for key in GLOBAL_CHAT_SETTING_KEYS:
+            if key not in raw:
+                continue
+            try:
+                normalized, _ = apply_setting_patch({}, {key: raw[key]})
+                clean[key] = normalized[key]
+            except AlbumError:
+                continue
+        return clean
+
+    def _global_model_bindings(self):
+        data = self._global_model_settings_data()
+        if not data:
+            return {}
+        presets = {
+            p.get("id"): p.get("type")
+            for p in data.get("presets", [])
+            if isinstance(p, dict) and p.get("id")
+        }
+        clean = {}
+        for role, expected in (("summary", "chat"), ("embedding", "embedding"), ("rerank", "rerank")):
+            binding = (data.get("model_bindings") or {}).get(role)
+            if (
+                isinstance(binding, dict)
+                and binding.get("mode") == "preset"
+                and binding.get("preset_id")
+                and presets.get(binding["preset_id"]) == expected
+            ):
+                clean[role] = {"mode": "preset", "preset_id": binding["preset_id"]}
+        return clean
+
+    def sync_global_settings(self, *, chat_settings=None, bindings=None, exclude=None):
+        """Propagate global summary settings and model bindings to existing chats."""
+        roles = ("summary", "embedding", "rerank")
+        clean_chat = {}
+        if isinstance(chat_settings, dict):
+            subset = {k: v for k, v in chat_settings.items() if k in GLOBAL_CHAT_SETTING_KEYS}
+            if subset:
+                clean_chat, _ = apply_setting_patch({}, subset)
+        clean_bindings = None
+        if bindings is not None:
+            clean_bindings = {
+                role: {"mode": "preset", "preset_id": bindings[role]["preset_id"]}
+                for role in roles
+                if isinstance(bindings.get(role), dict)
+                and bindings[role].get("mode") == "preset"
+                and bindings[role].get("preset_id")
+            }
+        now = _now()
+        with self.transaction():
+            for row in self.db.execute("SELECT scope, cid, settings FROM mem_chats").fetchall():
+                if exclude and (row["scope"], row["cid"]) == exclude:
+                    continue
+                original = json.loads(row["settings"] or "{}")
+                updated = dict(original)
+                changed = False
+                for key, value in clean_chat.items():
+                    if updated.get(key) != value or key not in updated:
+                        updated[key] = value
+                        changed = True
+                if clean_bindings is not None:
+                    old_bindings = dict(updated.get("model_bindings") or {})
+                    new_bindings = {k: v for k, v in old_bindings.items() if k not in roles}
+                    new_bindings.update(clean_bindings)
+                    if new_bindings != old_bindings or (clean_bindings and "model_bindings" not in updated):
+                        updated["model_bindings"] = new_bindings
+                        changed = True
+                if changed:
+                    self.db.execute(
+                        "UPDATE mem_chats SET settings=?,revision=revision+1,updated=? WHERE scope=? AND cid=?",
+                        (_json(updated), now, row["scope"], row["cid"]),
+                    )
+
+    def sync_model_bindings(self, bindings, *, exclude=None):
+        """Propagate global summary/embedding/rerank bindings to all existing chats."""
+        return self.sync_global_settings(bindings=bindings, exclude=exclude)
 
     def chats_using_preset(self):
         """Preset ids referenced by any chat, for connection deletion checks."""

@@ -445,8 +445,9 @@ export async function mountMemory(env) {
     }
     const m = data.memory, enabled = data.state.enabled;
     const tabs = [["story", "剧情", m.events.length], ["people", "人物", m.people.length], ["profiles", "生活小档案", profiles().length], ["plans", "约定", openPlans().length], ["records", "整理记录", ""]];
-    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-btn" id="lj-maintenance">记忆助手</button><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-logs">拾忆日志</button><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button><button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
+    const topbar = `<div class="lj-topbar"><button class="lj-chat" id="lj-choose" title="切换聊天"><span class="lj-brand">${esc(view.target.title || "当前聊天")}</span><small>${following ? "跟随当前聊天" : "手动选择"} · 切换 ▾</small></button><div class="lj-actions"><button class="lj-btn" id="lj-maintenance">记忆助手</button><button class="lj-icon" id="lj-settings" title="总结设置" aria-label="总结设置"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg></button><details class="lj-more"><summary class="lj-icon" aria-label="更多">⋯</summary><div><button id="lj-logs">拾忆日志</button><button id="lj-bind">会话绑定</button><button id="lj-copy">复制记忆到另一份聊天</button><button id="lj-export">导出记忆</button><button id="lj-import">导入记忆</button>${enabled ? '<button id="lj-disable">停用记忆</button>' : ""}<button id="lj-clear" class="lj-danger">清空记忆</button></div></details></div></div>`;
     if (!enabled) {
+      clearTimeout(pollTimer);
       main.innerHTML = `<div class="lj">${topbar}<div class="lj-empty"><h2>此聊天未启用记忆</h2><p>启用后从下一条消息开始备份对话，满设定轮数自动整理。</p><button class="lj-btn lj-btn-primary" id="lj-enable">启用记忆</button></div></div>`;
       bind();
       return;
@@ -474,7 +475,8 @@ export async function mountMemory(env) {
     $("#lj-maintenance")?.addEventListener("click", () => {const target={...view.target};openMemoryMaintenance({bridge,showDialog,footer,escape:esc,target,openAssistantSettings:env.openAssistantSettings,isCurrent:()=>alive()&&view.target.scope===target.scope&&view.target.cid===target.cid,onChange:()=>{load().catch(()=>{});}});});
     $("#lj-logs")?.addEventListener("click", () => env.openDiagnostics({...params()}));
     $("#lj-bind")?.addEventListener("click", bindingDialog);
-    $("#lj-enable")?.addEventListener("click", e => busy(e.target, async () => { data = await act("enable", {enabled: true}); await render(); }));
+    $("#lj-enable")?.addEventListener("click", e => busy(e.target, async () => { data = await act("enable", {enabled: true}); toast("已启用记忆"); await render(); }));
+    $("#lj-disable")?.addEventListener("click", e => busy(e.target, async () => { data = await act("enable", {enabled: false}); toast("已停用记忆"); await render(); }));
     bindHero();
     main.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { view.tab = b.dataset.tab; view.query = ""; render(); });
     const query = $("#lj-query");
@@ -809,7 +811,7 @@ export async function mountMemory(env) {
       const note = kind === "chat" ? '<p class="lj-muted">模型窗口按服务商公布的上下文长度填写，整理时按它决定每批能放多少轮。</p>' : kind === "embedding" ? '<p class="lj-muted">换模型或维度后，已有向量会重新生成。测试连接会读出模型的实际维度。</p>' : "";
       const channel = kind === "chat" ? "" : `<label>渠道<select data-channel>${Object.entries(CHANNELS).map(([k, c]) => `<option value="${k}" ${channelOf(p.base_url) === k ? "selected" : ""}>${c.name}</option>`).join("")}</select></label>`;
       const key = `<label>API Key<span class="lj-key"><input data-p="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="${p.key_configured ? "已保存，留空不修改" : ""}"><button type="button" class="lj-btn" data-key-toggle aria-pressed="false">显示</button></span></label>`;
-      const model = `<label>模型<span class="lj-key"><input data-p="model" value="${esc(p.model || "")}" list="lj-model-list" autocomplete="off" spellcheck="false"><button type="button" class="lj-btn" id="lj-preset-list" title="从接口读取可用模型">拉取</button></span><datalist id="lj-model-list"></datalist></label>`;
+      const model = `<label>模型<span class="lj-key"><input data-p="model" value="${esc(p.model || "")}" autocomplete="off" spellcheck="false"><button type="button" class="lj-btn" id="lj-preset-list" title="从接口读取可用模型">拉取</button></span><select id="lj-model-pick" aria-label="选择已拉取的模型" hidden></select><datalist id="lj-model-list"></datalist></label>`;
       return `<div class="lj-preset-editor" data-kind="${kind}"><h4>${p.id ? "编辑连接" : "新建连接"}</h4><label>名称<input data-p="name" value="${esc(p.name || "")}" maxlength="60" placeholder="${kind === "chat" ? "例如：总结用 Gemini" : ""}"></label>${channel}<label>接口地址<input data-p="base_url" value="${esc(p.base_url || "")}" placeholder="https://…/v1"></label>${key}${model}<div class="lj-form-row">${extra}</div>${note}<p class="lj-muted" id="lj-preset-status" role="status"></p><div class="lj-actions"><button type="button" class="lj-btn" id="lj-preset-test">测试连接</button><button type="button" class="lj-btn lj-btn-primary" id="lj-preset-save">保存连接</button>${p.id ? '<button type="button" class="lj-btn lj-danger" id="lj-preset-delete">删除</button>' : ""}<button type="button" class="lj-text" id="lj-preset-cancel">取消</button></div></div>`;
     };
     const presetSummary = (p, kind) => kind === "chat"
@@ -821,11 +823,17 @@ export async function mountMemory(env) {
       const key = `<div class="lj-key"><input data-connection-key="${kind}" aria-label="${meta.title} API Key" readonly type="password" autocomplete="off" spellcheck="false" placeholder="${active.key_configured ? "已保存" : "未配置"}">${active.key_configured ? `<button type="button" class="lj-btn" data-preset-key="${kind}" aria-label="${meta.title}密钥显示" aria-pressed="false">显示</button>` : ""}</div>`;
       return `<div class="lj-connection"><strong>${esc(active.name)}</strong><span>${presetSummary(active, kind)}</span><button type="button" class="lj-text" data-preset-edit="${kind}">编辑</button><dl class="lj-connection-details"><div><dt>接口地址</dt><dd data-connection-url>${esc(active.base_url)}</dd></div><div><dt>API Key</dt><dd>${key}</dd></div></dl></div>`;
     };
+    const presetList = kind => {
+      const meta = KINDS[kind], others = s.presets.filter(p => p.type === kind && p.id !== s[meta.field]);
+      if (!others.length) return "";
+      return `<details class="lj-group" open><summary>未选用的已保存连接（${others.length}）</summary>${others.map(p => `<div class="lj-setting"><span>${esc(p.name)}<small>${presetSummary(p, kind)}</small></span><span class="lj-actions"><button type="button" class="lj-text" data-preset-edit-id="${esc(p.id)}">编辑</button><button type="button" class="lj-text lj-danger" data-preset-delete-id="${esc(p.id)}">删除</button></span></div>`).join("")}</details>`;
+    };
     const kindSection = kind => {
       const meta = KINDS[kind], options = s.presets.filter(p => p.type === kind), chosen = s[meta.field];
       const card = `<div data-preset-summary="${kind}">${connectionCard(kind)}</div>`;
+      const list = `<div data-preset-list="${kind}">${presetList(kind)}</div>`;
       const editor = editing && editing.kind === kind ? presetEditor(editing.item, kind) : `<button type="button" class="lj-btn" data-preset-new="${kind}">新建连接</button>`;
-      return `<section class="lj-settings-section"><h3>${meta.title}<small>${meta.hint}</small></h3><label class="lj-setting"><span>使用的连接</span><select name="${meta.field}"><option value="">${kind === "chat" ? "未选择" : "不使用"}</option>${options.map(p => `<option value="${esc(p.id)}" ${p.id === chosen ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>${card}${editor}</section>`;
+      return `<section class="lj-settings-section"><h3>${meta.title}<small>${meta.hint}</small></h3><label class="lj-setting"><span>使用的连接</span><select name="${meta.field}"><option value="">${kind === "chat" ? "未选择" : "不使用"}</option>${options.map(p => `<option value="${esc(p.id)}" ${p.id === chosen ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>${card}${list}${editor}</section>`;
     };
     const presetKey = () => Object.values(KINDS).map(k => s[k.field] || "").join("|");
 
@@ -840,8 +848,8 @@ export async function mountMemory(env) {
     const imageGroup = st => `<details class="lj-settings-section lj-group" data-image-group><summary>图片</summary>${toggle("image_describe", "识别图片内容", "新图随总结一起识别，使用总结 API", st.image_describe)}${number("image_keep_turns", "保留原图的最近轮数", "更早且已有描述的图片换成文字；未识别的仍保留原图", 0, 50, st.image_keep_turns, "轮")}${imageProgress()}<details class="lj-group"><summary>可处理范围</summary><p class="lj-muted">仅处理当前聊天文件中仍保留的图片；已移除的原图无法补描述。手动补描述失败不自动重试；随总结识图沿用整理重试设置。</p></details></details>`;
 
     const pane = st => {
-      if (view.settingsTab === "rules") return `<section class="lj-settings-section"><h3>此聊天<small>即时生效</small></h3>${toggle("enabled", "启用记忆", "关闭后不再备份和注入，已有记忆保留", data.state.enabled)}${toggle("inject_enabled", "聊天时加入记忆", "临时加入，不写进聊天文件", st.inject_enabled)}</section><section class="lj-settings-section"><h3>自动整理</h3>${toggle("auto_process", "启用自动整理", "", st.auto_process)}<div class="lj-sub">${number("summary_trigger_turns", "每积累多少轮整理一次", "", 5, 300, st.summary_trigger_turns, "轮")}</div></section><details class="lj-settings-section lj-group" open><summary>原文处理</summary>${number("keep_turns", "整理后保留最近原话", "已整理的轮次从聊天里移除，只保留最近这些轮", 0, 100, st.keep_turns, "轮")}${number("retention_days", "已整理原文的备份保留", "保留期内可撤销或重新整理；0为不清理", 0, 3650, st.retention_days, "天")}</details><details class="lj-settings-section lj-group"><summary>记忆注入</summary>${number("memory_tokens", "每次聊天加入的记忆上限", "按约1字1个估算，与模型无关；记忆和聊天加起来最好不超过10万", 500, 100000, st.memory_tokens, "token")}</details><details class="lj-settings-section lj-group"><summary>请求与重试</summary>${number("summary_max_retries", "失败后最多重试", "重试会重发本批文字和图片，按所选连接计费", 0, 10, st.summary_max_retries, "次")}${number("summary_timeout", "单次整理等待时间", "", 30, 1200, st.summary_timeout, "秒")}</details>${imageGroup(st)}`;
-      if (view.settingsTab === "models") return Object.keys(KINDS).map(kindSection).join("");
+      if (view.settingsTab === "rules") return `<section class="lj-settings-section"><h3>此聊天<small>即时生效</small></h3>${toggle("enabled", "启用记忆", "关闭后不再备份和注入，已有记忆保留", data.state.enabled)}</section><section class="lj-settings-section"><h3>注入与自动整理<small>全局生效</small></h3>${toggle("inject_enabled", "聊天时加入记忆", "临时加入，不写进聊天文件", st.inject_enabled)}${toggle("auto_process", "启用自动整理", "", st.auto_process)}<div class="lj-sub">${number("summary_trigger_turns", "每积累多少轮整理一次", "", 5, 300, st.summary_trigger_turns, "轮")}</div></section><details class="lj-settings-section lj-group" open><summary>原文处理</summary>${number("keep_turns", "整理后保留最近原话", "已整理的轮次从聊天里移除，只保留最近这些轮", 0, 100, st.keep_turns, "轮")}${number("retention_days", "已整理原文的备份保留", "保留期内可撤销或重新整理；0为不清理", 0, 3650, st.retention_days, "天")}</details><details class="lj-settings-section lj-group"><summary>记忆注入</summary>${number("memory_tokens", "每次聊天加入的记忆上限", "按约1字1个估算，与模型无关；记忆和聊天加起来最好不超过10万", 500, 100000, st.memory_tokens, "token")}</details><details class="lj-settings-section lj-group"><summary>请求与重试</summary>${number("summary_max_retries", "失败后最多重试", "重试会重发本批文字和图片，按所选连接计费", 0, 10, st.summary_max_retries, "次")}${number("summary_timeout", "单次整理等待时间", "", 30, 1200, st.summary_timeout, "秒")}</details>${imageGroup(st)}`;
+      if (view.settingsTab === "models") return '<p class="lj-muted">连接选择全局生效，保存后同步全部聊天。</p>' + Object.keys(KINDS).map(kindSection).join("");
       if (view.settingsTab === "vectors") {
         const v = vec || {counts: {}, total: 0, done: 0, missing: 0};
         const ready = v.configured;
@@ -850,7 +858,7 @@ export async function mountMemory(env) {
         const state = !ready ? '<p class="lj-muted">还没有选择向量模型，请先到“模型连接”配置。</p>'
           : v.running ? '<p class="lj-accent" role="status">正在生成向量…</p>'
           : v.missing ? `<p class="memory-error" role="status">${v.missing} 条记忆还没有向量，暂不参与向量召回。</p>` : "";
-        return `<section class="lj-settings-section"><h3>启用与参数<small>此聊天</small></h3>${toggle("vector_enabled", "启用向量检索", "关闭时聊天不做自动召回；记忆搜索工具仍可按字面查找", st.vector_enabled)}${toggle("query_rewrite", "召回前改写查询", "每次召回多调用一次总结 API，按所选连接计费", st.query_rewrite)}${ready ? `<p class="lj-muted">向量模型：${esc(v.model)} · ${v.dimensions} 维</p>` : ""}<details class="lj-settings-section lj-group"><summary>召回参数</summary>${number("recall_candidates", "送入精排的候选数", "", 5, 50, st.recall_candidates, "条")}${number("recall_max", "最多采用的记忆数", "", 1, 10, st.recall_max, "条")}${number("recall_rerank_min", "精排采用分数", "达到此分数的候选会被采用", 0, 1, st.recall_rerank_min, "", "0.01")}${number("recall_vector_min", "相似度采用分数", "没有达到精排分数时，达到此相似度也会采用", 0, 1, st.recall_vector_min, "", "0.01")}</details></section><section class="lj-settings-section" data-vector-progress><h3>处理进度<small>此聊天</small></h3><div class="lj-vec-counts">${rows}</div>${state}<div class="lj-actions"><button type="button" class="lj-btn lj-btn-primary" data-vec="fill" ${ready && st.vector_enabled && !v.running && v.missing ? "" : "disabled"}>补齐缺漏</button><button type="button" class="lj-btn" data-vec="rebuild" ${ready && st.vector_enabled && !v.running && v.total ? "" : "disabled"} title="清空后按当前模型全部重新生成">完整重建</button><button type="button" class="lj-btn lj-danger" data-vec="clear" ${!v.running && (v.done || v.other_model) ? "" : "disabled"}>清空</button><button type="button" class="lj-text" id="lj-vec-refresh">刷新</button></div><p class="lj-muted">整理、编辑、撤销后会自动更新变化的条目；失败不会自动重试，需要时点“补齐缺漏”。</p></section>`;
+        return `<section class="lj-settings-section"><h3>启用与参数<small>全局生效</small></h3>${toggle("vector_enabled", "启用向量检索", "关闭时聊天不做自动召回；记忆搜索工具仍可按字面查找", st.vector_enabled)}${toggle("query_rewrite", "召回前改写查询", "每次召回多调用一次总结 API，按所选连接计费", st.query_rewrite)}${ready ? `<p class="lj-muted">向量模型：${esc(v.model)} · ${v.dimensions} 维</p>` : ""}<details class="lj-settings-section lj-group"><summary>召回参数</summary>${number("recall_candidates", "送入精排的候选数", "", 5, 50, st.recall_candidates, "条")}${number("recall_max", "最多采用的记忆数", "", 1, 10, st.recall_max, "条")}${number("recall_rerank_min", "精排采用分数", "达到此分数的候选会被采用", 0, 1, st.recall_rerank_min, "", "0.01")}${number("recall_vector_min", "相似度采用分数", "没有达到精排分数时，达到此相似度也会采用", 0, 1, st.recall_vector_min, "", "0.01")}</details></section><section class="lj-settings-section" data-vector-progress><h3>处理进度<small>此聊天</small></h3><div class="lj-vec-counts">${rows}</div>${state}<div class="lj-actions"><button type="button" class="lj-btn lj-btn-primary" data-vec="fill" ${ready && st.vector_enabled && !v.running && v.missing ? "" : "disabled"}>补齐缺漏</button><button type="button" class="lj-btn" data-vec="rebuild" ${ready && st.vector_enabled && !v.running && v.total ? "" : "disabled"} title="清空后按当前模型全部重新生成">完整重建</button><button type="button" class="lj-btn lj-danger" data-vec="clear" ${!v.running && (v.done || v.other_model) ? "" : "disabled"}>清空</button><button type="button" class="lj-text" id="lj-vec-refresh">刷新</button></div><p class="lj-muted">整理、编辑、撤销后会自动更新变化的条目；失败不会自动重试，需要时点“补齐缺漏”。</p></section>`;
       }
       if (view.settingsTab === "prompts") {
         const custom = st.summary_prompt.trim() && st.summary_prompt.trim() !== s.default_prompt.trim();
@@ -921,6 +929,8 @@ export async function mountMemory(env) {
         if (kind) {
           const card = form.querySelector(`[data-preset-summary="${kind}"]`);
           clearConnectionKeys(card); card.innerHTML = connectionCard(kind);
+          const list = form.querySelector(`[data-preset-list="${kind}"]`);
+          if (list) list.innerHTML = presetList(kind);
         }
       };
       content.querySelectorAll("[data-stab]").forEach(b => b.onclick = () => run(ed, b, true, async t => {
@@ -1013,6 +1023,25 @@ export async function mountMemory(env) {
         if (!kind) return;
         collect(); editing = {kind, item: s.presets.find(p => p.id === s[KINDS[kind].field]) || {}}; draw();
       });
+      const deletePreset = (button, id) => run(ed, button, true, async t => {
+        const payload = {operation: "delete", id, revision: s.models_revision};
+        await configWrite(t, () => bridge.apiPost("memory/model_preset", payload), (r, show) => {
+          s = {...s, presets: r.presets, models_revision: r.models_revision};
+          if (editing?.item?.id === id) editing = null;
+          if (show) { toast("已删除连接"); draw(); }
+        });
+      });
+      content.querySelectorAll("[data-preset-list]").forEach(list => list.onclick = event => {
+        const button = event.target.closest("button");
+        const editId = button?.dataset.presetEditId;
+        if (editId) {
+          const item = s.presets.find(p => p.id === editId);
+          if (item) { collect(); editing = {kind: item.type, item}; draw(); }
+          return;
+        }
+        const deleteId = button?.dataset.presetDeleteId;
+        if (deleteId) return deletePreset(button, deleteId);
+      });
       content.querySelector("#lj-preset-cancel")?.addEventListener("click", () => { editing = null; draw(); });
       const presetData = () => {
         const v = n => content.querySelector(`[data-p="${n}"]`)?.value.trim();
@@ -1023,13 +1052,31 @@ export async function mountMemory(env) {
         return {id: editing.item.id, config, revision: s.models_revision};
       };
       const status = (text, ok) => { const el = content.querySelector("#lj-preset-status"); if (el) { el.textContent = text; el.dataset.ok = ok ? "true" : "false"; } };
+      const resetModelPick = () => {
+        const list = content.querySelector("#lj-model-list"), pick = content.querySelector("#lj-model-pick");
+        if (list) list.innerHTML = "";
+        if (pick) { pick.innerHTML = ""; pick.hidden = true; }
+      };
       content.querySelector("[data-channel]")?.addEventListener("change", ev => {
         ++owner.intent;
         const url = CHANNELS[ev.target.value].url, input = content.querySelector('[data-p="base_url"]');
         if (url || ev.target.value === "custom") input.value = url;
+        resetModelPick();
         if (ev.target.value === "custom") input.focus();
       });
-      content.querySelector('[data-p="base_url"]')?.addEventListener("input", ev => { const sel = content.querySelector("[data-channel]"); if (sel) sel.value = channelOf(ev.target.value.trim()); });
+      content.querySelector('[data-p="base_url"]')?.addEventListener("input", ev => { const sel = content.querySelector("[data-channel]"); if (sel) sel.value = channelOf(ev.target.value.trim()); resetModelPick(); });
+      content.querySelector("#lj-model-pick")?.addEventListener("change", ev => {
+        if (!ev.target.value) return;
+        const modelInput = content.querySelector('[data-p="model"]');
+        if (modelInput) modelInput.value = ev.target.value;
+        ++owner.intent;
+      });
+      content.querySelector('[data-p="model"]')?.addEventListener("input", ev => {
+        const pick = content.querySelector("#lj-model-pick");
+        if (!pick || pick.hidden) return;
+        const val = ev.target.value.trim();
+        pick.value = [...pick.children].some(o => o.value === val) ? val : "";
+      });
       content.querySelector("[data-key-toggle]")?.addEventListener("click", ev => run(ed, ev.target, true, async t => {
         const button = ev.target.closest("button"), input = content.querySelector('[data-p="api_key"]');
         if (input.type === "text") { input.type = "password"; button.textContent = "显示"; button.setAttribute("aria-pressed", "false"); return; }
@@ -1048,8 +1095,15 @@ export async function mountMemory(env) {
         const want = {embedding: {test: m => !/rerank/i.test(m) && /embed|bge|m3|e5|gte/i.test(m)}, rerank: /rerank/i}[editing.kind];
         const items = want ? [...r.items.filter(m => want.test(m)), ...r.items.filter(m => !want.test(m))] : r.items;
         content.querySelector("#lj-model-list").innerHTML = items.map(m => `<option value="${esc(m)}"></option>`).join("");
-        status(`读到 ${r.items.length} 个模型，在“模型”里输入或选择`, true);
-        content.querySelector('[data-p="model"]').focus();
+        const pick = content.querySelector("#lj-model-pick"), modelInput = content.querySelector('[data-p="model"]');
+        if (pick) {
+          pick.innerHTML = `<option value="">选择已拉取的模型（共 ${items.length} 个）</option>` + items.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+          const cur = modelInput?.value.trim() || "";
+          pick.value = items.includes(cur) ? cur : "";
+          pick.hidden = items.length === 0;
+        }
+        status(items.length ? `读到 ${items.length} 个模型，可在下方下拉框选择或直接输入` : "接口未返回可用模型，请手动输入", true);
+        modelInput?.focus();
       }));
       content.querySelector("#lj-preset-test")?.addEventListener("click", ev => run(ed, ev.target, true, async t => {
         status("", true);
@@ -1077,13 +1131,7 @@ export async function mountMemory(env) {
           editing = null; toast("连接已保存，记得保存设置"); draw();
         });
       }));
-      content.querySelector("#lj-preset-delete")?.addEventListener("click", ev => run(ed, ev.target, true, async t => {
-        const payload = {operation: "delete", id: editing.item.id, revision: s.models_revision};
-        await configWrite(t, () => bridge.apiPost("memory/model_preset", payload), (r, show) => {
-          s = {...s, presets: r.presets, models_revision: r.models_revision};
-          if (show) { editing = null; draw(); }
-        });
-      }));
+      content.querySelector("#lj-preset-delete")?.addEventListener("click", ev => deletePreset(ev.target, editing.item.id));
       content.querySelector("#lj-s-records")?.addEventListener("click", () => { dialog.close(); view.tab = "records"; render(); });
       const dataDialog = show => {
         invalidate(); let back;

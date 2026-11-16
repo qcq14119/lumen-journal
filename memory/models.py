@@ -15,7 +15,8 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from ..provider import PublicResolver, validate_url
-from ..store import AlbumError
+from ..store import AlbumError, redact_error_text
+from .store import GLOBAL_CHAT_SETTING_KEYS, apply_setting_patch
 from .text import clean_image_description
 
 # Local planning bounds, below the transport's 16 MiB ceiling. Vision token
@@ -190,9 +191,14 @@ class MemoryModels:
         """Resolve old routing without changing a saved conversation on read."""
         if role not in MODELS:
             raise MemoryModelError("不支持的模型用途")
-        explicit = settings.get("model_bindings", {}).get(role)
+        model_bindings = settings.get("model_bindings")
+        explicit = (model_bindings or {}).get(role)
         if explicit:
             return dict(explicit)
+        if "model_bindings" not in settings and role in ("summary", "embedding", "rerank"):
+            global_binding = self.global_bindings().get(role)
+            if global_binding:
+                return dict(global_binding)
         if role == "assistant":
             if not settings.get("assistant_enabled"):
                 return {"mode": "disabled"}
@@ -290,6 +296,72 @@ class MemoryModels:
                 used.add(data[role]["preset_id"])
         return used
 
+    def global_bindings(self, data=None):
+        """Return valid global preset bindings for memory roles."""
+        data = data or self.private()
+        presets = {
+            p["id"]: p.get("type")
+            for p in data.get("presets", [])
+            if isinstance(p, dict) and p.get("id")
+        }
+        raw = data.get("model_bindings") or {}
+        clean = {}
+        for role, expected in (("summary", "chat"), ("embedding", "embedding"), ("rerank", "rerank")):
+            binding = raw.get(role)
+            if (
+                isinstance(binding, dict)
+                and binding.get("mode") == "preset"
+                and binding.get("preset_id")
+                and presets.get(binding["preset_id"]) == expected
+            ):
+                clean[role] = {"mode": "preset", "preset_id": binding["preset_id"]}
+        return clean
+
+    def set_global_settings(self, *, chat_settings=None, bindings=None):
+        """Persist global memory summary/vector/prompt settings and model bindings."""
+        with self.store.transaction():
+            data = self.private()
+            revision = data.pop("revision")
+            if bindings is not None:
+                if not isinstance(bindings, dict):
+                    raise MemoryModelError("模型用途格式不正确")
+                presets = {
+                    p["id"]: p.get("type")
+                    for p in data.get("presets", [])
+                    if isinstance(p, dict) and p.get("id")
+                }
+                clean = {}
+                for role, expected in (("summary", "chat"), ("embedding", "embedding"), ("rerank", "rerank")):
+                    binding = bindings.get(role)
+                    if not binding:
+                        continue
+                    if (
+                        not isinstance(binding, dict)
+                        or binding.get("mode") != "preset"
+                        or not binding.get("preset_id")
+                        or presets.get(binding["preset_id"]) != expected
+                    ):
+                        raise MemoryModelError("连接不存在或类型与用途不匹配")
+                    clean[role] = {"mode": "preset", "preset_id": binding["preset_id"]}
+                data["model_bindings"] = clean
+            if chat_settings is not None:
+                if not isinstance(chat_settings, dict):
+                    raise MemoryModelError("记忆设置字段不正确")
+                subset = {k: v for k, v in chat_settings.items() if k in GLOBAL_CHAT_SETTING_KEYS}
+                if subset:
+                    normalized, _ = apply_setting_patch(data.get("chat_settings") or {}, subset)
+                    data["chat_settings"] = normalized
+            self.store.db.execute(
+                "INSERT INTO memory_model_settings VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,data=excluded.data",
+                (revision + 1, json.dumps(data, ensure_ascii=False)),
+            )
+        self.cache.clear()
+        return data
+
+    def set_global_bindings(self, bindings):
+        """Persist global summary/embedding/rerank preset bindings."""
+        return self.set_global_settings(bindings=bindings).get("model_bindings", {})
+
     def usage(self, data=None):
         data = data or self.private()
         result = {
@@ -301,6 +373,9 @@ class MemoryModels:
             }
             for p in data.get("presets", [])
         }
+        for role, binding in self.global_bindings(data).items():
+            if binding["preset_id"] in result:
+                result[binding["preset_id"]]["global_roles"].append(f"memory_{role}")
         for identifier, count in self.store.chats_using_preset().items():
             if identifier in result:
                 result[identifier]["usage_count"] += count
@@ -581,11 +656,23 @@ class MemoryModels:
             elif action == "delete":
                 if not item:
                     raise MemoryModelError("连接不存在")
+                used_info = self.usage(data)[item["id"]]
                 if (
                     any(data[r].get("preset_id") == item["id"] for r in MODELS)
-                    or any(self.usage(data)[item["id"]][key] for key in ("usage_count", "global_roles"))
+                    or any(used_info[key] for key in ("usage_count", "global_roles"))
                 ):
-                    raise MemoryModelError("此连接仍被使用，请先更换用途绑定")
+                    places = []
+                    if "plan_recovery" in used_info["global_roles"]:
+                        places.append("朝夕生成恢复")
+                    if "memory_maintenance" in used_info["global_roles"]:
+                        places.append("记忆维护助手")
+                    if used_info["usage_count"] or any(
+                        r.startswith("memory_") and r != "memory_maintenance"
+                        for r in used_info["global_roles"]
+                    ):
+                        places.append("拾忆回响（如刚修改上方用途，请先点「保存设置」）")
+                    detail = f"（当前绑定：{'、'.join(places)}）" if places else ""
+                    raise MemoryModelError("此连接仍被使用，请先更换用途绑定" + detail)
                 presets.remove(item)
             elif action == "copy":
                 if not item or len(presets) >= 24:
@@ -934,11 +1021,38 @@ class MemoryModel:
                 allow_redirects=False,
             ) as response:
                 if response.status != 200:
+                    remote_detail = ""
+                    try:
+                        err_chunks, err_size = [], 0
+                        async for chunk in response.content.iter_chunked(4096):
+                            err_chunks.append(chunk[: max(0, 4096 - err_size)])
+                            err_size += len(chunk)
+                            if err_size >= 4096:
+                                break
+                        raw_err = b"".join(err_chunks).decode("utf-8", errors="replace").strip()
+                        if raw_err:
+                            try:
+                                parsed_err = json.loads(raw_err)
+                                if isinstance(parsed_err, dict):
+                                    inner = parsed_err.get("error")
+                                    if isinstance(inner, dict) and inner.get("message"):
+                                        raw_err = str(inner["message"])
+                                    elif parsed_err.get("message"):
+                                        raw_err = str(parsed_err["message"])
+                                    elif parsed_err.get("detail"):
+                                        raw_err = str(parsed_err["detail"])
+                            except (ValueError, TypeError):
+                                pass
+                            remote_detail = redact_error_text(raw_err, limit=300)
+                    except Exception:
+                        remote_detail = ""
                     error = MemoryResponseError("REQUEST_FAILED", http_status=response.status)
                     error.status = response.status
                     error.headers = {
                         "Retry-After": response.headers.get("Retry-After", "")
                     }
+                    if remote_detail:
+                        error.remote_detail = remote_detail
                     raise error
                 chunks, size = [], 0
                 async for chunk in response.content.iter_chunked(16384):

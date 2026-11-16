@@ -206,7 +206,7 @@ dialog[data-memory-dialog="settings"] .dialog-foot { align-items: center; }
 .lj-preset-editor { margin: 6px 0 18px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; }
 .lj-preset-editor h4 { margin: 0 0 4px; font-size: 14px; font-weight: 500; }
 .lj-preset-editor label { display: block; margin: 12px 0 0; font-size: 12px; color: var(--muted); }
-.lj-preset-editor input { display: block; width: 100%; margin-top: 5px; }
+.lj-preset-editor input, .lj-preset-editor select:not([hidden]) { display: block; width: 100%; margin-top: 5px; }
 .lj-preset-editor .lj-actions { margin-top: 14px; }
 .lj-editor { width: 100%; font: inherit; line-height: 1.75; margin: 8px 0 12px; }
 .lj-pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.75; color: var(--lj-ink2); background: var(--bg); border-radius: 8px; padding: 14px 16px; max-height: 420px; overflow: auto; }

@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 
+from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
-from ..store import AlbumError
+from ..store import AlbumError, format_exception_detail, redact_error_text
 from . import core
 from .maintenance_store import fingerprint
 from .models import MemoryModel, MemoryModelError
@@ -78,7 +79,7 @@ class MemoryAPI:
             ("maintenance", "POST", self.maintenance_action),
         ):
 
-            async def safe(handler=handler):
+            async def safe(handler=handler, route=route, method=method):
                 if not request.username:
                     return error_response("请登录后管理记忆", status_code=401, headers=PRIVATE)
                 try:
@@ -88,7 +89,13 @@ class MemoryAPI:
                     message = str(exc) if isinstance(exc, AlbumError) else "记忆请求格式不正确"
                     conflict = any(w in message for w in ("处理中", "版本", "已变化", "修改过"))
                     return error_response(message, status_code=409 if conflict else 400, headers=PRIVATE)
-                except Exception:
+                except Exception as exc:
+                    logger.exception(
+                        "Memory API unexpected error (%s %s): %s",
+                        method,
+                        route,
+                        format_exception_detail(exc),
+                    )
                     return error_response("记忆操作失败，请刷新后查看当前状态", status_code=500, headers=PRIVATE)
 
             self.context.register_web_api(f"/{name}/memory/{route}", safe, [method], "Chat memory")
@@ -488,9 +495,13 @@ class MemoryAPI:
         patch = data.get("settings", {})
         if not isinstance(patch, dict) or set(patch) - set(SETTINGS):
             raise AlbumError("设置字段不正确")
+        bindings = None
         if any(field in data for field in PRESET_FIELDS.values()):
             presets = self.service.models.private().get("presets", [])
-            bindings = dict(self.store.state(scope, cid)["settings"].get("model_bindings") or {})
+            base_bindings = self.store.state(scope, cid)["settings"].get("model_bindings")
+            if base_bindings is None:
+                base_bindings = self.service.models.global_bindings()
+            bindings = dict(base_bindings or {})
             for role, field in PRESET_FIELDS.items():
                 preset = data.get(field)
                 if preset is None:
@@ -505,7 +516,15 @@ class MemoryAPI:
                 else:
                     bindings.pop(role, None)
             patch = {**patch, "model_bindings": bindings}
+        chat_keys = [k for k in patch if k not in ("maintenance_paused", "model_bindings")]
         self.store.configure(scope, cid, patch, data.get("revision"))
+        global_chat = None
+        if chat_keys:
+            saved_settings = self.store.state(scope, cid)["settings"]
+            global_chat = {k: saved_settings[k] for k in chat_keys}
+        if global_chat is not None or bindings is not None:
+            self.service.models.set_global_settings(chat_settings=global_chat, bindings=bindings)
+            self.store.sync_global_settings(chat_settings=global_chat, bindings=bindings, exclude=(scope, cid))
         self.service.failed.pop((scope, cid), None)
         # Turning vectors on or switching the embedding connection fills what is missing.
         self.service.refresh_vectors(scope, cid)
@@ -544,11 +563,29 @@ class MemoryAPI:
                     await model.summarize(prompt="请回复OK", system_prompt="连接测试", max_tokens=16, timeout=60)
                 return json_response({"ok": True}, headers=PRIVATE)
             except MemoryModelError as error:
+                detail = format_exception_detail(error, limit=300)
+                logger.warning(
+                    "Model preset %s failed (type=%s, model=%s, base_url=%s): %s",
+                    operation,
+                    kind,
+                    config.get("model", ""),
+                    redact_error_text(config.get("base_url", ""), limit=200),
+                    detail,
+                )
                 if getattr(error, "status", None) is None and not getattr(error, "retryable", False):
                     raise  # local validation such as wrong dimensions: show as is
-                raise AlbumError(error_kind(error)[0]) from None
+                raise AlbumError(f"{error_kind(error)[0]}（{detail}）") from None
             except Exception as error:
-                raise AlbumError(error_kind(error)[0]) from None
+                detail = format_exception_detail(error, limit=300)
+                logger.warning(
+                    "Model preset %s failed (type=%s, model=%s, base_url=%s): %s",
+                    operation,
+                    kind,
+                    config.get("model", ""),
+                    redact_error_text(config.get("base_url", ""), limit=200),
+                    detail,
+                )
+                raise AlbumError(f"{error_kind(error)[0]}（{detail}）") from None
         result = models.preset(operation, data, data.get("revision"))
         if operation == "key":
             return json_response(result, headers=PRIVATE)

@@ -41,6 +41,7 @@ DEFAULT_SETTINGS = {
     "poll_interval": 5,
     "task_timeout": 900,
     "qzone_enabled": False,
+    "memory_auto_enable": False,
     "qzone_visibility": 4,
     "generated_qzone_allowed": True,
     "generated_retention_days": 30,
@@ -62,6 +63,69 @@ DEFAULT_SETTINGS = {
 
 class AlbumError(Exception):
     """An error safe to display without provider payloads or secrets."""
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 [REDACTED]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,})"), "[REDACTED_KEY]"),
+    (
+        re.compile(r"(?i)([?&](?:api_?key|key|token|access_token|secret|password|authorization)=)[^&\s\"'<>]+"),
+        r"\1[REDACTED]",
+    ),
+    (re.compile(r"(?i)(https?://)[^/@\s\"'<>]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]+"), "[IMAGE_BASE64]"),
+    (re.compile(r"(?i)\b(authorization|cookie|set-cookie|x-api-key)\s*[:=]\s*[^\s,;'\"}\]]+"), r"\1=[REDACTED]"),
+)
+
+
+def redact_error_text(value: str, *, limit: int = 800) -> str:
+    """Strip credentials/base64 from diagnostic text while keeping error context."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
+
+
+def format_exception_detail(exc: BaseException, *, limit: int = 800) -> str:
+    """Format an exception cause chain safely with HTTP status and redacted message."""
+    parts, seen, current = [], set(), exc
+    while isinstance(current, BaseException) and id(current) not in seen and len(seen) < 4:
+        seen.add(id(current))
+        name = type(current).__name__
+        status = next(
+            (
+                v
+                for v in (
+                    getattr(current, "status_code", None),
+                    getattr(current, "status", None),
+                    getattr(current, "code", None),
+                    getattr(getattr(current, "response", None), "status_code", None),
+                    (getattr(current, "counts", None) or {}).get("http_status")
+                    if isinstance(getattr(current, "counts", None), dict)
+                    else None,
+                )
+                if type(v) is int and 100 <= v <= 599
+            ),
+            0,
+        )
+        try:
+            msg = str(current)
+        except Exception:
+            msg = "<unprintable>"
+        remote = getattr(current, "remote_detail", "")
+        header = f"{name}(HTTP {status})" if status else name
+        detail = redact_error_text(msg, limit=limit)
+        if isinstance(remote, str) and remote.strip():
+            remote_clean = redact_error_text(remote, limit=300)
+            detail = f"{detail} | {remote_clean}" if detail else remote_clean
+        parts.append(f"{header}: {detail}" if detail else header)
+        current = current.__cause__ or current.__context__
+    text = " <- ".join(parts)
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "…"
+    return text
 
 
 def plan_recovery_settings(value=None):
@@ -940,6 +1004,7 @@ class Store:
                 raise AlbumError("参考图字段仅支持 image 或 image[]")
             for key in (
                 "qzone_enabled",
+                "memory_auto_enable",
                 "generated_qzone_allowed",
                 "parallel_backup",
                 "retry_unknown",

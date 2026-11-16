@@ -58,6 +58,7 @@ from .store import (
     AlbumError,
     Store,
     credential_entries,
+    format_exception_detail,
     now,
     strings,
     text_value,
@@ -86,7 +87,7 @@ QQ自查：需要确认你自己的QQ昵称、个性签名或最近QQ空间说�
 """.strip()
 
 
-@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.10")
+@register(NAME, "local-workshop", "通用角色相册、参考图与生图", "0.1.11")
 class CompanionAlbum(Star):
     clean_tool_echo = staticmethod(clean_tool_echo)
 
@@ -226,8 +227,8 @@ class CompanionAlbum(Star):
         if getattr(self, "memory_runtime", None):
             try:
                 await self.memory_runtime.done(event)
-            except Exception:
-                logger.warning("Memory reply capture could not complete")
+            except Exception as exc:
+                logger.warning("Memory reply capture could not complete: %s", format_exception_detail(exc))
         if getattr(self, "daily_evidence", None):
             cid = event.get_extra(NAME + "_conversation_id")
             if cid:
@@ -284,8 +285,8 @@ class CompanionAlbum(Star):
                             job_id, job["state"], origin_reply=final_text,
                             origin_checkpoint=checkpoint,
                         )
-            except Exception:
-                logger.warning("Saved daily context capture could not complete")
+            except Exception as exc:
+                logger.warning("Saved daily context capture could not complete: %s", format_exception_detail(exc))
 
         task = asyncio.create_task(capture())
         self.notice_tasks.add(task)
@@ -385,9 +386,10 @@ class CompanionAlbum(Star):
                 self.store.cleanup_media()
                 History(self.store).cleanup(busy=self.engine.tasks)
                 await self.proactive.maintain(limit=20)
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "Expired media cleanup could not finish; retained records for retry"
+                    "Expired media cleanup could not finish; retained records for retry: %s",
+                    format_exception_detail(exc),
                 )
 
     async def terminate(self):
@@ -1119,8 +1121,8 @@ class CompanionAlbum(Star):
             return error_response(
                 str(exc), status_code=getattr(exc, "status_code", 400)
             )
-        except Exception:
-            logger.error("Album management operation failed: %s", action)
+        except Exception as exc:
+            logger.exception("Album management operation failed (%s): %s", action, format_exception_detail(exc))
             return error_response(
                 "操作失败，已保留现有数据，请检查服务状态", status_code=500
             )
@@ -1134,8 +1136,12 @@ class CompanionAlbum(Star):
         """
         try:
             await self.memory_runtime.begin(event, req)
-        except Exception:
-            logger.warning("Memory context skipped for this reply")
+        except Exception as exc:
+            logger.warning(
+                "Memory context skipped for %s: %s",
+                getattr(event, "unified_msg_origin", ""),
+                format_exception_detail(exc),
+            )
 
     def _memory_character_name(self, scope):
         try:
@@ -1247,8 +1253,8 @@ class CompanionAlbum(Star):
                 )
                 self._observe_daily(scope, conversation_id, saved_history)
                 event.set_extra(NAME + "_history_count", len(saved_history))
-            except (ValueError, TypeError):
-                logger.warning("Saved daily baseline unavailable")
+            except (ValueError, TypeError) as exc:
+                logger.warning("Saved daily baseline unavailable (%s): %s", scope, format_exception_detail(exc))
         if getattr(self, "memory_store", None) and conversation_id:
             event.set_extra(NAME + "_memory_generation", self.memory_store.state(scope, conversation_id)["generation"])
         self.latest_chat[(scope, conversation_id)] = {
@@ -1284,9 +1290,11 @@ class CompanionAlbum(Star):
                             or "当前聊天分享的场景参考",
                         )
                         current_refs.append(asset["id"])
-                    except Exception:
+                    except Exception as exc:
                         logger.warning(
-                            "One chat scene could not be collected; remaining images will continue"
+                            "One chat scene could not be collected; remaining images will continue (%s): %s",
+                            scope,
+                            format_exception_detail(exc),
                         )
                 event.set_extra(NAME + "_images", current_refs)
             samples = self.store.list_assets(char["id"], limit=5, scope=scope)["items"]
@@ -1382,9 +1390,11 @@ class CompanionAlbum(Star):
                     for x in hint.get("today_schedule", {}).get("occurrences", [])
                 },
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Album context media could not be collected; chat will continue"
+                "Album context media could not be collected; chat will continue (%s): %s",
+                scope,
+                format_exception_detail(exc),
             )
 
     @staticmethod
@@ -1441,8 +1451,8 @@ class CompanionAlbum(Star):
                     self._chat_schedule_item(row) for row in items[:6]
                 ]
             return {"today_schedule": schedule}
-        except Exception:
-            logger.warning("Today schedule hint unavailable; album context continues")
+        except Exception as exc:
+            logger.warning("Today schedule hint unavailable; album context continues (%s): %s", scope, format_exception_detail(exc))
             return {}
 
     @filter.on_waiting_llm_request(priority=-100001)
@@ -2693,8 +2703,8 @@ class CompanionAlbum(Star):
             await runtime.business(
                 scope, cid, key, text, generation=generation, kind=kind, status=status
             )
-        except Exception:
-            logger.warning("Memory business fact capture could not complete")
+        except Exception as exc:
+            logger.warning("Memory business fact capture could not complete (%s): %s", scope, format_exception_detail(exc))
 
     @managed
     async def complete_job(self, job: dict):
@@ -3094,6 +3104,7 @@ class CompanionAlbum(Star):
                     line, caption_source = generated, "model"
                 stages.append(safe_stage("generation", "ok" if generated else "fallback"))
             except Exception as exc:
+                logger.warning("Photo completion_line failed (job=%s scope=%s): %s", job.get("id"), scope, format_exception_detail(exc))
                 stages.append(safe_stage("generation", "failed", exc=exc))
             # The recipient or photo permission may change while the LLM is pending.
             latest = await self.context.conversation_manager.get_curr_conversation_id(
@@ -3151,6 +3162,7 @@ class CompanionAlbum(Star):
                                 line,
                             )
                     except Exception as exc:
+                        logger.warning("Photo caption send failed (job=%s scope=%s): %s", job.get("id"), scope, format_exception_detail(exc))
                         caption_status = outcome(caption_key, "held" if isinstance(exc, AlbumError) else "failed")
                         self.store.finish_delivery(caption_key, caption_status)
                         stages.append(safe_stage("sending", "ok" if caption_status == "sent" else caption_status, exc=exc))
@@ -3202,6 +3214,7 @@ class CompanionAlbum(Star):
                 notification_stages=stages + [safe_stage("sending", "ok" if status == "sent" else status)],
             )
         except Exception as exc:
+            logger.warning("Photo notification/delivery failed (job=%s scope=%s phase=%s): %s", job.get("id"), scope, phase, format_exception_detail(exc))
             status = outcome(key, "held" if isinstance(exc, AlbumError) else "failed")
             self.store.finish_delivery(key, status)
             self.store.update_job(
@@ -3451,6 +3464,8 @@ class CompanionAlbum(Star):
                 "没有发布，照片和文案仍保留，不承诺自动重试。",
             )
         provider_id = await self.context.get_current_chat_provider_id(job["scope"])
+        if life_plan:
+            job["_provider_id"] = provider_id
         memory_hint = ""
         if (
             getattr(self, "memory_service", None)
@@ -3799,6 +3814,14 @@ class CompanionAlbum(Star):
         except AlbumError as exc:
             from .continuity import safe_stage
 
+            logger.warning(
+                "Life plan pre-execution held: plan_id=%s run_id=%s scope=%s cid=%s detail=%s",
+                plan.get("id"),
+                run_id,
+                plan.get("scope"),
+                cid,
+                format_exception_detail(exc),
+            )
             return "held", {"error": "本次安排或聊天依据已变化，未发送消息", "conversation_id": cid,
                             "stages": [safe_stage("validation", "held", exc)]}
         finally:
@@ -3915,7 +3938,16 @@ class CompanionAlbum(Star):
         except RecoveryStop as exc:
             stopped = exc.code in {"ASSISTANT_CHANGED", "GENERATION_STALE", "GENERATION_CANCELLED"}
             state = "skipped" if exc.code == "CHAT_ACTIVE" else "held" if stopped else "failed"
-            return state, {"error": "本次生成恢复已结束，未发送消息", "conversation_id": current,
+            http_status = next(
+                (
+                    s["http_status"]
+                    for s in reversed(stages)
+                    if isinstance(s, dict) and type(s.get("http_status")) is int and 100 <= s["http_status"] <= 599
+                ),
+                0,
+            )
+            detail_tag = f"{exc.code}, HTTP {http_status}" if http_status else exc.code
+            return state, {"error": f"本次生成恢复已结束，未发送消息（{detail_tag}）", "conversation_id": current,
                            "stages": stages, **({"_preserve_plan": True} if stopped else {})}
         if getattr(self, "daily_evidence", None):
             occurrence = self.plans.daily.occurrence(scope, current, run_id)
@@ -4010,11 +4042,27 @@ class CompanionAlbum(Star):
             if receipt.get("public_text") is not None:
                 line = receipt.pop("public_text")
         except AlbumError as exc:
+            logger.warning(
+                "Life plan sending held: plan_id=%s run_id=%s scope=%s cid=%s detail=%s",
+                plan.get("id"),
+                run_id,
+                scope,
+                current,
+                format_exception_detail(exc),
+            )
             self.store.finish_delivery(key, "held")
             return "held", {"error": "本次安排或聊天依据已变化，未发送消息", "conversation_id": current,
                             "stages": stages + [safe_stage("sending", "held", exc)],
                             **({"_preserve_plan": True} if getattr(exc, "code", "") == "ASSISTANT_CHANGED" else {})}
         except Exception as exc:
+            logger.exception(
+                "Life plan sending failed (unknown delivery): plan_id=%s run_id=%s scope=%s cid=%s detail=%s",
+                plan.get("id"),
+                run_id,
+                scope,
+                current,
+                format_exception_detail(exc),
+            )
             self.store.finish_delivery(key, "unknown")
             return "unknown", {"error": "投递结果未知，不会自动重发", "conversation_id": current,
                                "stages": stages + [safe_stage("sending", "unknown", exc)]}
@@ -4023,6 +4071,13 @@ class CompanionAlbum(Star):
         except Exception as exc:
             # The acknowledged transport result remains true even when a
             # secondary delivery ledger cannot be updated.
+            logger.warning(
+                "Life plan finish_delivery failed: plan_id=%s run_id=%s key=%s detail=%s",
+                plan.get("id"),
+                run_id,
+                key,
+                format_exception_detail(exc),
+            )
             stages.append(safe_stage("sending", "failed", exc))
             receipt["delivery_error"] = "投递回执待保存"
         if receipt.get("timer_fallback"):
@@ -4034,6 +4089,7 @@ class CompanionAlbum(Star):
                 history_state = self.proactive.get(key).get("history_state")
                 stages.append(safe_stage("history", "ok" if history_state in {"saved", "consumed"} else "pending"))
             except Exception as exc:
+                logger.warning("Life plan proactive history check failed: key=%s detail=%s", key, format_exception_detail(exc))
                 stages.append(safe_stage("history", "failed", exc))
         extra = {
             "summary": line[:160],
@@ -4047,6 +4103,7 @@ class CompanionAlbum(Star):
                     await self._memory_business((scope, current, memory_generation), key, line)
                     stages.append(safe_stage("history", "ok"))
                 except Exception as exc:
+                    logger.warning("Life plan memory business capture failed: key=%s detail=%s", key, format_exception_detail(exc))
                     stages.append(safe_stage("history", "failed", exc))
             photo_mode = latest.get("photo_mode", "auto")
             if (
@@ -4073,7 +4130,14 @@ class CompanionAlbum(Star):
                     extra["job_id"] = job["id"]
                     extra["photo_scene"] = photo_scene[:240]
                     stages.append(safe_stage("photo", "ok", code="PHOTO_TASK_CREATED"))
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "Life plan photo submit failed: plan_id=%s run_id=%s scope=%s detail=%s",
+                        plan.get("id"),
+                        run_id,
+                        scope,
+                        format_exception_detail(exc),
+                    )
                     extra["photo_error"] = "照片任务未建立"
                     stages.append(safe_stage("photo", "failed", code="PHOTO_SUBMIT_FAILED"))
             else:
@@ -4115,6 +4179,13 @@ class CompanionAlbum(Star):
                             extra["follow_up_name"] = spawned["name"]
                     stages.append(safe_stage("follow_up", "ok"))
                 except Exception as exc:
+                    logger.warning(
+                        "Life plan follow-up schedule failed: plan_id=%s run_id=%s scope=%s detail=%s",
+                        plan.get("id"),
+                        run_id,
+                        scope,
+                        format_exception_detail(exc),
+                    )
                     extra["follow_up_error"] = "后续约定未建立"
                     stages.append(safe_stage("follow_up", "failed", exc))
             else:

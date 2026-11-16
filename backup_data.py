@@ -526,7 +526,7 @@ _CHAT_BOUNDS = {
     "recall_candidates": (5, 50), "recall_max": (1, 10), "image_keep_turns": (0, 50),
 }
 _CONFIG_SWITCHES = {
-    "settings": ("qzone_enabled", "generated_qzone_allowed", "parallel_backup", "retry_unknown", "primary_enabled"),
+    "settings": ("qzone_enabled", "memory_auto_enable", "generated_qzone_allowed", "parallel_backup", "retry_unknown", "primary_enabled"),
     "chat": ("auto_process", "inject_enabled", "vector_enabled", "query_rewrite", "image_describe", "enabled", "maintenance_paused"),
     "provider": ("enabled",), "model": ("custom", "clear_key"), "search": ("is_builtin",),
 }
@@ -543,7 +543,7 @@ def _config_schema(value, *, context="settings"):
     _object(value)
     _optional_fields(value, text=("api_key", "base_url", "api_url", "active_key_id", "preferred_provider"),
                      integer=("settings_revision",), lists=("providers", "api_keys", "presets", "search_schemes", "provider_order"),
-                     objects=("shared", "model_bindings"), boolean=_CONFIG_SWITCHES.get(context, ()))
+                     objects=("shared", "model_bindings", "chat_settings"), boolean=_CONFIG_SWITCHES.get(context, ()))
     if context == "settings":
         _bounded_fields(value, _SETTING_BOUNDS)
         if "plan_recovery" in value:
@@ -601,6 +601,8 @@ def _config_schema(value, *, context="settings"):
     for binding in value.get("model_bindings", {}).values():
         _object(binding)
         _optional_fields(binding, text=("mode", "preset_id"))
+    if context == "models" and "chat_settings" in value:
+        _config_schema(value["chat_settings"], context="chat")
 
 
 def _calendar_schema(value):
@@ -1095,7 +1097,11 @@ def _validate_relations(db, directory, manifest, cancel, source=None):
                     raise BackupError("CREDENTIAL_POLICY_INVALID")
 
     config = get("memory_model_settings", "1")
-    presets = {p.get("id") for p in _load(config["data"]).get("presets", [])} if config else set()
+    config_data = _load(config["data"]) if config else {}
+    presets = {p.get("id") for p in config_data.get("presets", [])}
+    for role, binding in config_data.get("model_bindings", {}).items():
+        if binding.get("mode") == "preset" and binding.get("preset_id") and binding["preset_id"] not in presets:
+            unresolved(["memory_model_settings", "1"], "model_bindings." + role, binding["preset_id"])
     for key, row in items("settings"):
         settings_value = _load(row["data"]) if isinstance(row["data"], str) else row["data"]
         binding = settings_value.get("plan_recovery", {}).get("assistant_binding", {})

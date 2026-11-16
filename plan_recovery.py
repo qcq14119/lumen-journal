@@ -10,12 +10,13 @@ import time
 from email.utils import parsedate_to_datetime
 
 import aiohttp
+from astrbot.api import logger
 
 from .continuity import (
     PLAN_OUTPUT_PROTOCOL, _decision, _object, _without_thoughts, parse_plan_controls,
     safe_failure, safe_stage,
 )
-from .store import AlbumError
+from .store import AlbumError, format_exception_detail
 
 
 class RecoveryStop(AlbumError):
@@ -307,7 +308,14 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                             await budget.verify(eligible)
                         except RecoveryStop:
                             raise
-                        except AlbumError:
+                        except AlbumError as exc:
+                            logger.warning(
+                                "Life plan assistant unavailable: plan_id=%s scope=%s cid=%s detail=%s",
+                                plan.get("id"),
+                                plan.get("scope"),
+                                cid,
+                                format_exception_detail(exc),
+                            )
                             budget.note("assistant", "skipped", "ASSISTANT_UNAVAILABLE")
                     else:
                         budget.note("assistant", "skipped", "ASSISTANT_UNAVAILABLE")
@@ -329,6 +337,18 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                     raw = await budget.wait(lambda: plugin.completion_line(job, char, cid), eligible, call=True)
                 budget.note(stage, "ok")
             except RecoveryStop as exc:
+                logger.warning(
+                    "Life plan stage stopped: plan_id=%s plan_name=%s run_id=%s scope=%s stage=%s code=%s attempt=%s/%s provider=%s",
+                    plan.get("id"),
+                    plan.get("name"),
+                    job["life_plan"]["occurrence_id"],
+                    plan.get("scope"),
+                    stage,
+                    exc.code,
+                    budget.calls,
+                    budget.limit,
+                    job.get("_provider_id", ""),
+                )
                 if exc.code in {"ASSISTANT_RESPONSE", "RESPONSE_LIMIT"} and budget.calls < budget.limit:
                     budget.note(stage, "failed", exc.code)
                     failed_code = exc.code
@@ -336,6 +356,21 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                 raise
             except Exception as exc:
                 code, retryable, status = classify(exc)
+                logger.warning(
+                    "Life plan %s failed: plan_id=%s plan_name=%s run_id=%s scope=%s provider=%s code=%s retryable=%s http_status=%s attempt=%s/%s detail=%s",
+                    stage,
+                    plan.get("id"),
+                    plan.get("name"),
+                    job["life_plan"]["occurrence_id"],
+                    plan.get("scope"),
+                    job.get("_provider_id", ""),
+                    code,
+                    retryable,
+                    status,
+                    budget.calls,
+                    budget.limit,
+                    format_exception_detail(exc),
+                )
                 budget.note(stage, "failed", code, http_status=status)
                 if code.startswith("PROTOCOL_") and budget.calls < budget.limit:
                     failed_code = code
@@ -356,6 +391,17 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                     if repaired_from is not None else parse_plan_controls(raw, sources, reminder=plan.get("contact_mode") == "reminder"))
             except AlbumError as exc:
                 failed_code = getattr(exc, "code", "PROTOCOL_STRUCTURE")
+                logger.warning(
+                    "Life plan validation failed: plan_id=%s plan_name=%s run_id=%s scope=%s code=%s attempt=%s/%s detail=%s",
+                    plan.get("id"),
+                    plan.get("name"),
+                    job["life_plan"]["occurrence_id"],
+                    plan.get("scope"),
+                    failed_code,
+                    budget.calls,
+                    budget.limit,
+                    format_exception_detail(exc),
+                )
                 budget.note("validation", "failed", failed_code)
                 if budget.calls >= budget.limit:
                     raise RecoveryStop(failed_code) from None
@@ -397,11 +443,22 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                   else "skipped" if exc.code == "CHAT_ACTIVE"
                   else "exhausted" if exc.code in {"GENERATION_BUDGET", "GENERATION_DEADLINE"} or budget.calls >= budget.limit
                   else "failed")
+        logger.warning(
+            "Life plan recovery ended: plan_id=%s plan_name=%s run_id=%s scope=%s status=%s code=%s calls=%s/%s",
+            plan.get("id"),
+            plan.get("name"),
+            job["life_plan"]["occurrence_id"],
+            plan.get("scope"),
+            status,
+            exc.code,
+            budget.calls,
+            budget.limit,
+        )
         budget.note("recovery", status, exc.code)
         raise
     except asyncio.CancelledError:
         budget.note("recovery", "cancelled", "GENERATION_CANCELLED")
         raise
     finally:
-        for key in ("_recovery_prompt", "_recovery_persona", "_recovery_feedback", "_generation_budget"):
+        for key in ("_recovery_prompt", "_recovery_persona", "_recovery_feedback", "_generation_budget", "_provider_id"):
             job.pop(key, None)

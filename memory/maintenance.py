@@ -10,8 +10,10 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
+from astrbot.api import logger
+
 from ..plan_recovery import classify, retry_delay
-from ..store import AlbumError
+from ..store import AlbumError, format_exception_detail
 from .maintenance_protocol import CATEGORIES, CODES, SYSTEM, MaintenanceError, candidate, dependencies, key, keys, packed, parse, quote_index, safe_text
 from .text import estimate
 
@@ -277,6 +279,14 @@ class MemoryMaintenance:
             code = code if code in CODES else "STORAGE"
             if not acquired and code == "TIME_LIMIT":
                 code = "QUEUE_EXPIRED"
+            logger.warning(
+                "Memory maintenance failed (scope=%s cid=%s task=%s code=%s): %s",
+                scope,
+                cid,
+                task_id,
+                code,
+                format_exception_detail(exc),
+            )
             state = "partial" if code in {"CALL_LIMIT", "TIME_LIMIT", "CAPACITY"} else "stale" if code in {"STALE", "SOURCE_CHANGED", "CHAT_DELETED"} else "failed"
             self._end(scope, cid, task_id, unit_id, state, code, total, frozen, started, accounted, vector_attempted)
         finally:
@@ -431,6 +441,16 @@ class MemoryMaintenance:
             except Exception as exc:
                 code = getattr(exc, "code", "")
                 network_code, retryable, _ = classify(exc)
+                logger.warning(
+                    "Memory maintenance call failed (scope=%s cid=%s unit=%s call=%s code=%s retryable=%s): %s",
+                    scope,
+                    cid,
+                    unit_id,
+                    calls,
+                    code or network_code,
+                    retryable,
+                    format_exception_detail(exc),
+                )
                 format_error = code in {"JSON_FORMAT", "RESPONSE_JSON", "RESPONSE_FORMAT"}
                 if retried or not (retryable or format_error) or calls >= policy["max_calls"]:
                     failure = network_code if network_code in {"MODEL_AUTH", "MODEL_CONFIG"} else code if code in CODES else "REQUEST_TIMEOUT" if network_code == "TIMEOUT" else "REQUEST_FAILED"

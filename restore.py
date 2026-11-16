@@ -862,6 +862,8 @@ class Restores:
                         elif kind == "settings":
                             for field in ("qzone_enabled", "generated_qzone_allowed", "primary_enabled"):
                                 settings[field] = intent[field]
+                            if "memory_auto_enable" in intent:
+                                settings["memory_auto_enable"] = bool(intent["memory_auto_enable"])
                             for provider in settings.get("providers", []):
                                 provider["enabled"] = intent["providers"].get(provider["id"], False)
                             if "plan_recovery" in settings:

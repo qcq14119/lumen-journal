@@ -10,9 +10,11 @@ import json
 import os
 import shutil
 
+from astrbot.api import logger
+
 from .provider import ImageProvider, ProviderError, parse_result
 from .attempts import Attempts, provider_settings
-from .store import AlbumError, Store, now, strings, text_value
+from .store import AlbumError, Store, format_exception_detail, now, strings, text_value
 
 
 class Engine:
@@ -512,6 +514,13 @@ class Engine:
             except asyncio.CancelledError:
                 raise
             except AlbumError as exc:
+                logger.warning(
+                    "Image job failed (job=%s scope=%s stage=%s): %s",
+                    key,
+                    job.get("scope"),
+                    stage,
+                    format_exception_detail(exc),
+                )
                 if getattr(exc, "retry_after", 0):
                     pauses = self.store.all("provider_pause")
                     previous = next((p for p in pauses if p["id"] == "service"), None)
@@ -553,6 +562,13 @@ class Engine:
                         ],
                     )
             except Exception as exc:
+                logger.exception(
+                    "Image job unexpected error (job=%s scope=%s stage=%s): %s",
+                    key,
+                    job.get("scope"),
+                    stage,
+                    format_exception_detail(exc),
+                )
                 current = self.store.job(key)
                 if current["state"] == "ready":
                     self.store.update_job(

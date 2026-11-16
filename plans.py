@@ -13,8 +13,9 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
+from astrbot.api import logger
 
-from .store import AlbumError, now, text_value, uid
+from .store import AlbumError, format_exception_detail, now, text_value, uid
 from .daily import DailySchedule
 
 FORMAT = "companion-life-plans-v1"
@@ -2606,6 +2607,14 @@ class LifePlans:
         except Exception as exc:
             from .continuity import safe_stage
 
+            logger.exception(
+                "Life plan worker execution failed: plan_id=%s run_id=%s scope=%s status=%s detail=%s",
+                plan.get("id"),
+                run.get("id"),
+                plan.get("scope"),
+                status,
+                format_exception_detail(exc),
+            )
             self.store.save(
                 "life_run",
                 run["id"],
@@ -2622,8 +2631,8 @@ class LifePlans:
             if destroy:
                 try:
                     self.destroy_plan(plan["id"])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Life plan destroy_plan failed (plan_id=%s): %s", plan.get("id"), format_exception_detail(exc))
             self.running_scopes.discard(plan["scope"])
 
     async def close(self):
