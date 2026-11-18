@@ -13,7 +13,7 @@ import warnings
 from PIL import Image
 
 from .provider import ProviderError, parse_result
-from .store import AlbumError, MAX_BYTES, MAX_PIXELS, credential_entries, now
+from .store import AlbumError, MAX_BYTES, MAX_PIXELS, credential_entries, now, clean_model_message, exception_fields
 
 
 def provider_settings(store, snapshot):
@@ -86,6 +86,7 @@ class Attempts:
         )
         self.update(attempt)
         stage = "prepare"
+        settings = {}
         try:
             settings = provider_settings(self.store, site)
             async with self.engine.provider_factory(settings) as client:
@@ -112,7 +113,8 @@ class Attempts:
                     data = await client.submit(self.job["prompt"], refs)
                 deadline = now() + settings["task_timeout"]
                 while True:
-                    kind, value = parse_result(data, attempt.get("task_id", ""))
+                    failure = {}
+                    kind, value = parse_result(data, attempt.get("task_id", ""), failure=failure)
                     if kind != "pending":
                         break
                     stage = "poll"
@@ -132,6 +134,8 @@ class Attempts:
                         terminal=kind == "failed",
                         retryable=kind == "failed",
                         code=kind,
+                        remote_detail=clean_model_message(failure.get("message"), request_texts=(self.job["prompt"],),
+                                                          secrets=(settings.get("api_key"),)),
                     )
                 stage = "download"
                 path = self.cache_path(attempt)
@@ -169,7 +173,12 @@ class Attempts:
                         Image.DecompressionBombWarning,
                         Image.DecompressionBombError,
                     ) as exc:
-                        self.update(attempt, download_attempts=number + 1)
+                        failures = list(attempt.get("download_errors", []))
+                        if number < self.policy["max_retries"]:
+                            failures.append({"attempt": number + 1, **exception_fields(exc, from_client=True,
+                                request_texts=(self.job.get("prompt"), self.job.get("scene"), value if kind == "url" else ""),
+                                secrets=(settings.get("api_key"),))})
+                        self.update(attempt, download_attempts=number + 1, download_errors=failures)
                         if number == self.policy["max_retries"]:
                             if isinstance(exc, AlbumError):
                                 raise
@@ -202,6 +211,8 @@ class Attempts:
                 if unknown
                 else "failed",
                 error=str(exc),
+                **exception_fields(exc, request_texts=(self.job.get("prompt"), self.job.get("scene")),
+                                   secrets=(settings.get("api_key"),), from_client=stage in ("submit", "poll", "download")),
                 stage=stage,
                 finished=now(),
                 **{
@@ -220,6 +231,8 @@ class Attempts:
                 state="unknown",
                 stage=stage,
                 code=type(exc).__name__,
+                **exception_fields(exc, request_texts=(self.job.get("prompt"), self.job.get("scene")),
+                                   secrets=(settings.get("api_key"),), from_client=stage in ("submit", "poll", "download")),
                 finished=now(),
             )
             raise ProviderError(
@@ -394,6 +407,7 @@ class Attempts:
                 stage="download" if cached else last.get("stage", "provider"),
                 code=last.get("code", ""),
                 http_status=last.get("http_status"),
+                remote_detail=last.get("raw_error", ""),
             )
         attempt, raw, site = winner
         os.replace(self.cache_path(attempt), self.engine.result_path(self.key))

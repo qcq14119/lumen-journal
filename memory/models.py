@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from ..provider import PublicResolver, validate_url
-from ..store import AlbumError, redact_error_text
+from ..store import AlbumError, clean_model_message, model_response_message, upstream_error_code
 from .store import GLOBAL_CHAT_SETTING_KEYS, apply_setting_patch
 from .text import clean_image_description
 
@@ -1022,6 +1022,7 @@ class MemoryModel:
             ) as response:
                 if response.status != 200:
                     remote_detail = ""
+                    upstream_code = None
                     try:
                         err_chunks, err_size = [], 0
                         async for chunk in response.content.iter_chunked(4096):
@@ -1030,23 +1031,26 @@ class MemoryModel:
                             if err_size >= 4096:
                                 break
                         raw_err = b"".join(err_chunks).decode("utf-8", errors="replace").strip()
-                        if raw_err:
-                            try:
-                                parsed_err = json.loads(raw_err)
-                                if isinstance(parsed_err, dict):
-                                    inner = parsed_err.get("error")
-                                    if isinstance(inner, dict) and inner.get("message"):
-                                        raw_err = str(inner["message"])
-                                    elif parsed_err.get("message"):
-                                        raw_err = str(parsed_err["message"])
-                                    elif parsed_err.get("detail"):
-                                        raw_err = str(parsed_err["detail"])
-                            except (ValueError, TypeError):
-                                pass
-                            remote_detail = redact_error_text(raw_err, limit=300)
+                        try:
+                            parsed = json.loads(raw_err)
+                        except (ValueError, RecursionError):
+                            parsed = raw_err
+                        upstream_code = upstream_error_code(parsed)
+                        # The request can contain model input and images. Use it only to
+                        # recognize echoes, never as a fallback description of an error.
+                        inputs = [item.get("content") for item in payload.get("messages", [])]
+                        inputs.extend(payload.get("input", []))
+                        inputs.extend(payload.get("documents", []))
+                        inputs.append(payload.get("query"))
+                        texts = [part for value in inputs for part in (
+                            [p.get("text") for p in value if isinstance(p, dict)]
+                            if isinstance(value, list) else [value])]
+                        remote_detail = clean_model_message(model_response_message(parsed),
+                            request_texts=texts, secrets=(self.config["api_key"],))
                     except Exception:
                         remote_detail = ""
                     error = MemoryResponseError("REQUEST_FAILED", http_status=response.status)
+                    error.upstream_code = upstream_code
                     error.status = response.status
                     error.headers = {
                         "Retry-After": response.headers.get("Retry-After", "")

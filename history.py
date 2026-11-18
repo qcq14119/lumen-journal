@@ -18,6 +18,8 @@ class History:
             sql = "SELECT id,state,data,updated FROM jobs"
         elif kind == "deliveries":
             sql = "SELECT id,state,data,0 AS updated FROM deliveries"
+        elif kind == "operations":
+            return self.store.operation_errors()
         elif kind == "runs":
             sql = "SELECT id,json_extract(data,'$.state') AS state,data,revision AS updated FROM records WHERE kind='life_run'"
         else:
@@ -43,6 +45,8 @@ class History:
 
     def protection(self, kind, item, busy=()):
         """Explain why a record must retain its details and recovery information."""
+        if kind == "operations":
+            return ""
         if kind == "jobs":
             if item["id"] in busy or item["state"] not in (
                 "ready",
@@ -112,7 +116,7 @@ class History:
                     or query.casefold()
                     in " ".join(
                         str(r.get(k, ""))
-                        for k in ("id", "scene", "name", "error", "character_name")
+                        for k in ("id", "scene", "name", "error", "character_name", "raw_error", "error_detail")
                     ).casefold()
                 )
             ]
@@ -194,6 +198,9 @@ class History:
                     raise AlbumError(reason + "；本次未清理任何记录")
                 ids.add(row["id"])
                 selected.append(row)
+            if kind == "operations":
+                self.store.delete_operation_errors(ids)
+                return {"cleaned": len(ids)}
             for row in selected:
                 if kind == "jobs":
                     provider = row.get("provider", {})
@@ -283,7 +290,7 @@ class History:
         """Apply age/count limits only to settled records; preview is read-only."""
         result = {}
         with self.store.lock:
-            for kind in ("jobs", "deliveries", "runs"):
+            for kind in ("jobs", "deliveries", "runs", "operations"):
                 rows = self.rows(kind)
                 ordered = sorted(
                     rows,

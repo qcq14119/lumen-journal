@@ -8,7 +8,7 @@ import re
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
-from ..store import AlbumError, format_exception_detail, redact_error_text
+from ..store import AlbumError, capture_exception, recorded_exception_detail, record_operation_error
 from . import core
 from .maintenance_store import fingerprint
 from .models import MemoryModel, MemoryModelError
@@ -86,15 +86,17 @@ class MemoryAPI:
                     with self.store.restore_guard.operation():
                         return await handler()
                 except (AlbumError, ValueError, TypeError, KeyError) as exc:
+                    record_operation_error(self.plugin.store, "拾忆管理 · " + route, exc)
                     message = str(exc) if isinstance(exc, AlbumError) else "记忆请求格式不正确"
                     conflict = any(w in message for w in ("处理中", "版本", "已变化", "修改过"))
                     return error_response(message, status_code=409 if conflict else 400, headers=PRIVATE)
                 except Exception as exc:
-                    logger.exception(
+                    record_operation_error(self.plugin.store, "拾忆管理 · " + route, exc)
+                    logger.warning(
                         "Memory API unexpected error (%s %s): %s",
                         method,
                         route,
-                        format_exception_detail(exc),
+                        recorded_exception_detail(exc),
                     )
                     return error_response("记忆操作失败，请刷新后查看当前状态", status_code=500, headers=PRIVATE)
 
@@ -562,30 +564,14 @@ class MemoryAPI:
                 else:
                     await model.summarize(prompt="请回复OK", system_prompt="连接测试", max_tokens=16, timeout=60)
                 return json_response({"ok": True}, headers=PRIVATE)
-            except MemoryModelError as error:
-                detail = format_exception_detail(error, limit=300)
-                logger.warning(
-                    "Model preset %s failed (type=%s, model=%s, base_url=%s): %s",
-                    operation,
-                    kind,
-                    config.get("model", ""),
-                    redact_error_text(config.get("base_url", ""), limit=200),
-                    detail,
-                )
-                if getattr(error, "status", None) is None and not getattr(error, "retryable", False):
-                    raise  # local validation such as wrong dimensions: show as is
-                raise AlbumError(f"{error_kind(error)[0]}（{detail}）") from None
             except Exception as error:
-                detail = format_exception_detail(error, limit=300)
-                logger.warning(
-                    "Model preset %s failed (type=%s, model=%s, base_url=%s): %s",
-                    operation,
-                    kind,
-                    config.get("model", ""),
-                    redact_error_text(config.get("base_url", ""), limit=200),
-                    detail,
-                )
-                raise AlbumError(f"{error_kind(error)[0]}（{detail}）") from None
+                fields = capture_exception(error, from_client=True, secrets=(config.get("api_key"),),
+                                  request_texts=("请回复OK", "连接测试", "测试文档一", "测试文档二"))
+                logger.warning("Model preset %s failed (type=%s): %s", operation, kind, recorded_exception_detail(error))
+                if isinstance(error, MemoryModelError) and getattr(error, "status", None) is None and not getattr(error, "retryable", False):
+                    raise
+                detail = " · ".join(filter(None, (fields["raw_error"], fields["error_detail"])))
+                raise AlbumError(f"{error_kind(error)[0]}（{detail}）") from error
         result = models.preset(operation, data, data.get("revision"))
         if operation == "key":
             return json_response(result, headers=PRIVATE)

@@ -976,6 +976,7 @@ fieldset { min-width: 0; border: 1px solid var(--line); border-radius: 10px; mar
 .help-details > summary { width: fit-content; }
 .help-details[open] > summary { color: var(--ink); }
 .help-details p { line-height: 1.7; }
+.diagnostic-detail { margin: 4px 0 12px; padding-inline-start: 12px; border-inline-start: 2px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font: .92em/1.6 ui-monospace, monospace; }
 .history-card-foot > button { margin-left: auto; }
 @media (max-width: 600px) {
   .brand p { display: none; }

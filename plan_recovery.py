@@ -16,13 +16,13 @@ from .continuity import (
     PLAN_OUTPUT_PROTOCOL, _decision, _object, _without_thoughts, parse_plan_controls,
     safe_failure, safe_stage,
 )
-from .store import AlbumError, format_exception_detail
+from .store import AlbumError, exception_http_status, format_exception_detail, model_exception_message
 
 
 class RecoveryStop(AlbumError):
-    def __init__(self, code):
+    def __init__(self, code, message="本次生成恢复已结束，未发送消息"):
         self.code = code
-        super().__init__("本次生成恢复已结束，未发送消息")
+        super().__init__(message)
 
 
 def _errors(error):
@@ -42,9 +42,7 @@ def classify(error):
     if any(isinstance(item, (ssl.SSLError, aiohttp.ClientSSLError,
             aiohttp.ServerFingerprintMismatch, aiohttp.InvalidURL)) for item in chain):
         return "MODEL_CONFIG", False, 0
-    status = next((v for item in chain for v in (getattr(item, "status_code", None), getattr(item, "status", None),
-        getattr(item, "code", None), getattr(getattr(item, "response", None), "status_code", None),
-        getattr(item, "counts", {}).get("http_status")) if type(v) is int and 100 <= v <= 599), 0)
+    status = next((status for item in chain if (status := exception_http_status(item))), 0)
     if status in (401, 403):
         return "MODEL_AUTH", False, status
     if status == 429:
@@ -93,9 +91,11 @@ class GenerationBudget:
     def remaining(self):
         return max(0.0, self.deadline - time.monotonic())
 
-    def note(self, stage, status, code=None, **counts):
-        self.stages.append(safe_stage(stage, status, code=code, attempt=self.calls,
-            calls=self.calls, elapsed_ms=int((time.monotonic() - self.started) * 1000), **counts))
+    def note(self, stage, status, code=None, *, exc=None, **counts):
+        entry = safe_stage(stage, status, exc=exc, code=code, attempt=self.calls,
+            calls=self.calls, elapsed_ms=int((time.monotonic() - self.started) * 1000), **counts)
+        self.stages.append(entry)
+        return entry
 
     async def verify(self, check):
         if not self.remaining:
@@ -266,22 +266,24 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
         try:
             fresh = plugin.store.get("life_plan", plan["id"])
             character_id = plugin.store.character_for(plan["scope"])["id"]
-        except AlbumError:
-            raise RecoveryStop("GENERATION_STALE") from None
-        if (fresh.get("deleted") or not fresh.get("enabled") or fresh["revision"] != plan["revision"]
-            or character_id != char["id"]
-            or await plugin.context.conversation_manager.get_curr_conversation_id(plan["scope"]) != cid):
-            raise RecoveryStop("GENERATION_STALE")
+        except AlbumError as exc:
+            raise RecoveryStop("GENERATION_STALE", "找不到原计划或角色绑定") from exc
+        if fresh.get("deleted") or not fresh.get("enabled") or fresh["revision"] != plan["revision"]:
+            raise RecoveryStop("GENERATION_STALE", "生成期间计划已停用、删除或修改")
+        if character_id != char["id"]:
+            raise RecoveryStop("GENERATION_STALE", "生成期间会话已换绑角色")
+        if await plugin.context.conversation_manager.get_curr_conversation_id(plan["scope"]) != cid:
+            raise RecoveryStop("GENERATION_STALE", "生成期间已切换聊天文件")
         if getattr(plugin, "memory_store", None) and plugin.memory_store.state(plan["scope"], cid)["generation"] != job["memory_generation"]:
-            raise RecoveryStop("GENERATION_STALE")
+            raise RecoveryStop("GENERATION_STALE", "生成期间聊天记忆已换代")
         occurrence = None
         if getattr(plugin, "daily_evidence", None):
             occurrence = plugin.plans.daily.occurrence(plan["scope"], cid, job["life_plan"]["occurrence_id"])
             if ("_occurrence_revision" in job and occurrence["revision"] != job["_occurrence_revision"]
                 or occurrence.get("decision") == "skip" or occurrence.get("effective_ts", 0) > now()):
-                raise RecoveryStop("GENERATION_STALE")
+                raise RecoveryStop("GENERATION_STALE", "本次安排已调整、取消或尚未到时间")
         if plan.get("run_once") and plugin.plans.daily.once_expired(plan, now()):
-            raise RecoveryStop("GENERATION_STALE")
+            raise RecoveryStop("GENERATION_STALE", "一次性约定已过期")
         if assistant_signature is not None:
             try:
                 signature = models.plan_assistant_signature(plan["scope"], cid)
@@ -316,7 +318,7 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                                 cid,
                                 format_exception_detail(exc),
                             )
-                            budget.note("assistant", "skipped", "ASSISTANT_UNAVAILABLE")
+                            budget.note("assistant", "skipped", "ASSISTANT_UNAVAILABLE", exc=exc)
                     else:
                         budget.note("assistant", "skipped", "ASSISTANT_UNAVAILABLE")
                     assistant_used = True
@@ -356,6 +358,11 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                 raise
             except Exception as exc:
                 code, retryable, status = classify(exc)
+                entry = budget.note(stage, "failed", code, exc=exc, http_status=status)
+                from_client = stage == "assistant" or job.pop("_failed_model_call", None) == id(exc)
+                entry["raw_error"] = model_exception_message(exc, from_client=from_client, request_texts=(
+                    job.get("_recovery_prompt"), job.get("_recovery_persona"), failed_raw,
+                    *job.get("_recovery_turn_texts", ())))
                 logger.warning(
                     "Life plan %s failed: plan_id=%s plan_name=%s run_id=%s scope=%s provider=%s code=%s retryable=%s http_status=%s attempt=%s/%s detail=%s",
                     stage,
@@ -369,9 +376,8 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                     status,
                     budget.calls,
                     budget.limit,
-                    format_exception_detail(exc),
+                    " | ".join(filter(None, (entry["error_detail"], entry["raw_error"]))),
                 )
-                budget.note(stage, "failed", code, http_status=status)
                 if code.startswith("PROTOCOL_") and budget.calls < budget.limit:
                     failed_code = code
                     continue
@@ -402,7 +408,7 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                     budget.limit,
                     format_exception_detail(exc),
                 )
-                budget.note("validation", "failed", failed_code)
+                budget.note("validation", "failed", failed_code, exc=exc)
                 if budget.calls >= budget.limit:
                     raise RecoveryStop(failed_code) from None
                 failed_raw = raw if isinstance(raw, str) and len(raw) <= 2400 else ""
@@ -413,14 +419,17 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
                 conv = await budget.wait(lambda: plugin._completion_snapshot(plan["scope"], cid), eligible)
                 history = json.loads(conv.history or "[]")
                 plugin._observe_daily(plan["scope"], cid, history)
-                stale = (watermark(history, plugin.latest_chat.get((plan["scope"], cid), {})) != job.get("_context_watermark")
-                    or plugin.daily_evidence.revision(plan["scope"], cid) != job.get("_evidence_revision"))
+                stale = None
+                if watermark(history, plugin.latest_chat.get((plan["scope"], cid), {})) != job.get("_context_watermark"):
+                    stale = "CHAT_CONTEXT_CHANGED"
+                elif plugin.daily_evidence.revision(plan["scope"], cid) != job.get("_evidence_revision"):
+                    stale = "DAILY_EVIDENCE_CHANGED"
                 del history, conv
                 if stale:
                     if not rechecked and budget.calls < budget.limit:
                         rechecked = True
                         failed_raw, failed_code = "", ""
-                        budget.note("recovery", "retrying", "GENERATION_STALE")
+                        budget.note("recovery", "retrying", stale)
                         continue
                     await budget.verify(eligible)
                     if plan.get("contact_mode") != "reminder":
@@ -454,11 +463,11 @@ async def generate_plan(plugin, job, char, plan, cid, stages):
             budget.calls,
             budget.limit,
         )
-        budget.note("recovery", status, exc.code)
+        budget.note("recovery", status, exc.code, exc=exc if exc.code == "GENERATION_STALE" else None)
         raise
     except asyncio.CancelledError:
         budget.note("recovery", "cancelled", "GENERATION_CANCELLED")
         raise
     finally:
-        for key in ("_recovery_prompt", "_recovery_persona", "_recovery_feedback", "_generation_budget", "_provider_id"):
+        for key in ("_recovery_prompt", "_recovery_persona", "_recovery_turn_texts", "_failed_model_call", "_recovery_feedback", "_generation_budget", "_provider_id"):
             job.pop(key, None)

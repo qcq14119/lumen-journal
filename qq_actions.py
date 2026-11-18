@@ -18,8 +18,12 @@ from astrbot.core.platform.message_type import MessageType
 from PIL import Image as PillowImage, ImageOps, UnidentifiedImageError
 
 from .restore_guard import managed
-from .store import MAX_BYTES, MAX_PIXELS, AlbumError, format_exception_detail, now, text_value
+from .store import MAX_BYTES, MAX_PIXELS, AlbumError, record_operation_error, recorded_exception_detail, request_strings, now, text_value
 
+
+QQ_ACTION_NAMES = {"set_qq_profile": "修改 QQ 昵称", "set_self_longnick": "修改 QQ 签名", "set_qq_avatar": "更换 QQ 头像",
+                   "set_online_status": "修改 QQ 状态", "friend_poke": "好友戳一戳", "group_poke": "群聊戳一戳",
+                   "get_stranger_info": "读取 QQ 资料", "get_qzone_msg_list": "读取 QQ 空间"}
 
 QQ_READ_TOOLS = frozenset(
     {
@@ -252,18 +256,19 @@ class QQActions:
         if len(self.seen) > 1024:
             self.seen.popitem(last=False)
 
-    @staticmethod
-    async def call(client, account, action, **params):
+    async def call(self, client, account, action, *, operation="", **params):
         try:
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 client.call_action(action, self_id=account, **params), 12
             )
-        except ApiNotAvailable:
-            return "unavailable"
-        except ActionFailed:
-            return "failed"
-        except Exception:
-            return "unknown"
+            if isinstance(result, dict) and (result.get("status") == "failed" or
+                    type(result.get("retcode")) is int and result["retcode"] != 0):
+                raise ActionFailed(result)
+        except Exception as exc:
+            state = "unavailable" if isinstance(exc, ApiNotAvailable) else "failed" if isinstance(exc, ActionFailed) else "unknown"
+            record_operation_error(self.plugin.store, operation or QQ_ACTION_NAMES.get(action, "QQ 动作"), exc,
+                                   state=state, request_texts=request_strings(params), from_client=True)
+            return state
         return "confirmed"
 
     async def read_self(self, event, action, **params):
@@ -273,13 +278,15 @@ class QQActions:
             data = await asyncio.wait_for(
                 client.call_action(action, self_id=account, **params), 12
             )
-        except (QQConnectionUnavailable, ApiNotAvailable):
-            return "unavailable"
-        except TimeoutError:
-            return "timeout"
-        except (ActionFailed, Exception):
+        except Exception as exc:
+            state = "unavailable" if isinstance(exc, (QQConnectionUnavailable, ApiNotAvailable)) else "timeout" if isinstance(exc, TimeoutError) else "failed"
+            record_operation_error(self.plugin.store, QQ_ACTION_NAMES.get(action, "读取 QQ 资料"), exc,
+                                   state=state, request_texts=request_strings(params), from_client=True)
+            return state
+        if not isinstance(data, dict):
+            record_operation_error(self.plugin.store, QQ_ACTION_NAMES.get(action, "读取 QQ 资料"), AlbumError("QQ 返回的数据格式无效"))
             return "failed"
-        return ("ok", data) if isinstance(data, dict) else "failed"
+        return "ok", data
 
     @managed
     async def read_profile(self, event):
@@ -291,6 +298,7 @@ class QQActions:
             return {"status": result}
         data = result[1]
         if data.get("user_id") not in (account, str(account)):
+            record_operation_error(self.plugin.store, "读取 QQ 资料", ActionFailed(data) if "retcode" in data else AlbumError("QQ 返回的账号与当前账号不一致"))
             return {"status": "failed"}
         nickname = (
             data["nickname"].strip()[:60]
@@ -321,6 +329,8 @@ class QQActions:
             if "missing" in fields.values()
             else "ok"
         )
+        if status == "failed":
+            record_operation_error(self.plugin.store, "读取 QQ 资料", AlbumError("QQ 没有返回昵称或签名字段"))
         return {
             "status": status,
             "nickname": nickname,
@@ -337,6 +347,7 @@ class QQActions:
         if items is None:
             items = []
         if not isinstance(items, list):
+            record_operation_error(self.plugin.store, "读取 QQ 空间", AlbumError("QQ 没有返回有效的说说列表"))
             return {"status": "failed"}
         posts = []
         for item in items[:5]:
@@ -549,6 +560,7 @@ class QQActions:
             client,
             row["account"],
             "set_online_status",
+            operation={"restore": "恢复 QQ 状态", "scheduled": "定时修改 QQ 状态"}.get(operation, "修改 QQ 状态"),
             status=primary,
             ext_status=extended,
             battery_status=0,
@@ -623,12 +635,14 @@ class QQActions:
                     continue
                 try:
                     client = self.client(row["platform"])
-                except QQConnectionUnavailable:
+                except QQConnectionUnavailable as exc:
                     if restoring and row.get("recovery") != "waiting_connection":
+                        record_operation_error(self.plugin.store, "恢复 QQ 状态", exc, state="unavailable")
                         self.save_status(
                             row, recovery="waiting_connection", outcome="unavailable"
                         )
                     elif due and scheduled.get("state") != "waiting_connection":
+                        record_operation_error(self.plugin.store, "定时修改 QQ 状态", exc, state="unavailable")
                         self.save_status(
                             row,
                             scheduled=scheduled | {"state": "waiting_connection"},
@@ -656,7 +670,8 @@ class QQActions:
             except AlbumError:
                 pass
             except Exception as exc:
-                logger.warning("QQ status timer could not be checked: %s", format_exception_detail(exc))
+                record_operation_error(self.plugin.store, "检查 QQ 状态定时任务", exc)
+                logger.warning("QQ status timer could not be checked: %s", recorded_exception_detail(exc))
             await asyncio.sleep(5)
 
     def start(self):

@@ -202,6 +202,8 @@ class MemoryStore:
                 CREATE TABLE IF NOT EXISTS memory_view_bindings(
                     username TEXT PRIMARY KEY, scope TEXT NOT NULL);
             """)
+            if "diagnostics" not in {r[1] for r in self.db.execute("PRAGMA table_info(mem_logs)")}:
+                self.db.execute("ALTER TABLE mem_logs ADD COLUMN diagnostics TEXT")
             self.db.commit()
         from .maintenance_store import MaintenanceStore
         self.maintenance = MaintenanceStore(self)
@@ -1078,15 +1080,15 @@ class MemoryStore:
 
     # ---------------------------------------------------------------- logs --
 
-    def _log(self, scope, cid, state, detail=""):
+    def _log(self, scope, cid, state, detail="", diagnostics=()):
         self.db.execute(
-            "INSERT INTO mem_logs(scope,cid,at,state,detail) VALUES(?,?,?,?,?)",
-            (scope, cid, _now(), state, str(detail)[:400]),
+            "INSERT INTO mem_logs(scope,cid,at,state,detail,diagnostics) VALUES(?,?,?,?,?,?)",
+            (scope, cid, _now(), state, str(detail)[:400], _json(diagnostics[:10]) if diagnostics else None),
         )
 
-    def log(self, scope, cid, state, detail=""):
+    def log(self, scope, cid, state, detail="", *, diagnostics=()):
         with self.transaction():
-            self._log(scope, cid, state, detail)
+            self._log(scope, cid, state, detail, diagnostics)
 
     def logs(self, scope="", cid="", *, failed=False, query="", offset=0, limit=20):
         where, params = [], []
@@ -1097,10 +1099,10 @@ class MemoryStore:
             where.append("cid=?")
             params.append(cid)
         if failed:
-            where.append("state LIKE '%failed%'")
+            where.append("(state LIKE '%failed%' OR diagnostics IS NOT NULL)")
         if query:
-            where.append("(state LIKE ? OR detail LIKE ? OR CAST(id AS TEXT)=?)")
-            params += [f"%{query}%", f"%{query}%", query.lstrip("#")]
+            where.append("(state LIKE ? OR detail LIKE ? OR diagnostics LIKE ? OR CAST(id AS TEXT)=?)")
+            params += [f"%{query}%", f"%{query}%", f"%{query}%", query.lstrip("#")]
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         with self.lock:
             total = self.db.execute(f"SELECT count(*) FROM mem_logs{clause}", params).fetchone()[0]
@@ -1108,7 +1110,13 @@ class MemoryStore:
                 f"SELECT * FROM mem_logs{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             ).fetchall()
-        return {"items": [dict(r) for r in rows], "total": total, "offset": offset}
+        items = []
+        for row in rows:
+            item = dict(row)
+            if captured := item.pop("diagnostics", None):
+                item["diagnostics"] = json.loads(captured)
+            items.append(item)
+        return {"items": items, "total": total, "offset": offset}
 
     # ------------------------------------------------------------ bindings --
 

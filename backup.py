@@ -17,6 +17,8 @@ from starlette.responses import StreamingResponse
 
 from . import backup_data, backup_format
 
+from .store import record_operation_error
+
 PRIVATE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 CHUNK_BYTES = 1024 * 1024
 MAX_UPLOAD_BYTES = 600 * 1024 * 1024
@@ -124,7 +126,9 @@ class Backups:
             shutil.rmtree(job["root"])
         except FileNotFoundError:
             pass
-        except OSError:
+        except OSError as exc:
+            if job.get("error") != "CLEANUP_FAILED":
+                record_operation_error(self.store, "清理备份临时文件", exc)
             job["state"], job["error"] = "failed", "CLEANUP_FAILED"
             job["release"] = True
             return
@@ -155,6 +159,8 @@ class Backups:
             else:
                 job["state"] = "cancelled" if job["cancel"].is_set() else "failed"
                 job["error"] = _fixed_error(exc)
+                if job["state"] == "failed":
+                    record_operation_error(self.store, "备份与恢复 · " + job["operation"], exc)
         finally:
             job["password"] = None
             # The worker is now actually finished; a callback owns cleanup.
@@ -171,7 +177,8 @@ class Backups:
                         shutil.rmtree(path)
                     else:
                         path.unlink()
-            except OSError:
+            except OSError as exc:
+                record_operation_error(self.store, "清理备份临时文件", exc)
                 job["error"] = "CLEANUP_FAILED"
                 job["release"] = True
 
@@ -467,12 +474,16 @@ class BackupAPI:
                     raise BackupRequestError("BACKUP_NOT_FOUND", 404)
             return json_response(result, headers=PRIVATE)
         except BackupRequestError as exc:
+            record_operation_error(self.service.store, "备份与恢复 · " + operation, exc)
             return error_response(exc.code, status_code=exc.status, headers=PRIVATE)
         except backup_format.BackupError as exc:
+            record_operation_error(self.service.store, "备份与恢复 · " + operation, exc)
             return error_response(exc.code, status_code=409, headers=PRIVATE)
-        except (ValueError, TypeError, KeyError):
+        except (ValueError, TypeError, KeyError) as exc:
+            record_operation_error(self.service.store, "备份与恢复 · " + operation, exc)
             return error_response("INVALID_OPTIONS", status_code=400, headers=PRIVATE)
         except Exception as exc:
+            record_operation_error(self.service.store, "备份与恢复 · " + operation, exc)
             from .restore_guard import ERROR_CODES
             from .store import AlbumError
             if isinstance(exc, AlbumError) and exc.args and exc.args[0] in ERROR_CODES:

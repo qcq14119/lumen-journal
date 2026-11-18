@@ -6,6 +6,7 @@ from .restore_guard import RestoreGuard, managed
 
 import hashlib
 import copy
+import errno
 import io
 import json
 import os
@@ -16,6 +17,9 @@ import threading
 import time
 import uuid
 import warnings
+from contextlib import closing
+from functools import wraps
+from http import HTTPStatus
 from pathlib import Path
 from datetime import date, datetime, time as daytime, timedelta
 from urllib.parse import urlsplit
@@ -65,6 +69,103 @@ class AlbumError(Exception):
     """An error safe to display without provider payloads or secrets."""
 
 
+_PLUGIN_DIR = Path(__file__).parent
+_UPSTREAM_ERRORS = frozenset({
+    "model_not_found", "invalid_model", "model_not_available", "invalid_api_key",
+    "authentication_error", "permission_denied", "permission_error", "insufficient_quota",
+    "rate_limit_exceeded", "rate_limit_error", "context_length_exceeded", "content_filter",
+    "invalid_request_error", "invalid_parameter", "unsupported_parameter", "server_error",
+    "overloaded_error", "insufficient_user_quota", "channel_not_found", "no_available_channel",
+})
+_PUBLIC_SERVICE_MESSAGES = re.compile(
+    r"model (?:not found|unavailable)|no available channels?|insufficient quota|invalid api key|"
+    r"rate limit exceeded|too many requests|service unavailable|upstream request timeout|"
+    r"(?:connect(?:ion)?|read) (?:timeout|timed out|refused)|database is (?:locked|full)|"
+    r"this model's maximum context length is [0-9]{1,9} tokens\. however, "
+    r"(?:your messages resulted in|you requested) [0-9]{1,9} tokens", re.I | re.ASCII)
+
+
+def upstream_error_code(body):
+    """Read known machine codes only. An API may echo the request in any field."""
+    if isinstance(body, dict) and isinstance(error := body.get("error", body), dict):
+        for field in ("code", "type"):
+            value = error.get(field)
+            if type(value) is str and value in _UPSTREAM_ERRORS:
+                return value
+    return None
+
+
+def exception_http_status(exc):
+    for value in (getattr(exc, "status_code", None), getattr(exc, "status", None),
+                  getattr(exc, "code", None), getattr(getattr(exc, "response", None), "status_code", None)):
+        if type(value) is int and 100 <= value <= 599:
+            return value
+    for data in (getattr(exc, "counts", None), getattr(exc, "diagnostic", None)):
+        if isinstance(data, dict) and type(status := data.get("http_status")) is int and 100 <= status <= 599:
+            return status
+    return None
+
+
+def _recordable_message(exc):
+    # Preserve the spelling of a recognized technical message. Substrings or
+    # extra trailing text may contain an echoed prompt, so require a full match.
+    body = getattr(exc, "body", None)
+    error = body.get("error", body) if isinstance(body, dict) else None
+    for message in (error.get("message") if isinstance(error, dict) else None,
+                    getattr(exc, "remote_detail", None), exc.args[0] if len(exc.args) == 1 else None):
+        if type(message) is str and len(message) <= 220 and _PUBLIC_SERVICE_MESSAGES.fullmatch(message.rstrip(".")):
+            return message
+    return ""
+
+
+def _exception_site(exc):
+    location, message = "", ""
+    trace = exc.__traceback__
+    while trace:
+        frame = trace.tb_frame.f_code
+        path = Path(frame.co_filename)
+        if path.parent in (_PLUGIN_DIR, _PLUGIN_DIR / "memory"):
+            location = f"{path.relative_to(_PLUGIN_DIR).as_posix()}:{trace.tb_lineno}"
+            # Only quote a local error verbatim if it is a literal at its raise site.
+            # Interpolated messages, including upstream exceptions, may echo a request.
+            if (trace.tb_next is None and len(exc.args) == 1
+                and type(exc.args[0]) is str and len(exc.args[0]) <= 160 and exc.args[0] in frame.co_consts):
+                message = exc.args[0]
+        trace = trace.tb_next
+    return message, location
+
+
+def recorded_exception_detail(exc):
+    """Durable WebUI facts, excluding arbitrary remote text, full paths and frame locals."""
+    parts, seen = [], set()
+    while isinstance(exc, BaseException) and id(exc) not in seen and len(seen) < 4:
+        seen.add(id(exc))
+        name = type(exc).__name__
+        facts = [name if re.fullmatch(r"[A-Za-z_]\w{0,63}", name, re.ASCII) else "Exception"]
+        if status := exception_http_status(exc):
+            try:
+                phrase = HTTPStatus(status).phrase
+            except ValueError:
+                phrase = ""
+            facts.append(f"HTTP {status} {phrase}".rstrip())
+        code = upstream_error_code(getattr(exc, "body", None)) or upstream_error_code({
+            "code": getattr(exc, "upstream_code", None), "type": getattr(exc, "code", None)})
+        if code:
+            facts.append(code)
+        if isinstance(exc, OSError) and type(exc.errno) is int and abs(exc.errno) <= 2**31:
+            facts.append(f"errno {exc.errno} {errno.errorcode.get(exc.errno, '')}".rstrip())
+        if isinstance(exc, json.JSONDecodeError):
+            facts.append(f"JSON 第 {exc.lineno} 行第 {exc.colno} 列")
+        result = getattr(exc, "result", None)
+        if isinstance(result, dict) and type(retcode := result.get("retcode")) is int and abs(retcode) <= 2**31:
+            facts.append(f"retcode {retcode}")
+        local_message, location = _exception_site(exc)
+        facts.extend(value for value in (local_message or _recordable_message(exc), location) if value)
+        parts.append(" · ".join(facts))
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return "\n由以下异常引起：".join(parts)[:1000]
+
+
 _SECRET_PATTERNS = (
     (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 [REDACTED]"),
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{8,})"), "[REDACTED_KEY]"),
@@ -88,28 +189,235 @@ def redact_error_text(value: str, *, limit: int = 800) -> str:
     return text
 
 
+_MODEL_MESSAGE_LIMIT = 800
+# SDK descriptions sometimes append a serialized request or an entire header block.
+_DUMP_START = re.compile(
+    r'''(?ix)\{\s*["']|\[\s*(?:\{|["'])|<!doctype\b|<html\b|'''
+    r'''(?:(?:^|[;|\n])\s*request|(?<![\w.'"])(?:request[\s_-]*(?:body|headers?|data|payload)|headers?|payload|body|'''
+    r'''messages|user[ _-]?message|system[ _-]?prompt|prompt|input|content|failed_output|response[ _-]?body|'''
+    r'''authorization|(?:set-)?cookie|(?:x-)?api[_ -]?key|(?:access[_ -]?|refresh[_ -]?)?token|'''
+    r'''password|(?:client[_ -]?)?secret)|请求体|请求正文|请求头|提示词|聊天内容)\s*[:=：]|'''
+    r'''["'](?:api[_-]?key|authorization|cookie|password|secret|token)["']\s*[:=：]''')
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/_-]{80,}={0,2}")
+
+
+def model_response_message(body):
+    """Select only a scalar error description from an HTTP error response."""
+    if isinstance(body, str):
+        body = body.strip()
+        if not body.startswith(("{", "[")):
+            return body
+        try:
+            if len(body) > 8192:
+                return ""
+            body = json.loads(body)
+        except (ValueError, RecursionError):
+            # A plain message may start with a bracketed gateway name.
+            return "" if body.startswith("{") or _DUMP_START.match(body) else body
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        for source in (error, body, body.get("detail")):
+            if isinstance(source, dict):
+                for key in ("message", "detail", "error_description"):
+                    if isinstance(value := source.get(key), str) and value.strip():
+                        return value
+        if isinstance(error, str):
+            return error
+    return ""
+
+
+def clean_model_message(value, *, request_texts=(), secrets=()):
+    """Keep original wording and line breaks while removing credentials and request echoes."""
+    if not isinstance(value, str):
+        return ""
+    text = _DUMP_START.split(value[:8192], maxsplit=1)[0].strip()
+    if not text or re.fullmatch(r"(?i)(?:(?:error code|HTTP)\s*:?\s*)?\d{3}(?:\s*[-:])?", text):
+        return ""
+    for secret in secrets:
+        if isinstance(secret, str) and secret:
+            text = text.replace(secret, "[REDACTED]")
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r'''(https?://[^\s?\#"'<>]+)[?\#][^\s"'<>]+''', r"\1?[REDACTED]", text)
+    text = _BASE64_RUN.sub("[REDACTED]", text)
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text.replace("\r\n", "\n").replace("\r", "\n"))
+    if len(text) > _MODEL_MESSAGE_LIMIT:
+        text = text[:_MODEL_MESSAGE_LIMIT - 1] + "…"
+    # Some gateways quote input in the message itself. Compare only against this
+    # call's transient request text. Never put that text in the diagnostic.
+    inputs = [t for t in request_texts if isinstance(t, str) and t]
+    if sum(map(len, inputs)) > 256_000:
+        return ""
+    for part in inputs:
+        if len(part) <= len(text) and part in text:
+            text = text.replace(part, "[已隐藏请求内容]")
+    context = "\n".join(inputs)
+    if not context:
+        return text
+    if text in context or text == "[已隐藏请求内容]":
+        return ""
+    text = re.sub(r'''["'“]([^"'“”\n]+)["'”]''',
+                  lambda match: "[已隐藏请求内容]" if match[1] in context else match[0], text)
+    # Merge adjacent matches so a partial, unlabelled echo is masked as well.
+    spans = []
+    width = 10
+    for start in range(len(text) - width + 1):
+        if text[start:start + width] in context:
+            if spans and start <= spans[-1][1]:
+                spans[-1][1] = start + width
+            else:
+                spans.append([start, start + width])
+    for start, end in reversed(spans):
+        text = text[:start] + "[已隐藏请求内容]" + text[end:]
+    return text[:_MODEL_MESSAGE_LIMIT]
+
+
+def model_exception_message(exc, *, from_client=False, request_texts=()):
+    """Read upstream/SDK wording from a model call, starting at its underlying cause."""
+    chain, seen = [], set()
+    while isinstance(exc, BaseException) and id(exc) not in seen and len(chain) < 4:
+        seen.add(id(exc))
+        chain.append(exc)
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    messages = []
+    for error in reversed(chain):
+        body = getattr(error, "body", None)
+        if body is None:
+            body = getattr(error, "response_json", None)
+        remote = getattr(error, "remote_detail", None)
+        sdk = type(error).__module__.split(".")[0] in {"openai", "anthropic", "httpx", "httpcore", "aiohttp"}
+        provider_lookup = type(error).__name__ in {"ProviderNotFoundError", "ChatProviderNotFoundError"}
+        if body is None and remote is None and not (from_client or provider_lookup or sdk or exception_http_status(error)):
+            continue
+        response = getattr(error, "response", None)
+        try:
+            request = getattr(error, "request", None) or getattr(response, "request", None)
+            # httpx.HTTPStatusError has a buffered response, but no parsed body.
+            if body is None and isinstance(content := getattr(response, "content", None), bytes) and len(content) <= 8192:
+                body = content.decode("utf-8", errors="replace")
+        except RuntimeError:  # Unbound request / unread stream. Never read from the network here.
+            request = None
+        headers = getattr(request, "headers", None)
+        secrets = []
+        if hasattr(headers, "get"):
+            for key in ("Authorization", "x-api-key", "api-key", "x-goog-api-key"):
+                credential = headers.get(key)
+                if isinstance(credential, str):
+                    secrets.append(credential.split()[-1] if credential.strip() else "")
+        candidates = [model_response_message(body), remote]
+        # Never serialize an exception, request object or the other response fields.
+        # Built-in timeouts carry no provider response. Adapters sometimes put the
+        # entire pending request in their argument, including unlabelled private text.
+        if not isinstance(error, (AlbumError, TimeoutError)) and len(error.args) == 1:
+            sdk_text = error.args[0]
+            # A bare untyped adapter value can be a token or a returned identifier.
+            # Accept descriptive prose, or wording attached to an actual HTTP/SDK error.
+            opaque = isinstance(sdk_text, str) and re.fullmatch(r"[\w./+=-]+", sdk_text, re.ASCII)
+            if not opaque or sdk or body is not None or exception_http_status(error):
+                candidates.append(sdk_text)
+        for candidate in candidates:
+            message = clean_model_message(candidate, request_texts=request_texts, secrets=secrets)
+            if message and message not in messages:
+                messages.append(message)
+    return "\n".join(messages)[:_MODEL_MESSAGE_LIMIT]
+
+
+def request_strings(value):
+    """Collect only transient text for echo suppression, never serialize a request."""
+    pending = [value]
+    result = []
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            # Media and signed URLs never belong in an error, even in fragments.
+            if item.startswith(("base64://", "data:image/")):
+                continue
+            result.append(item)
+        elif isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return result
+
+
+def exception_fields(exc, *, request_texts=(), secrets=(), from_client=False):
+    """Build the private UI fields once, as close to the failing call as possible."""
+    fields = {"error_detail": "Exception", "raw_error": ""}
+    try:
+        fields["error_detail"] = recorded_exception_detail(exc)
+        error, seen = exc, set()
+        while isinstance(error, BaseException) and id(error) not in seen and len(seen) < 4:
+            seen.add(id(error))
+            captured = getattr(error, "_album_error_fields", None)
+            if isinstance(captured, dict):
+                return {"error_detail": captured["error_detail"], "raw_error": captured["raw_error"]}
+            error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+        receipt = getattr(exc, "result", None)
+        if isinstance(receipt, dict):
+            candidates = [receipt.get(key) for key in ("wording", "message", "msg")]
+        else:
+            candidates = [model_exception_message(exc, from_client=from_client, request_texts=request_texts)]
+            if isinstance(exc, json.JSONDecodeError):
+                candidates.append(exc.msg)  # Excludes the invalid document on exc.doc.
+            if isinstance(exc, sqlite3.Error) and getattr(exc, "sqlite_errorcode", None) is not None:
+                # SQLite errors may echo SQL fragments or untrusted identifiers.
+                if exc.args and type(exc.args[0]) is str and re.fullmatch(
+                    r"database (?:is locked|or disk is full|disk image is malformed)|disk I/O error|"
+                    r"attempt to write a readonly database|unable to open database file", exc.args[0], re.I):
+                    candidates.append(exc.args[0])
+            if isinstance(exc, OSError) and type(exc.errno) is int:
+                if abs(exc.errno) < 256 and exc.strerror == os.strerror(exc.errno):
+                    candidates.append(exc.strerror)
+            if not any(candidates) and getattr(exc, "remote_detail", None) is None:
+                candidates.append(_exception_site(exc)[0] or _recordable_message(exc))
+        messages = []
+        for candidate in candidates:
+            value = clean_model_message(candidate, request_texts=request_texts, secrets=secrets)
+            if value and value not in messages:
+                messages.append(value)
+        fields["raw_error"] = "\n".join(messages)[:_MODEL_MESSAGE_LIMIT]
+    except Exception:
+        # A broken SDK attribute or a diagnostic must never change the action outcome.
+        pass
+    return fields
+
+
+def capture_exception(exc, **options):
+    """Attach a sanitized snapshot before a caller wraps the exception or drops the input."""
+    exc._album_error_fields = exception_fields(exc, **options)
+    return exc._album_error_fields
+
+
+def record_operation_error(store, name, exc, *, state="failed", **options):
+    """Best-effort history for actions without their own task or delivery ledger."""
+    try:
+        store.append_operation_error({"name": name, "at": now(), "state": state, **exception_fields(exc, **options)})
+    except Exception:
+        # The failing operation may itself be a database or restore operation.
+        pass
+
+
+def observed_action(name):
+    """Keep an uncaught tool or management error visible and preserve its host behavior."""
+    def decorate(handler):
+        @wraps(handler)
+        async def run(self, *args, **kwargs):
+            try:
+                return await handler(self, *args, **kwargs)
+            except Exception as exc:
+                record_operation_error(getattr(self, "store", None), name, exc)
+                raise
+        return run
+    return decorate
+
+
 def format_exception_detail(exc: BaseException, *, limit: int = 800) -> str:
     """Format an exception cause chain safely with HTTP status and redacted message."""
     parts, seen, current = [], set(), exc
     while isinstance(current, BaseException) and id(current) not in seen and len(seen) < 4:
         seen.add(id(current))
         name = type(current).__name__
-        status = next(
-            (
-                v
-                for v in (
-                    getattr(current, "status_code", None),
-                    getattr(current, "status", None),
-                    getattr(current, "code", None),
-                    getattr(getattr(current, "response", None), "status_code", None),
-                    (getattr(current, "counts", None) or {}).get("http_status")
-                    if isinstance(getattr(current, "counts", None), dict)
-                    else None,
-                )
-                if type(v) is int and 100 <= v <= 599
-            ),
-            0,
-        )
+        status = exception_http_status(current)
         try:
             msg = str(current)
         except Exception:
@@ -329,6 +637,30 @@ class Store:
     def close(self):
         with self.lock:
             self.db.close()
+
+    def append_operation_error(self, record):
+        """Keep management failures outside the business database, including during restore."""
+        path = self.root / "operation-errors.sqlite3"
+        with self.lock, closing(sqlite3.connect(path, timeout=1)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS errors(id TEXT PRIMARY KEY, at INTEGER NOT NULL, data TEXT NOT NULL)")
+            db.execute("INSERT INTO errors VALUES(?,?,?)", (uid("err_"), record["at"], json.dumps(record, ensure_ascii=False)))
+            db.execute("DELETE FROM errors WHERE at < ?", (now() - self.settings["records_retention_days"] * 86400,))
+            db.execute("DELETE FROM errors WHERE rowid <= (SELECT rowid FROM errors ORDER BY rowid DESC LIMIT 1 OFFSET ?)",
+                       (self.settings["records_max_count"],))
+
+    def operation_errors(self):
+        path = self.root / "operation-errors.sqlite3"
+        with self.lock:
+            if not path.is_file():
+                return []
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return [{**json.loads(data), "id": key, "_version": at}
+                        for key, at, data in db.execute("SELECT id,at,data FROM errors ORDER BY rowid DESC")]
+
+    def delete_operation_errors(self, ids):
+        path = self.root / "operation-errors.sqlite3"
+        with self.lock, closing(sqlite3.connect(path)) as db, db:
+            db.executemany("DELETE FROM errors WHERE id=?", ((key,) for key in ids))
 
     def get(self, kind: str, key: str) -> dict:
         with self.lock:
@@ -1340,15 +1672,18 @@ class Store:
             return cursor.rowcount == 1
 
     @managed
-    def mark_worker_error(self, key: str):
+    def mark_worker_error(self, key: str, fields=None):
         """Isolate one interrupted worker without stopping unrelated jobs."""
         with self.lock, self.db:
             self.db.execute(
-                "UPDATE jobs SET data=json_set(data,'$.worker_error','LOCAL_SAVE_FAILED') WHERE id=?", (key,)
+                "UPDATE jobs SET data=json_set(data,'$.worker_error','LOCAL_SAVE_FAILED','$.worker_diagnostic',json(?)) WHERE id=?",
+                (json.dumps(fields), key),
             )
 
     @managed
     def finish_delivery(self, key: str, state: str, **patch):
+        if state in ("unknown", "failed"):
+            patch.setdefault("raw_error", "")
         with self.lock, self.db:
             old = self.db.execute(
                 "SELECT data FROM deliveries WHERE id=?", (key,)

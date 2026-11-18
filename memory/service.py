@@ -12,11 +12,10 @@ import re
 from datetime import datetime, timezone
 from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
 from astrbot.api import logger
 
-from ..store import AlbumError, format_exception_detail
+from ..store import AlbumError, exception_fields, record_operation_error, recorded_exception_detail
 from . import core
 from .images import ImageIndex, UNSAFE_REASON
 from .models import (
@@ -75,14 +74,7 @@ def error_kind(error: Exception) -> tuple[str, bool, int]:
 def diagnostic(error):
     if isinstance(error, MemoryResponseError):
         return str(error)
-    frames, trace = [], error.__traceback__
-    while trace:
-        path = Path(trace.tb_frame.f_code.co_filename)
-        if path.parent == Path(__file__).parent:
-            frames.append(f"{path.name}:{trace.tb_lineno}")
-        trace = trace.tb_next
-    kind = re.sub(r"[^a-zA-Z0-9_]", "", type(error).__name__)[:48]
-    return f"{error_kind(error)[0][:160]} [diag {kind} {' > '.join(frames[-2:])}]"[:300]
+    return f"{error_kind(error)[0][:160]} [diag {recorded_exception_detail(error)[:220]}]"
 
 
 def response_failure(error, expected_images):
@@ -261,7 +253,7 @@ class MemoryService:
 
         def done(result, error):
             if error is not None:
-                self.store.log(scope, cid, "index_failed", diagnostic(error))
+                self.store.log(scope, cid, "index_failed", diagnostic(error), diagnostics=[exception_fields(error)])
             elif manual or result["added"] or result["removed"]:
                 self.store.log(
                     scope, cid, "indexed",
@@ -274,8 +266,8 @@ class MemoryService:
         while not self._closed:
             try:
                 await asyncio.to_thread(self.store.cleanup)
-            except Exception:
-                pass
+            except Exception as exc:
+                record_operation_error(self.store.album_store, "清理拾忆记录", exc)
             await asyncio.sleep(3600)
 
     # ----------------------------------------------------------- model ----
@@ -568,10 +560,10 @@ class MemoryService:
                 "Memory summary failed (scope=%s cid=%s): %s",
                 scope,
                 cid,
-                format_exception_detail(error),
+                recorded_exception_detail(error),
             )
             self.failed[key] = error_kind(error)[0]
-            self.store.log(scope, cid, "summary_failed", diagnostic(error))
+            self.store.log(scope, cid, "summary_failed", diagnostic(error), diagnostics=[exception_fields(error)])
         else:
             # Only metadata crosses this boundary. A failed/cancelled summary
             # never launches maintenance from its finally block.
@@ -585,10 +577,10 @@ class MemoryService:
                         "Memory post-summary maintenance trigger failed (scope=%s cid=%s): %s",
                         scope,
                         cid,
-                        format_exception_detail(exc),
+                        recorded_exception_detail(exc),
                     )
                     code = getattr(exc, "code", "")
-                    self.store.log(scope, cid, "maintenance_failed", packed({"code": code if code in CODES else "STORAGE"}))
+                    self.store.log(scope, cid, "maintenance_failed", packed({"code": code if code in CODES else "STORAGE"}), diagnostics=[exception_fields(exc)])
         finally:
             self.busy.pop(key, None)
 
@@ -666,16 +658,18 @@ class MemoryService:
                         except Exception as error:
                             _, retryable, delay = error_kind(error)
                             issue = response_failure(error, len(group))
+                            issue._album_error_fields = exception_fields(error, from_client=True,
+                                request_texts=(system, prompt), secrets=(getattr(model, "config", {}).get("api_key"),))
                             if not retryable or attempt > retries:
                                 raise issue from None
-                            self.store.log(scope, cid, "retrying", f"第{attempt}次：{issue}，{delay}秒后重发本批全部图片")
+                            self.store.log(scope, cid, "retrying", f"第{attempt}次：{issue}，{delay}秒后重发本批全部图片", diagnostics=[exception_fields(issue)])
                             await asyncio.sleep(delay)
                             continue
                         parsed, group_descriptions, safe_raw, issue = parse(raw, group)
                         if parsed is None:
                             if attempt > retries:
                                 raise issue from None
-                            self.store.log(scope, cid, "retrying", f"第{attempt}次：{issue}，整批重新生成")
+                            self.store.log(scope, cid, "retrying", f"第{attempt}次：{issue}，整批重新生成", diagnostics=[exception_fields(issue)])
                     if not await valid():
                         raise MemoryModelError("整理期间本批内容或设置已变化，结果未保存")
                     self.store.save_result(scope, cid, fingerprint, safe_raw, model_name)

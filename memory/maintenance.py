@@ -13,7 +13,7 @@ from pathlib import Path
 from astrbot.api import logger
 
 from ..plan_recovery import classify, retry_delay
-from ..store import AlbumError, format_exception_detail
+from ..store import AlbumError, exception_fields, recorded_exception_detail
 from .maintenance_protocol import CATEGORIES, CODES, SYSTEM, MaintenanceError, candidate, dependencies, key, keys, packed, parse, quote_index, safe_text
 from .text import estimate
 
@@ -285,15 +285,15 @@ class MemoryMaintenance:
                 cid,
                 task_id,
                 code,
-                format_exception_detail(exc),
+                recorded_exception_detail(exc),
             )
             state = "partial" if code in {"CALL_LIMIT", "TIME_LIMIT", "CAPACITY"} else "stale" if code in {"STALE", "SOURCE_CHANGED", "CHAT_DELETED"} else "failed"
-            self._end(scope, cid, task_id, unit_id, state, code, total, frozen, started, accounted, vector_attempted)
+            self._end(scope, cid, task_id, unit_id, state, code, total, frozen, started, accounted, vector_attempted, exc=exc)
         finally:
             if acquired:
                 self._gate.release()
 
-    def _end(self, scope, cid, task_id, unit_id, state, code, counts, frozen, started, accounted, vector_attempted):
+    def _end(self, scope, cid, task_id, unit_id, state, code, counts, frozen, started, accounted, vector_attempted, exc=None):
         # Query authoritative receipts after cancellation/unknown write outcome.
         current = None
         try:
@@ -317,11 +317,13 @@ class MemoryMaintenance:
         if not vector_attempted and current and current.get("committed") and unit_counts.get("modified"):
             try:
                 self.service.refresh_vectors(scope, cid)
-            except Exception:
-                self.store.log(scope, cid, "maintenance_failed", packed({"code": "STORAGE", "calls": 0}))
+            except Exception as error:
+                self.store.log(scope, cid, "maintenance_failed", packed({"code": "STORAGE", "calls": 0}),
+                               diagnostics=[exception_fields(error)])
         parameters = {k: v for k, v in (current or {}).get("parameters", {}).items()
                       if k in {"max_calls", "window", "unit_timeout", "manual_timeout"} and type(v) is int}
-        self.store.log(scope, cid, "maintenance_" + state, packed({"code": code, **counts, **parameters, "elapsed_ms": elapsed}))
+        self.store.log(scope, cid, "maintenance_" + state, packed({"code": code, **counts, **parameters, "elapsed_ms": elapsed}),
+                       diagnostics=[exception_fields(exc)] if exc is not None else [])
 
     async def _unit(self, scope, cid, unit_id, frozen, client, check, deadline, policy, apply, allow_protected):
         from .service import capacity
@@ -449,12 +451,16 @@ class MemoryMaintenance:
                     calls,
                     code or network_code,
                     retryable,
-                    format_exception_detail(exc),
+                    recorded_exception_detail(exc),
                 )
                 format_error = code in {"JSON_FORMAT", "RESPONSE_JSON", "RESPONSE_FORMAT"}
+                fields = exception_fields(exc, from_client=True, request_texts=(SYSTEM, prompt), secrets=(secret,))
                 if retried or not (retryable or format_error) or calls >= policy["max_calls"]:
                     failure = network_code if network_code in {"MODEL_AUTH", "MODEL_CONFIG"} else code if code in CODES else "REQUEST_TIMEOUT" if network_code == "TIMEOUT" else "REQUEST_FAILED"
-                    raise MaintenanceError(failure) from None
+                    error = MaintenanceError(failure)
+                    error._album_error_fields = fields
+                    raise error from None
+                self.store.log(scope, cid, "retrying", f"维护助手第 {calls} 次调用失败", diagnostics=[fields])
                 retried = True
                 payload["feedback"] = "JSON_FORMAT" if format_error else "REQUEST_FAILED"
                 if retryable:

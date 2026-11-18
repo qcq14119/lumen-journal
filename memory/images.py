@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..restore_guard import managed
+from ..store import exception_fields, request_strings
 
 import asyncio
 import hashlib
@@ -493,6 +494,7 @@ class ImageIndex:
     async def _run(self, scope, cid, refs, model_provider, manual, window):
         completed, failed, skipped, requests = 0, 0, 0, 0
         cancelled = False
+        diagnostics = []
         reason = "模型请求或返回内容不可用"
         try:
             initial = self.store.state(scope, cid)
@@ -566,6 +568,11 @@ class ImageIndex:
                         raise
                     except Exception as error:
                         failed += len(items)
+                        if len(diagnostics) == 10:
+                            self.store.log(scope, cid, "image_failed", "图片批次描述失败", diagnostics=diagnostics)
+                            diagnostics.clear()
+                        diagnostics.append({"stage": f"图片描述 · 第 {requests} 批", **exception_fields(error,
+                            request_texts=request_strings(items), secrets=(getattr(selected_model, "config", {}).get("api_key"),))})
                         reason = "模型服务超时" if isinstance(error, (TimeoutError, asyncio.TimeoutError)) else "模型请求或返回内容不可用"
                     else:
                         completed += len(items)
@@ -578,8 +585,8 @@ class ImageIndex:
             cancelled = True
             self.store.log(scope, cid, "image_failed", "图片描述已取消，未完成图片可手动补描述")
             raise
-        except Exception:
-            self.store.log(scope, cid, "image_failed", "图片描述本地处理失败")
+        except Exception as error:
+            self.store.log(scope, cid, "image_failed", "图片描述本地处理失败", diagnostics=[exception_fields(error)])
         finally:
             key = (scope, cid)
             self._results.pop(key, None)
@@ -593,7 +600,7 @@ class ImageIndex:
             if completed:
                 self.store.log(scope, cid, "image_described", f"已描述{completed}张图片，跳过{skipped}张")
             if failed:
-                self.store.log(scope, cid, "image_failed", f"{failed}张图片描述失败：{reason}")
+                self.store.log(scope, cid, "image_failed", f"{failed}张图片描述失败：{reason}", diagnostics=diagnostics)
 
     async def close(self):
         self._closed = True

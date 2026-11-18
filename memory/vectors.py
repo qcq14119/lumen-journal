@@ -14,6 +14,7 @@ process memory between requests, so a small server only pays while searching.
 from __future__ import annotations
 
 from ..restore_guard import managed
+from ..store import capture_exception
 
 import array
 import asyncio
@@ -169,7 +170,12 @@ class VectorIndex:
         added = 0
         for start in range(0, len(todo), BATCH):
             chunk = todo[start : start + BATCH]
-            vectors = await model.get_embeddings([t for _, _, t in chunk])
+            texts = [t for _, _, t in chunk]
+            try:
+                vectors = await model.get_embeddings(texts)
+            except Exception as error:
+                capture_exception(error, from_client=True, request_texts=texts, secrets=(getattr(model, "config", {}).get("api_key"),))
+                raise
             with self.store.transaction():
                 for (item, kind, text), vector in zip(chunk, vectors):
                     self.store.db.execute(

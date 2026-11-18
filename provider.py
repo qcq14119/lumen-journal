@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import ipaddress
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from .store import AlbumError, MAX_BYTES
+from .store import AlbumError, MAX_BYTES, clean_model_message, model_response_message
 
 
 class ProviderError(AlbumError):
@@ -27,8 +28,10 @@ class ProviderError(AlbumError):
         code: str = "",
         http_status: int | None = None,
         retryable: bool = False,
+        remote_detail: str | None = None,
     ):
         super().__init__(message)
+        self.remote_detail = remote_detail
         self.unknown = unknown
         self.retry_after = retry_after
         self.terminal = terminal
@@ -87,7 +90,7 @@ def validate_url(url: str) -> str:
     return url
 
 
-def parse_result(data: dict, task_id: str = "") -> tuple[str, str]:
+def parse_result(data: dict, task_id: str = "", *, failure=None) -> tuple[str, str]:
     """Read image or asynchronous task responses without returning full payloads.
 
     Args:
@@ -102,9 +105,11 @@ def parse_result(data: dict, task_id: str = "") -> tuple[str, str]:
     own_id = data.get("task_id") or data.get("id")
     if task_id and own_id and str(own_id) != task_id:
         return "unsupported", "查询结果不属于当前任务"
+    state = str(data.get("status", data.get("state", ""))).lower()
+    if failure is not None and (data.get("error") or state in ("failed", "failure", "error", "cancelled", "canceled")):
+        failure["message"] = model_response_message(data)
     if data.get("error"):
         return "failed", "图片服务拒绝了任务，请在服务端检查任务记录"
-    state = str(data.get("status", data.get("state", ""))).lower()
     if state in ("failed", "failure", "error", "cancelled", "canceled"):
         return "failed", "图片生成失败"
     if isinstance(data.get("b64_json"), str):
@@ -123,7 +128,7 @@ def parse_result(data: dict, task_id: str = "") -> tuple[str, str]:
         if isinstance(value, dict):
             if task_id and task_id in value:
                 value = value[task_id]
-            parsed = parse_result(value, task_id)
+            parsed = parse_result(value, task_id, failure=failure)
             if parsed[0] != "unsupported":
                 return parsed
         elif isinstance(value, list) and value:
@@ -139,7 +144,7 @@ def parse_result(data: dict, task_id: str = "") -> tuple[str, str]:
                     return "unsupported", "查询结果不包含当前任务"
                 items = matching or items
             for item in items[:1]:
-                parsed = parse_result(item, task_id)
+                parsed = parse_result(item, task_id, failure=failure)
                 if parsed[0] != "unsupported":
                     return parsed
             if isinstance(value[0], str) and value[0].startswith("https://"):
@@ -163,6 +168,22 @@ def parse_result(data: dict, task_id: str = "") -> tuple[str, str]:
     if identifier:
         return "pending", str(identifier)
     return "unsupported", "图片服务没有返回图片或可查询的任务编号"
+
+
+async def http_error_message(response, *, request_texts=(), secrets=()):
+    """Read a small error description without letting diagnostic IO change retry semantics."""
+    async def read():
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(4096):
+            body.extend(chunk[:8192-len(body)])
+            if len(body) >= 8192:
+                break
+        return clean_model_message(model_response_message(body.decode("utf-8")),
+                                   request_texts=request_texts, secrets=secrets)
+    try:
+        return await asyncio.wait_for(read(), 2)
+    except Exception:
+        return ""
 
 
 class ImageProvider:
@@ -192,11 +213,13 @@ class ImageProvider:
                 method, url, allow_redirects=False, **kwargs
             ) as response:
                 if response.status not in (200, 201, 202):
+                    detail = await http_error_message(response, request_texts=getattr(self, "_request_texts", ()),
+                                                      secrets=(self.settings.get("api_key"),))
                     if response.status in (401, 403):
                         raise ProviderError(
                             "图片服务鉴权失败，请检查 API Key 和服务权限",
                             code="authentication",
-                            http_status=response.status,
+                            http_status=response.status, remote_detail=detail,
                         )
                     if response.status == 429:
                         delay = response.headers.get("Retry-After", "60")
@@ -216,14 +239,14 @@ class ImageProvider:
                             retry_after=max(1, seconds),
                             retryable=True,
                             code="rate_limit",
-                            http_status=429,
+                            http_status=429, remote_detail=detail,
                         )
                     raise ProviderError(
                         f"图片服务返回 HTTP {response.status}",
                         unknown=method == "POST" and response.status >= 500,
                         retryable=response.status >= 500 or response.status == 408,
                         code="http_error",
-                        http_status=response.status,
+                        http_status=response.status, remote_detail=detail,
                     )
                 body = bytearray()
                 async for chunk in response.content.iter_chunked(65536):
@@ -275,6 +298,7 @@ class ImageProvider:
         ]
 
     async def submit(self, prompt: str, references: list[bytes]) -> dict:
+        self._request_texts = (prompt,)
         base = self.settings["base_url"].rstrip("/")
         if not self.settings.get("model"):
             raise AlbumError("请先选择图片模型")
@@ -336,11 +360,13 @@ class ImageProvider:
                         url = urljoin(url, response.headers.get("Location", ""))
                         continue
                     if response.status != 200:
+                        detail = await http_error_message(response, request_texts=(*getattr(self, "_request_texts", ()), url),
+                                                          secrets=(self.settings.get("api_key"),))
                         raise ProviderError(
                             f"上游已生成，图片下载返回 HTTP {response.status}",
                             stage="download",
                             code="http_error",
-                            http_status=response.status,
+                            http_status=response.status, remote_detail=detail,
                         )
                     body = bytearray()
                     async for chunk in response.content.iter_chunked(65536):

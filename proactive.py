@@ -12,9 +12,14 @@ import time
 
 from astrbot.core.utils.session_lock import session_lock_manager
 
-from .store import AlbumError, now
+from .store import AlbumError, exception_fields, record_operation_error, now
 
 KIND = "proactive_message"
+TRANSPORT_ERRORS = {"unknown": "QQ 接口未返回有效消息编号", "failed": "平台适配器返回发送失败"}
+class TransportReceipt(dict):
+    """Only the local sender can attach diagnostics extracted from a platform receipt."""
+
+
 PREFIX = "lumen-proactive:v1:"
 DAY = 86400
 RECOVERABLE = ("kind='proactive_message' AND (json_extract(data,'$.state')='sending' OR "
@@ -303,7 +308,7 @@ class ProactiveHistory:
 
     def _saved(self, record):
         return self.store.save(KIND, record["id"], {
-            **record, "history_state": "saved", "history_error": "",
+            **record, "history_state": "saved", "history_error": "", "history_diagnostic": {},
             "history_saved_at": now(), "history_proof": {
                 "scope": record["scope"], "cid": record["cid"],
                 "checkpoint": marker(record),
@@ -338,9 +343,11 @@ class ProactiveHistory:
         old = self.get(key)
         if old["state"] == "sent":
             return old
-        safe_receipt = {}
+        safe_receipt = {k: receipt[k] for k in ("error_detail", "raw_error") if k in receipt} if isinstance(receipt, TransportReceipt) else {}
         if isinstance(receipt, dict) and receipt.get("message_id") is not None:
             safe_receipt["message_id"] = str(receipt["message_id"])[:160]
+        if state in TRANSPORT_ERRORS and isinstance(receipt, dict) and receipt.get("error") == TRANSPORT_ERRORS[state]:
+            safe_receipt["error"] = TRANSPORT_ERRORS[state]
         return self.store.save(
             KIND,
             key,
@@ -453,7 +460,7 @@ class ProactiveHistory:
                 }, record["revision"])
             if conv.cid != record["cid"] or conv.user_id != record["scope"]:
                 raise AlbumError("原聊天归属不符")
-        except Exception:
+        except Exception as exc:
             return self.store.save(
                 KIND,
                 record["id"],
@@ -461,6 +468,7 @@ class ProactiveHistory:
                     **record,
                     "history_state": "pending",
                     "history_error": "原聊天暂时无法读取，可重试保存历史",
+                    "history_diagnostic": exception_fields(exc),
                 },
                 record["revision"],
             )
@@ -521,7 +529,7 @@ class ProactiveHistory:
                     history=history,
                 )
             record = self._saved(record)
-        except Exception:
+        except Exception as exc:
             # Keep the confirmed transport state. Never re-enter the sender.
             fresh = self.get(record["id"])
             return self.store.save(
@@ -531,6 +539,7 @@ class ProactiveHistory:
                     **fresh,
                     "history_state": "pending",
                     "history_error": "历史保存失败，可重试保存",
+                    "history_diagnostic": exception_fields(exc),
                 },
                 fresh["revision"],
             )
@@ -539,9 +548,8 @@ class ProactiveHistory:
             try:
                 if runtime.store.state(record["scope"], record["cid"])["enabled"]:
                     runtime.capture(record["scope"], record["cid"], history)
-            except Exception:
-                # The next normal memory capture retries independently.
-                pass
+            except Exception as exc:
+                record_operation_error(self.store, "补存主动消息记忆", exc)
         return record
 
     @managed
@@ -578,7 +586,8 @@ class ProactiveHistory:
                     results.append(self.finish(record["id"], "unknown"))
                 elif record["state"] == "sent" and record.get("history_state") in ("pending", "orphaned") and not record.get("chat_deleted_at"):
                     results.append(await self.retry(record["id"]))
-            except Exception:
+            except Exception as exc:
+                record_operation_error(self.store, "检查主动消息历史补存", exc)
                 results.append({"id": key, "history_state": "pending", "history_error": "历史补存检查失败，可稍后重试"})
         return results
 

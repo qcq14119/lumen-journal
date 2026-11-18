@@ -7,7 +7,7 @@ import json
 import re
 
 from .memory.text import estimate, text_content
-from .store import AlbumError, now
+from .store import AlbumError, now, exception_fields
 
 
 def plain_text(value) -> str:
@@ -103,6 +103,7 @@ RECOVERY_CODES = {
 SAFE_CODES = PROTOCOL_CODES | RECOVERY_CODES | {
     "TIMEOUT", "CONNECTION", "STORAGE", "VALIDATION", "INTERNAL", "TIMER_ONLY",
     "PHOTO_DISABLED", "PHOTO_NO_SCENE", "PHOTO_ENGINE_UNAVAILABLE", "PHOTO_SUBMIT_FAILED", "PHOTO_TASK_CREATED",
+    "CHAT_CONTEXT_CHANGED", "DAILY_EVIDENCE_CHANGED", "DECISION_SKIP", "DECISION_DELAY", "NO_SENDABLE_LINE",
 }
 SAFE_STAGES = {"generation", "validation", "sending", "history", "photo", "follow_up", "recovery", "assistant"}
 SAFE_STATUSES = {"ok", "failed", "held", "pending", "skipped", "unknown", "fallback", "retrying", "recovered", "exhausted", "cancelled"}
@@ -124,7 +125,7 @@ def protocol_error(code):
 def safe_failure(exc):
     """Classify locally; never persist an exception's possibly private text."""
     code = getattr(exc, "code", "")
-    if code in SAFE_CODES:
+    if isinstance(code, str) and code in SAFE_CODES:
         return code
     if isinstance(exc, TimeoutError):
         return "TIMEOUT"
@@ -142,8 +143,13 @@ def safe_stage(stage, status, exc=None, code=None, **counts):
         raise ValueError("Invalid local diagnostic stage")
     if status not in SAFE_STATUSES:
         raise ValueError("Invalid local diagnostic status")
-    code = safe_failure(exc) if exc is not None else code
+    if code is None and exc is not None:
+        code = safe_failure(exc)
+    fields = exception_fields(exc) if exc is not None else {}
+    if code in SAFE_CODES and str(code).startswith("PROTOCOL_") and not fields.get("raw_error"):
+        fields.pop("raw_error", None)  # A local validation result, not a second provider failure.
     return {"stage": stage, "status": status, "at": now(), **safe_counts(counts),
+            **fields,
             **({"code": code if code in SAFE_CODES else "INTERNAL"} if code else {})}
 
 

@@ -9,6 +9,7 @@ the only history change; the memory block is a temporary part and is never saved
 from __future__ import annotations
 
 from ..restore_guard import managed
+from ..store import exception_fields
 
 import json
 import time
@@ -134,7 +135,7 @@ class MemoryRuntime:
         except Exception as error:
             # Memory problems must not stop the reply; the history stays untouched.
             try:
-                self.store.log(scope, cid, "inject_failed", f"本轮未加入记忆：{type(error).__name__}")
+                self.store.log(scope, cid, "inject_failed", f"本轮未加入记忆：{type(error).__name__}", diagnostics=[exception_fields(error)])
             except Exception:
                 pass
 
@@ -170,8 +171,11 @@ class MemoryRuntime:
             # next configured summary batch, or an explicitly confirmed manual fill.
             del history, captured
             self.service.request(scope, cid)
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.store.log(scope, cid, "capture_failed", "保存聊天记忆失败", diagnostics=[exception_fields(exc)])
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ trimming --
 

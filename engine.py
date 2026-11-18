@@ -14,7 +14,7 @@ from astrbot.api import logger
 
 from .provider import ImageProvider, ProviderError, parse_result
 from .attempts import Attempts, provider_settings
-from .store import AlbumError, Store, format_exception_detail, now, strings, text_value
+from .store import AlbumError, Store, recorded_exception_detail, now, clean_model_message, exception_fields, record_operation_error, strings, text_value
 
 
 class Engine:
@@ -147,8 +147,9 @@ class Engine:
             # A failed local durable transition cannot be retried in a busy loop.
             # Restart will re-evaluate the saved state and actual transport record.
             try:
-                self.store.mark_worker_error(key)
+                self.store.mark_worker_error(key, exception_fields(task.exception()))
             except Exception:
+                record_operation_error(self.store, "保存生图任务状态", task.exception())
                 return
         self._pump()
 
@@ -166,10 +167,11 @@ class Engine:
             await self.notify(self.store.job(key))
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             job = self.store.job(key)
             self.store.update_job(key, job["state"], notification_state="failed",
-                                  notification_error="通知处理未完成，请核对投递记录")
+                                  notification_error="通知处理未完成，请核对投递记录",
+                                  notification_diagnostic=exception_fields(exc))
         else:
             job = self.store.job(key)
             self.store.update_job(key, job["state"], notification_state="complete")
@@ -439,8 +441,9 @@ class Engine:
                         else:
                             data = await client.poll(job["provider_task_id"])
                         while True:
+                            failure = {}
                             result, value = parse_result(
-                                data, self.store.job(key).get("provider_task_id", "")
+                                data, self.store.job(key).get("provider_task_id", ""), failure=failure
                             )
                             if result == "pending":
                                 job = self.store.update_job(
@@ -465,6 +468,8 @@ class Engine:
                                     value,
                                     unknown=result == "unsupported",
                                     terminal=result == "failed",
+                                    remote_detail=clean_model_message(failure.get("message"), request_texts=(job["prompt"],),
+                                                                      secrets=(settings.get("api_key"),)),
                                 )
                             stage = "download"
                             self.store.update_job(
@@ -519,7 +524,7 @@ class Engine:
                     key,
                     job.get("scope"),
                     stage,
-                    format_exception_detail(exc),
+                    recorded_exception_detail(exc),
                 )
                 if getattr(exc, "retry_after", 0):
                     pauses = self.store.all("provider_pause")
@@ -536,7 +541,7 @@ class Engine:
                 current = self.store.job(key)
                 if current["state"] == "ready":
                     self.store.update_job(
-                        key, "ready", error="照片已入册，结果整理未完成"
+                        key, "ready", error="照片已入册，结果整理未完成", **exception_fields(exc, request_texts=(job.get("prompt"), job.get("scene")))
                     )
                 else:
                     state = (
@@ -550,6 +555,7 @@ class Engine:
                     )
                     diagnostic = {
                         **getattr(exc, "diagnostic", {}),
+                        **exception_fields(exc, request_texts=(job.get("prompt"), job.get("scene"))),
                         "stage": getattr(exc, "diagnostic", {}).get("stage") or stage,
                         "at": now(),
                     }
@@ -562,12 +568,12 @@ class Engine:
                         ],
                     )
             except Exception as exc:
-                logger.exception(
+                logger.warning(
                     "Image job unexpected error (job=%s scope=%s stage=%s): %s",
                     key,
                     job.get("scope"),
                     stage,
-                    format_exception_detail(exc),
+                    recorded_exception_detail(exc),
                 )
                 current = self.store.job(key)
                 if current["state"] == "ready":
@@ -575,6 +581,7 @@ class Engine:
                         key,
                         "ready",
                         error="照片已入册，结果整理未完成",
+                        **exception_fields(exc, request_texts=(job.get("prompt"), job.get("scene"))),
                     )
                 else:
                     self.store.update_job(
@@ -589,6 +596,7 @@ class Engine:
                                 {
                                     "stage": stage,
                                     "code": type(exc).__name__,
+                                    **exception_fields(exc, request_texts=(job.get("prompt"), job.get("scene"))),
                                     "at": now(),
                                 }
                             ]

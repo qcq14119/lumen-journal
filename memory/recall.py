@@ -10,6 +10,7 @@ import asyncio
 import re
 import time
 
+from ..store import exception_fields, capture_exception
 from . import core
 from .models import MemoryModelError
 from .store import DEFAULTS
@@ -144,11 +145,14 @@ class Recall:
                 self._find(scope, cid, settings, memory, message, history, pool, model, info, started + TIMEOUT),
                 TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as error:
+            info.setdefault("diagnostics", []).append({"stage": "召回", **exception_fields(error)})
             info["reason"] = f"召回超过{TIMEOUT}秒，本轮未加入相关记忆"
             info["items"] = []
             ids = []
         except Exception as error:
+            info["attempted"] = True
+            info.setdefault("diagnostics", []).append({"stage": "向量检索", **exception_fields(error)})
             info["reason"] = "向量检索失败：" + failure_reason(error)
             info["items"] = []
             ids = []
@@ -169,11 +173,17 @@ class Recall:
                 else:
                     info["reason"] = "查询改写未返回可用Q，改用原话检索"
             except Exception as error:
+                info.setdefault("diagnostics", []).append({"stage": "查询改写", **exception_fields(error,
+                    from_client=True, request_texts=(rewrite_prompt(memory, message, history), message, QUERY_REWRITE_SYSTEM))})
                 if isinstance(error, MemoryModelError) and str(error) == "请先在总结设置里选择总结 API 连接":
                     info["reason"] = "未选择总结 API，改用原话检索"
                 else:
                     info["reason"] = "查询改写失败，改用原话检索：" + failure_reason(error)
-        vectors = await model.get_embeddings(texts)
+        try:
+            vectors = await model.get_embeddings(texts)
+        except Exception as error:
+            capture_exception(error, from_client=True, request_texts=texts)
+            raise
         ranked, missing = self.service.vectors.score(scope, cid, model.identity, vectors, memory, only=pool)
         if missing:
             info["missing"] = missing
@@ -186,10 +196,12 @@ class Recall:
         rerank = self.service.optional_model("rerank", settings)
         scores = {}
         if rerank is not None:
+            documents = []
             try:
                 names = core.person_names(memory)
+                documents = [document(memory, i, names) for _, i in candidates]
                 rows = await rerank.rerank(
-                    intent, [document(memory, i, names) for _, i in candidates], len(candidates),
+                    intent, documents, len(candidates),
                     timeout=max(0, deadline - time.monotonic()),
                 )
                 scores = {candidates[r.index][1]: r.relevance_score for r in rows}
@@ -197,6 +209,8 @@ class Recall:
                 info["best_rerank"] = round(max(scores.values()), 2) if scores else None
                 candidates.sort(key=lambda row: scores.get(row[1], -1), reverse=True)
             except Exception as error:
+                info.setdefault("diagnostics", []).append({"stage": "精排", **exception_fields(error,
+                    from_client=True, request_texts=(intent, *documents))})
                 info["rerank_failed"] = failure_reason(error)
                 scores = {}
         chosen = [
@@ -236,6 +250,6 @@ class Recall:
         if info.get("missing"):
             detail += f"｜{info['missing']}条缺向量，已安排后台补齐"
         try:
-            self.store.log(scope, cid, state, detail)
+            self.store.log(scope, cid, state, detail, diagnostics=info.get("diagnostics", []))
         except Exception:
             pass
